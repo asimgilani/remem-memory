@@ -1,7 +1,7 @@
 {
   "name": "remem-memory",
   "description": "Session checkpoint and rollup workflows for Remem",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": {
     "name": "Remem",
     "email": "support@remem.io"
@@ -9,6 +9,5 @@
   "homepage": "https://remem.io",
   "repository": "https://github.com/asimgilani/remem-memory",
   "license": "MIT",
-  "hooks": "./hooks/hooks.json",
   "keywords": ["remem", "memory", "session", "checkpoints", "skills"]
 }
