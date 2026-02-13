@@ -1,0 +1,20 @@
+{
+  "name": "remem-memory",
+  "description": "Marketplace for Remem memory workflows in Claude Code",
+  "owner": {
+    "name": "Remem",
+    "email": "support@remem.io"
+  },
+  "plugins": [
+    {
+      "name": "remem-memory",
+      "description": "Session checkpoint and rollup workflows for Remem",
+      "version": "0.1.0",
+      "source": "./plugins/remem-memory",
+      "author": {
+        "name": "Remem",
+        "email": "support@remem.io"
+      }
+    }
+  ]
+}
