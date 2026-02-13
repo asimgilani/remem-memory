@@ -1,7 +1,7 @@
 {
   "name": "remem-memory",
   "description": "Session checkpoint and rollup workflows for Remem",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Remem",
     "email": "support@remem.io"
