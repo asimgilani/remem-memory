@@ -9,5 +9,6 @@
   "homepage": "https://remem.io",
   "repository": "https://github.com/asimgilani/remem-memory",
   "license": "MIT",
+  "hooks": "./hooks/hooks.json",
   "keywords": ["remem", "memory", "session", "checkpoints", "skills"]
 }

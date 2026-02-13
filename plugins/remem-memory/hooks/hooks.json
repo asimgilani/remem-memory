@@ -1,0 +1,41 @@
+{
+  "description": "Automatic Remem checkpoints and session rollups",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode post_tool_use",
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode task_completed",
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode session_end",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

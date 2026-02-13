@@ -11,6 +11,7 @@ Use this skill to persist coding-session progress into Remem so context survives
 
 - `REMEM_API_URL` and `REMEM_API_KEY` must be set.
 - Run `./install-codex-skill.sh` from the `remem-memory` repository first.
+- This skill does not create timed background checkpoints by itself; invoke helper commands during work or from your own scheduler.
 
 ## Checkpoint Workflow
 

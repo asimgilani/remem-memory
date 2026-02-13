@@ -11,6 +11,25 @@ Use this skill to store progress snapshots in Remem so future sessions can recov
 
 - Remem MCP server configured and available in Claude Code.
 - `remem_ingest` and `remem_query` tools available.
+- Set `REMEM_API_KEY` (and optionally `REMEM_API_URL`) in your shell environment.
+
+## Automatic Mode (Claude Hooks)
+
+When this plugin is enabled, hooks automatically:
+
+1. Capture interval checkpoints from `Write`, `Edit`, `MultiEdit`, and `Bash` tool activity.
+2. Capture milestone checkpoints on `TaskCompleted`.
+3. Generate a final rollup on `SessionEnd`.
+
+Tune behavior with environment variables:
+
+- `REMEM_MEMORY_PROJECT`: override project key (default: current folder name).
+- `REMEM_MEMORY_INTERVAL_SECONDS`: minimum seconds between interval checkpoints (default: 1200).
+- `REMEM_MEMORY_MIN_EVENTS`: minimum tool events before interval checkpoint (default: 4).
+- `REMEM_MEMORY_ROLLUP_ON_SESSION_END`: `1`/`0` toggle for final rollup.
+- `REMEM_MEMORY_AUTO_ENABLED`: `1`/`0` global toggle.
+
+If `REMEM_API_KEY` is not set, hooks keep local logs but skip ingest calls.
 
 ## Workflow
 

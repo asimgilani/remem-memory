@@ -7,6 +7,8 @@ Reusable session-memory workflows for Remem users, distributed independently fro
 - Claude marketplace manifest: `.claude-plugin/marketplace.json`
 - Claude plugin: `plugins/remem-memory`
   - Skill: `session-memory`
+  - Hooks: `hooks/hooks.json`
+  - Hook runner: `scripts/auto_memory_hook.py`
 - Codex skill: `codex/skills/remem-session-memory`
 - Helper scripts:
   - `scripts/remem_checkpoint.py`
@@ -48,6 +50,26 @@ From this repository root:
 
 3. Restart Claude Code.
 
+## Claude Auto Checkpoints
+
+The Claude plugin now runs automatic hooks:
+
+- `PostToolUse` (`Write|Edit|MultiEdit|Bash`) for interval checkpoints
+- `TaskCompleted` for milestone checkpoints
+- `SessionEnd` for final rollup
+
+If `REMEM_API_KEY` is unset, hooks still write local checkpoint logs but skip API ingest.
+
+Optional tuning env vars:
+
+```bash
+export REMEM_MEMORY_PROJECT="my-project"          # default: current folder name
+export REMEM_MEMORY_INTERVAL_SECONDS="1200"       # default: 20 minutes
+export REMEM_MEMORY_MIN_EVENTS="4"                # default: 4 tool events
+export REMEM_MEMORY_ROLLUP_ON_SESSION_END="1"     # default: enabled
+export REMEM_MEMORY_AUTO_ENABLED="1"              # default: enabled
+```
+
 ## Install in Codex
 
 From this repository root:
@@ -64,6 +86,14 @@ This installs:
   - `~/.local/bin/remem-memory-rollup`
 
 Restart Codex after installation.
+
+## Codex Behavior
+
+Codex installation is different from Claude plugins:
+
+- Codex uses local skills + helper commands (no Claude plugin marketplace).
+- The installed skill guides checkpoint/rollup workflow.
+- Automatic timed/background checkpoints are not native in Codex skill loading; use helper commands explicitly, or schedule with your own automation (for example cron/launchd or Codex app automations).
 
 ## Checkpoint examples
 
