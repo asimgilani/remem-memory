@@ -14,7 +14,7 @@
         ]
       }
     ],
-    "TaskCompleted": [
+    "Stop": [
       {
         "hooks": [
           {

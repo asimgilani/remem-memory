@@ -18,7 +18,7 @@ Use this skill to store progress snapshots in Remem so future sessions can recov
 When this plugin is enabled, hooks automatically:
 
 1. Capture interval checkpoints from `Write`, `Edit`, `MultiEdit`, and `Bash` tool activity.
-2. Capture milestone checkpoints on `TaskCompleted`.
+2. Capture milestone checkpoints on `Stop`.
 3. Generate a final rollup on `SessionEnd`.
 
 Tune behavior with environment variables:

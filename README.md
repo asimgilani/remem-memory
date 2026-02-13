@@ -55,7 +55,7 @@ From this repository root:
 The Claude plugin now runs automatic hooks:
 
 - `PostToolUse` (`Write|Edit|MultiEdit|Bash`) for interval checkpoints
-- `TaskCompleted` for milestone checkpoints
+- `Stop` for milestone checkpoints
 - `SessionEnd` for final rollup
 
 If `REMEM_API_KEY` is unset, hooks still write local checkpoint logs but skip API ingest.

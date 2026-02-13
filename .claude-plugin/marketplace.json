@@ -9,7 +9,7 @@
     {
       "name": "remem-memory",
       "description": "Session checkpoint and rollup workflows for Remem",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "source": "./plugins/remem-memory",
       "author": {
         "name": "Remem",
