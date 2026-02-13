@@ -17,7 +17,8 @@ try:
 except ModuleNotFoundError:
     import importlib.util
 
-    _CHECKPOINT_PATH = Path(__file__).with_name("remem_checkpoint.py")
+    # Resolve symlinked entrypoints (for ~/.local/bin installs) to locate sibling script reliably.
+    _CHECKPOINT_PATH = Path(__file__).resolve().with_name("remem_checkpoint.py")
     _SPEC = importlib.util.spec_from_file_location("remem_checkpoint", _CHECKPOINT_PATH)
     _MODULE = importlib.util.module_from_spec(_SPEC)
     assert _SPEC and _SPEC.loader

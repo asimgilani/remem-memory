@@ -7,7 +7,7 @@
     "email": "support@remem.io"
   },
   "homepage": "https://remem.io",
-  "repository": "https://github.com/remem-ai/remem-memory",
+  "repository": "https://github.com/asimgilani/remem-memory",
   "license": "MIT",
   "keywords": ["remem", "memory", "session", "checkpoints", "skills"]
 }

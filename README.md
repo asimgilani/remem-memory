@@ -1,19 +1,21 @@
 # remem-memory
 
-Reusable session-memory workflows for Remem users, designed to be shared independently from the private Remem backend repo.
+Reusable session-memory workflows for Remem users, distributed independently from the private Remem backend repository.
 
 ## What this package contains
 
-- Claude plugin marketplace entry (`.claude-plugin/marketplace.json`)
-- Claude plugin (`plugins/remem-memory`)
+- Claude marketplace manifest: `.claude-plugin/marketplace.json`
+- Claude plugin: `plugins/remem-memory`
   - Skill: `session-memory`
-- Codex skill (`codex/skills/remem-session-memory`)
-- Portable checkpoint scripts:
+- Codex skill: `codex/skills/remem-session-memory`
+- Helper scripts:
   - `scripts/remem_checkpoint.py`
   - `scripts/remem_rollup.py`
 
 ## Prerequisites
 
+- Python 3.10+
+- `httpx` installed
 - A Remem API key (`vlt_...`)
 - Environment variables:
 
@@ -22,16 +24,20 @@ export REMEM_API_URL="https://api.remem.io"
 export REMEM_API_KEY="vlt_your_key"
 ```
 
-- Remem MCP configured in your agent environment if you want direct `remem_query` / `remem_ingest` tool usage.
+Install Python dependency:
+
+```bash
+python -m pip install -r requirements.txt
+```
 
 ## Install in Claude Code (local marketplace)
 
-From the Remem repo root:
+From this repository root:
 
 1. Add marketplace:
 
 ```text
-/plugin marketplace add ./remem-memory
+/plugin marketplace add .
 ```
 
 2. Install plugin:
@@ -44,20 +50,27 @@ From the Remem repo root:
 
 ## Install in Codex
 
-Run:
+From this repository root:
 
 ```bash
-./remem-memory/install-codex-skill.sh
+./install-codex-skill.sh
 ```
 
-Then restart Codex.
+This installs:
+
+- Skill symlink: `~/.agents/skills/remem-session-memory`
+- Helper commands:
+  - `~/.local/bin/remem-memory-checkpoint`
+  - `~/.local/bin/remem-memory-rollup`
+
+Restart Codex after installation.
 
 ## Checkpoint examples
 
 Periodic checkpoint:
 
 ```bash
-python remem-memory/scripts/remem_checkpoint.py \
+remem-memory-checkpoint \
   --project my-project \
   --session-id 2026-02-13-session-a \
   --kind interval \
@@ -70,18 +83,23 @@ python remem-memory/scripts/remem_checkpoint.py \
 End-of-session rollup:
 
 ```bash
-python remem-memory/scripts/remem_rollup.py \
+remem-memory-rollup \
   --project my-project \
   --session-id 2026-02-13-session-a \
   --summary "Completed middleware refactor and tests" \
   --ingest
 ```
 
-## Publishing as its own repo
+## Verify setup
 
-This directory is intentionally self-contained. To publish:
+Dry-run checkpoint (no API write):
 
-1. Copy `remem-memory/` into a new git repository.
-2. Update plugin `repository` URL in `plugins/remem-memory/.claude-plugin/plugin.json`.
-3. Tag versions (for example `v0.1.0`).
-4. Share installation instructions from this README.
+```bash
+remem-memory-checkpoint --project smoke --session-id test --summary "ok" --dry-run --no-log
+```
+
+Dry-run rollup:
+
+```bash
+remem-memory-rollup --project smoke --session-id test --dry-run --no-log
+```

@@ -7,12 +7,17 @@ description: Use when coding sessions need periodic checkpoints and end-of-sessi
 
 Use this skill to persist coding-session progress into Remem so context survives memory resets across future sessions.
 
+## Prerequisites
+
+- `REMEM_API_URL` and `REMEM_API_KEY` must be set.
+- Run `./install-codex-skill.sh` from the `remem-memory` repository first.
+
 ## Checkpoint Workflow
 
 Run periodic checkpoints:
 
 ```bash
-python remem-memory/scripts/remem_checkpoint.py \
+remem-memory-checkpoint \
   --project remem \
   --session-id 2026-02-13-mcp-memory \
   --kind interval \
@@ -27,7 +32,7 @@ python remem-memory/scripts/remem_checkpoint.py \
 At session end, run:
 
 ```bash
-python remem-memory/scripts/remem_rollup.py \
+remem-memory-rollup \
   --project remem \
   --session-id 2026-02-13-mcp-memory \
   --summary "Implemented session-memory MVP with checkpoint metadata filters." \
