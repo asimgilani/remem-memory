@@ -103,6 +103,8 @@ Restart Codex after installation.
 
 ## API-First Commands
 
+Use these after running `./install-codex-skill.sh` (or otherwise placing scripts on your PATH).
+
 Checkpoint:
 
 ```bash
@@ -145,6 +147,8 @@ If you want in-chat tool-based recall (`remem_query`), keep MCP enabled. The Cla
 
 - `REMEM_API_URL` (default `https://api.remem.io`)
 - `REMEM_API_KEY` (required)
+
+If you only installed the Claude plugin and not the CLI commands, use MCP tools or direct API calls (`curl`) for recall queries.
 
 ## Verify Setup
 

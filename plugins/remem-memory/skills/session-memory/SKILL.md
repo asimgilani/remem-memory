@@ -49,18 +49,7 @@ If `REMEM_API_KEY` is not set, hooks keep local logs but skip ingest calls.
 
 ## Recall Pattern
 
-Use raw API recall via helper command:
-
-```bash
-remem-dev-sessions recall \
-  --query "What did we decide about query filters?" \
-  --mode rich \
-  --synthesize \
-  --checkpoint-project my-project \
-  --checkpoint-session 2026-02-13-session-a
-```
-
-If MCP `remem_query` is available, use the same filters:
+If MCP `remem_query` is available, use checkpoint filters directly:
 
 ```json
 {
@@ -72,6 +61,23 @@ If MCP `remem_query` is available, use the same filters:
     "checkpoint_session": ["2026-02-13-session-a"]
   }
 }
+```
+
+Without MCP, use raw API query:
+
+```bash
+curl -X POST "${REMEM_API_URL:-https://api.remem.io}/v1/query" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${REMEM_API_KEY}" \
+  -d '{
+    "query": "What did we decide about query filters?",
+    "mode": "rich",
+    "synthesize": true,
+    "filters": {
+      "checkpoint_project": ["my-project"],
+      "checkpoint_session": ["2026-02-13-session-a"]
+    }
+  }'
 ```
 
 ## Common Mistakes
