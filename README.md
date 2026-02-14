@@ -4,6 +4,16 @@ API-first coding-session memory workflows for Remem.
 
 This repository is still hosted as `remem-memory`, but the toolkit name is now `remem-dev-sessions`.
 
+## Codex Quick Install
+
+Tell Codex:
+
+```text
+Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/remem-memory/refs/heads/master/.codex/INSTALL.md
+```
+
+Detailed Codex guide: `docs/README.codex.md`
+
 ## What this package contains
 
 - Claude marketplace manifest: `.claude-plugin/marketplace.json`
