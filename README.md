@@ -1,18 +1,25 @@
-# remem-memory
+# remem-dev-sessions
 
-Reusable session-memory workflows for Remem users, distributed independently from the private Remem backend repository.
+API-first coding-session memory workflows for Remem.
+
+This repository is still hosted as `remem-memory`, but the toolkit name is now `remem-dev-sessions`.
 
 ## What this package contains
 
 - Claude marketplace manifest: `.claude-plugin/marketplace.json`
-- Claude plugin: `plugins/remem-memory`
+- Claude plugin source: `plugins/remem-memory`
   - Skill: `session-memory`
   - Hooks: `hooks/hooks.json`
   - Hook runner: `scripts/auto_memory_hook.py`
-- Codex skill: `codex/skills/remem-session-memory`
+  - Optional bundled MCP config: `.mcp.json`
+- Codex skills:
+  - `codex/skills/remem-dev-sessions` (canonical)
+  - `codex/skills/remem-session-memory` (legacy alias)
 - Helper scripts:
+  - `scripts/remem_dev_sessions.py` (unified CLI)
   - `scripts/remem_checkpoint.py`
   - `scripts/remem_rollup.py`
+  - `scripts/remem_recall.py`
 
 ## Prerequisites
 
@@ -26,7 +33,7 @@ export REMEM_API_URL="https://api.remem.io"
 export REMEM_API_KEY="vlt_your_key"
 ```
 
-Install Python dependency:
+Install dependency:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -45,20 +52,20 @@ From this repository root:
 2. Install plugin:
 
 ```text
-/plugin install remem-memory@remem-memory
+/plugin install remem-dev-sessions@remem-dev-sessions
 ```
 
 3. Restart Claude Code.
 
 ## Claude Auto Checkpoints
 
-The Claude plugin now runs automatic hooks:
+When enabled, hooks automatically run:
 
 - `PostToolUse` (`Write|Edit|MultiEdit|Bash`) for interval checkpoints
 - `Stop` for milestone checkpoints
 - `SessionEnd` for final rollup
 
-If `REMEM_API_KEY` is unset, hooks still write local checkpoint logs but skip API ingest.
+If `REMEM_API_KEY` is unset, hooks still write local checkpoint logs and skip API ingest.
 
 Optional tuning env vars:
 
@@ -80,27 +87,26 @@ From this repository root:
 
 This installs:
 
-- Skill symlink: `~/.agents/skills/remem-session-memory`
+- Skill symlink: `~/.agents/skills/remem-dev-sessions`
+- Legacy alias skill: `~/.agents/skills/remem-session-memory` (if present)
 - Helper commands:
+  - `~/.local/bin/remem-dev-sessions`
+  - `~/.local/bin/remem-dev-sessions-checkpoint`
+  - `~/.local/bin/remem-dev-sessions-rollup`
+  - `~/.local/bin/remem-dev-sessions-recall`
+- Legacy aliases:
   - `~/.local/bin/remem-memory-checkpoint`
   - `~/.local/bin/remem-memory-rollup`
+  - `~/.local/bin/remem-memory-recall`
 
 Restart Codex after installation.
 
-## Codex Behavior
+## API-First Commands
 
-Codex installation is different from Claude plugins:
-
-- Codex uses local skills + helper commands (no Claude plugin marketplace).
-- The installed skill guides checkpoint/rollup workflow.
-- Automatic timed/background checkpoints are not native in Codex skill loading; use helper commands explicitly, or schedule with your own automation (for example cron/launchd or Codex app automations).
-
-## Checkpoint examples
-
-Periodic checkpoint:
+Checkpoint:
 
 ```bash
-remem-memory-checkpoint \
+remem-dev-sessions checkpoint \
   --project my-project \
   --session-id 2026-02-13-session-a \
   --kind interval \
@@ -110,26 +116,52 @@ remem-memory-checkpoint \
   --ingest
 ```
 
-End-of-session rollup:
+Rollup:
 
 ```bash
-remem-memory-rollup \
+remem-dev-sessions rollup \
   --project my-project \
   --session-id 2026-02-13-session-a \
   --summary "Completed middleware refactor and tests" \
   --ingest
 ```
 
-## Verify setup
-
-Dry-run checkpoint (no API write):
+Recall:
 
 ```bash
-remem-memory-checkpoint --project smoke --session-id test --summary "ok" --dry-run --no-log
+remem-dev-sessions recall \
+  --query "What did we decide about auth middleware?" \
+  --mode rich \
+  --synthesize \
+  --checkpoint-project my-project \
+  --checkpoint-session 2026-02-13-session-a
+```
+
+## MCP: Optional Add-On
+
+This toolkit does not require MCP for ingest or recall.
+
+If you want in-chat tool-based recall (`remem_query`), keep MCP enabled. The Claude plugin includes a `.mcp.json` server config that uses:
+
+- `REMEM_API_URL` (default `https://api.remem.io`)
+- `REMEM_API_KEY` (required)
+
+## Verify Setup
+
+Dry-run checkpoint:
+
+```bash
+remem-dev-sessions checkpoint --project smoke --session-id test --summary "ok" --dry-run --no-log
 ```
 
 Dry-run rollup:
 
 ```bash
-remem-memory-rollup --project smoke --session-id test --dry-run --no-log
+remem-dev-sessions rollup --project smoke --session-id test --dry-run --no-log
+```
+
+Dry-run recall:
+
+```bash
+remem-dev-sessions recall --query "smoke test" --dry-run --no-log
 ```

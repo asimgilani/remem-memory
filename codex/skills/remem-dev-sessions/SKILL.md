@@ -1,19 +1,17 @@
 ---
-name: remem-session-memory
+name: remem-dev-sessions
 description: Use when coding sessions need periodic checkpoints and end-of-session rollups persisted to Remem with project/session metadata for later recall.
 ---
 
-# Remem Session Memory
+# Remem Dev Sessions
 
-Legacy alias skill. Prefer `remem-dev-sessions` for new installs.
-
-Use this workflow to persist coding-session progress into Remem so context survives memory resets across future sessions.
+Use this skill to persist coding-session progress into Remem so context survives memory resets across future sessions.
 
 ## Prerequisites
 
 - `REMEM_API_URL` and `REMEM_API_KEY` must be set.
 - Run `./install-codex-skill.sh` from this repository first.
-- This skill does not create timed background checkpoints by itself; invoke helper commands during work or from your own scheduler.
+- MCP is optional. This workflow works via raw API commands.
 
 ## Checkpoint Workflow
 
@@ -24,9 +22,9 @@ remem-dev-sessions checkpoint \
   --project remem \
   --session-id 2026-02-13-mcp-memory \
   --kind interval \
-  --summary "Added metadata merge and MCP filters for checkpoint recall." \
+  --summary "Added metadata merge and checkpoint query filters." \
   --decision "Store user metadata in encrypted document metadata." \
-  --next-action "Update docs-site and skill docs." \
+  --next-action "Update docs-site and migration notes." \
   --ingest
 ```
 
@@ -38,13 +36,11 @@ At session end, run:
 remem-dev-sessions rollup \
   --project remem \
   --session-id 2026-02-13-mcp-memory \
-  --summary "Implemented session-memory MVP with checkpoint metadata filters." \
+  --summary "Implemented session-memory workflow and docs updates." \
   --ingest
 ```
 
-## Recall Pattern
-
-Use raw API recall (MCP optional):
+## Recall Workflow (Raw API)
 
 ```bash
 remem-dev-sessions recall \
@@ -55,7 +51,9 @@ remem-dev-sessions recall \
   --checkpoint-session 2026-02-13-mcp-memory
 ```
 
-If MCP `remem_query` is available, use the same filters:
+## MCP Recall (Optional)
+
+If `remem_query` is available via MCP, you can use the same filter keys:
 
 ```json
 {

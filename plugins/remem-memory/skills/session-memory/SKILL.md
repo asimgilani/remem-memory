@@ -9,9 +9,8 @@ Use this skill to store progress snapshots in Remem so future sessions can recov
 
 ## Prerequisites
 
-- Remem MCP server configured and available in Claude Code.
-- `remem_ingest` and `remem_query` tools available.
 - Set `REMEM_API_KEY` (and optionally `REMEM_API_URL`) in your shell environment.
+- MCP is optional. Automatic checkpoints and rollups run through direct API calls.
 
 ## Automatic Mode (Claude Hooks)
 
@@ -34,7 +33,7 @@ If `REMEM_API_KEY` is not set, hooks keep local logs but skip ingest calls.
 ## Workflow
 
 1. During active coding, create a checkpoint every 20-30 minutes or after major decisions.
-2. Store each checkpoint using `remem_ingest` with metadata keys:
+2. Store each checkpoint with metadata keys:
    - `project`
    - `session_id`
    - `checkpoint_kind` (`interval`, `milestone`, `final`, `manual`)
@@ -50,7 +49,18 @@ If `REMEM_API_KEY` is not set, hooks keep local logs but skip ingest calls.
 
 ## Recall Pattern
 
-Use `remem_query` with filters:
+Use raw API recall via helper command:
+
+```bash
+remem-dev-sessions recall \
+  --query "What did we decide about query filters?" \
+  --mode rich \
+  --synthesize \
+  --checkpoint-project my-project \
+  --checkpoint-session 2026-02-13-session-a
+```
+
+If MCP `remem_query` is available, use the same filters:
 
 ```json
 {

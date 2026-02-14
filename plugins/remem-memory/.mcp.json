@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "remem": {
+      "command": "uvx",
+      "args": [
+        "-q",
+        "--from",
+        "git+https://github.com/asimgilani/remem.git@master#subdirectory=packages/remem-mcp",
+        "remem-mcp"
+      ],
+      "env": {
+        "REMEM_API_URL": "${REMEM_API_URL:-https://api.remem.io}",
+        "REMEM_API_KEY": "${REMEM_API_KEY}"
+      }
+    }
+  }
+}
