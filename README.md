@@ -93,6 +93,7 @@ This installs:
 - Helper commands:
   - `~/.local/bin/remem-dev-sessions`
   - `~/.local/bin/remem-dev-sessions-codex`
+  - `~/.local/bin/remem-codex`
   - `~/.local/bin/remem-dev-sessions-checkpoint`
   - `~/.local/bin/remem-dev-sessions-rollup`
   - `~/.local/bin/remem-dev-sessions-recall`
@@ -120,6 +121,12 @@ Equivalent shortcut:
 
 ```bash
 remem-dev-sessions-codex
+```
+
+Short alias:
+
+```bash
+remem-codex
 ```
 
 Behavior:

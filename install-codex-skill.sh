@@ -17,6 +17,7 @@ fi
 
 ln -sfn "${ROOT_DIR}/scripts/remem_dev_sessions.py" "${BIN_DIR}/remem-dev-sessions"
 ln -sfn "${ROOT_DIR}/scripts/remem_codex_wrapper.py" "${BIN_DIR}/remem-dev-sessions-codex"
+ln -sfn "${ROOT_DIR}/scripts/remem_codex_wrapper.py" "${BIN_DIR}/remem-codex"
 ln -sfn "${ROOT_DIR}/scripts/remem_checkpoint.py" "${BIN_DIR}/remem-dev-sessions-checkpoint"
 ln -sfn "${ROOT_DIR}/scripts/remem_rollup.py" "${BIN_DIR}/remem-dev-sessions-rollup"
 ln -sfn "${ROOT_DIR}/scripts/remem_recall.py" "${BIN_DIR}/remem-dev-sessions-recall"
@@ -41,6 +42,7 @@ fi
 echo "Installed helpers:"
 echo "  ${BIN_DIR}/remem-dev-sessions"
 echo "  ${BIN_DIR}/remem-dev-sessions-codex"
+echo "  ${BIN_DIR}/remem-codex"
 echo "  ${BIN_DIR}/remem-dev-sessions-checkpoint"
 echo "  ${BIN_DIR}/remem-dev-sessions-rollup"
 echo "  ${BIN_DIR}/remem-dev-sessions-recall"

@@ -18,7 +18,7 @@ Use this workflow to persist coding-session progress into Remem so context survi
 ## Recommended Launch
 
 ```bash
-remem-dev-sessions codex --
+remem-codex
 ```
 
 This runs periodic interval checkpoints, emits a milestone checkpoint on exit when changes exist, and writes a final rollup.

@@ -18,7 +18,7 @@ Use this skill to persist coding-session progress into Remem so context survives
 Start Codex through the wrapper so checkpoints happen automatically:
 
 ```bash
-remem-dev-sessions codex --
+remem-codex
 ```
 
 This runs periodic interval checkpoints, emits a milestone checkpoint on exit when changes exist, and writes a final rollup.
