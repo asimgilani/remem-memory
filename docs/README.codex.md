@@ -31,9 +31,14 @@ This wrapper creates interval checkpoints and a final rollup automatically.
 
 Without `REMEM_API_KEY`, local checkpoint logs still write, but API ingest is skipped.
 
-## Optional MCP
+## MCP in Codex
 
-MCP is optional for this workflow.
+Codex MCP config is installed automatically by `./install-codex-skill.sh`.
 
-- Ingest/checkpoint automation works through raw API.
-- MCP is useful if you want in-chat `remem_query` tool usage.
+Verify:
+
+```bash
+rg -n "mcp_servers.remem" ~/.codex/config.toml
+```
+
+After restarting Codex, `remem_query` should be available in Codex MCP tooling.

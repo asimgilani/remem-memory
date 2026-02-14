@@ -33,7 +33,8 @@ chmod +x \
   "${ROOT_DIR}/scripts/remem_codex_wrapper.py" \
   "${ROOT_DIR}/scripts/remem_checkpoint.py" \
   "${ROOT_DIR}/scripts/remem_rollup.py" \
-  "${ROOT_DIR}/scripts/remem_recall.py"
+  "${ROOT_DIR}/scripts/remem_recall.py" \
+  "${ROOT_DIR}/scripts/install_codex_mcp.py"
 
 echo "Installed Codex skill: ${SKILL_DST} -> ${SKILL_SRC}"
 if [[ -d "${LEGACY_SKILL_SRC}" ]]; then
@@ -54,4 +55,8 @@ echo "  ${BIN_DIR}/remem-memory-recall"
 if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
   echo "Add ${BIN_DIR} to your PATH to call helpers directly."
 fi
-echo "Restart Codex to reload skills."
+
+echo "Installing Codex MCP server config (~/.codex/config.toml)..."
+python3 "${ROOT_DIR}/scripts/install_codex_mcp.py"
+
+echo "Restart Codex to reload skills and MCP servers."

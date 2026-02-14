@@ -31,6 +31,7 @@ Detailed Codex guide: `docs/README.codex.md`
   - `scripts/remem_checkpoint.py`
   - `scripts/remem_rollup.py`
   - `scripts/remem_recall.py`
+  - `scripts/install_codex_mcp.py` (writes Codex MCP config)
 
 ## Prerequisites
 
@@ -112,6 +113,7 @@ This installs:
   - `~/.local/bin/remem-memory-checkpoint`
   - `~/.local/bin/remem-memory-rollup`
   - `~/.local/bin/remem-memory-recall`
+- Codex MCP config block in `~/.codex/config.toml` (`mcp_servers.remem`)
 
 Restart Codex after installation.
 
@@ -194,16 +196,18 @@ remem-dev-sessions recall \
   --checkpoint-session 2026-02-13-session-a
 ```
 
-## MCP: Optional Add-On
+## MCP in Codex and Claude
 
-This toolkit does not require MCP for ingest or recall.
+- Claude plugin bundles `.mcp.json` in `plugins/remem-memory`.
+- Codex install now writes `mcp_servers.remem` into `~/.codex/config.toml` via `scripts/install_codex_mcp.py`.
 
-If you want in-chat tool-based recall (`remem_query`), keep MCP enabled. The Claude plugin includes a `.mcp.json` server config that uses:
+For Codex, verify MCP config after install:
 
-- `REMEM_API_URL` (default `https://api.remem.io`)
-- `REMEM_API_KEY` (required)
+```bash
+rg -n "mcp_servers.remem" ~/.codex/config.toml
+```
 
-If you only installed the Claude plugin and not the CLI commands, use MCP tools or direct API calls (`curl`) for recall queries.
+If you change `REMEM_API_KEY` later, rerun `./install-codex-skill.sh` to refresh the Codex MCP env block.
 
 ## Verify Setup
 

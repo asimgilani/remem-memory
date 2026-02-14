@@ -1,6 +1,6 @@
 # Installing Remem Dev Sessions for Codex
 
-Enable automatic Remem checkpoints in Codex using the `remem-codex` wrapper.
+Enable automatic Remem checkpoints in Codex using the `remem-codex` wrapper, with MCP configured automatically.
 
 ## Prerequisites
 
@@ -15,11 +15,10 @@ Enable automatic Remem checkpoints in Codex using the `remem-codex` wrapper.
    git clone https://github.com/asimgilani/remem-memory.git ~/.codex/remem-dev-sessions
    ```
 
-2. **Install dependencies and commands:**
+2. **Install dependencies:**
    ```bash
    cd ~/.codex/remem-dev-sessions
    python3 -m pip install -r requirements.txt
-   ./install-codex-skill.sh
    ```
 
 3. **Ensure command PATH includes `~/.local/bin`:**
@@ -37,12 +36,19 @@ Enable automatic Remem checkpoints in Codex using the `remem-codex` wrapper.
    source ~/.zshrc
    ```
 
-5. **Restart Codex.**
+5. **Install skills/commands and MCP config:**
+   ```bash
+   cd ~/.codex/remem-dev-sessions
+   ./install-codex-skill.sh
+   ```
+
+6. **Restart Codex.**
 
 ## Verify
 
 ```bash
 which remem-codex
+rg -n "mcp_servers.remem" ~/.codex/config.toml
 remem-dev-sessions checkpoint --project smoke --session-id test --summary "ok" --dry-run --no-log
 ```
 
@@ -59,6 +65,8 @@ This automatically:
 - Creates periodic interval checkpoints (default 20 min)
 - Writes milestone checkpoint on Codex exit when changes exist
 - Writes final rollup on exit
+
+MCP (`remem_query`) is configured during install and available after restart.
 
 ## Update
 
