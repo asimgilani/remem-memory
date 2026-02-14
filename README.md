@@ -17,6 +17,7 @@ This repository is still hosted as `remem-memory`, but the toolkit name is now `
   - `codex/skills/remem-session-memory` (legacy alias)
 - Helper scripts:
   - `scripts/remem_dev_sessions.py` (unified CLI)
+  - `scripts/remem_codex_wrapper.py` (Codex wrapper with auto checkpoints)
   - `scripts/remem_checkpoint.py`
   - `scripts/remem_rollup.py`
   - `scripts/remem_recall.py`
@@ -91,10 +92,12 @@ This installs:
 - Legacy alias skill: `~/.agents/skills/remem-session-memory` (if present)
 - Helper commands:
   - `~/.local/bin/remem-dev-sessions`
+  - `~/.local/bin/remem-dev-sessions-codex`
   - `~/.local/bin/remem-dev-sessions-checkpoint`
   - `~/.local/bin/remem-dev-sessions-rollup`
   - `~/.local/bin/remem-dev-sessions-recall`
 - Legacy aliases:
+  - `~/.local/bin/remem-memory-codex`
   - `~/.local/bin/remem-memory-checkpoint`
   - `~/.local/bin/remem-memory-rollup`
   - `~/.local/bin/remem-memory-recall`
@@ -104,6 +107,41 @@ Restart Codex after installation.
 ## API-First Commands
 
 Use these after running `./install-codex-skill.sh` (or otherwise placing scripts on your PATH).
+
+## Codex Automatic Mode (Wrapper)
+
+Launch Codex through the wrapper:
+
+```bash
+remem-dev-sessions codex --
+```
+
+Equivalent shortcut:
+
+```bash
+remem-dev-sessions-codex
+```
+
+Behavior:
+
+- Starts a new session ID (unless `REMEM_MEMORY_SESSION_ID` is set).
+- Runs interval checkpoints in the background (default every 20 minutes).
+- Captures a milestone checkpoint on Codex exit if git changes are detected.
+- Writes a final rollup after exit (unless `--no-rollup`).
+
+Useful flags:
+
+```bash
+remem-dev-sessions codex --interval-seconds 900 --checkpoint-on-start -- --model gpt-5
+```
+
+- `--interval-seconds`: checkpoint cadence
+- `--checkpoint-on-start`: emit first checkpoint immediately
+- `--always-checkpoint`: emit even if git status has not changed
+- `--no-rollup`: disable final rollup
+- `--dry-run`: log payloads without ingesting
+
+If `REMEM_API_KEY` is not set, wrapper still writes local logs and skips API ingest.
 
 Checkpoint:
 

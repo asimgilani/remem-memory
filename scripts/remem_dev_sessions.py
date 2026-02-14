@@ -12,6 +12,7 @@ _COMMAND_TO_SCRIPT = {
     "checkpoint": "remem_checkpoint.py",
     "rollup": "remem_rollup.py",
     "recall": "remem_recall.py",
+    "codex": "remem_codex_wrapper.py",
 }
 
 

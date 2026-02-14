@@ -13,11 +13,19 @@ Use this workflow to persist coding-session progress into Remem so context survi
 
 - `REMEM_API_URL` and `REMEM_API_KEY` must be set.
 - Run `./install-codex-skill.sh` from this repository first.
-- This skill does not create timed background checkpoints by itself; invoke helper commands during work or from your own scheduler.
+- Use the Codex wrapper for automatic checkpoints.
+
+## Recommended Launch
+
+```bash
+remem-dev-sessions codex --
+```
+
+This runs periodic interval checkpoints, emits a milestone checkpoint on exit when changes exist, and writes a final rollup.
 
 ## Checkpoint Workflow
 
-Run periodic checkpoints:
+Manual checkpoints are still available:
 
 ```bash
 remem-dev-sessions checkpoint \

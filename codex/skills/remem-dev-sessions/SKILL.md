@@ -13,9 +13,19 @@ Use this skill to persist coding-session progress into Remem so context survives
 - Run `./install-codex-skill.sh` from this repository first.
 - MCP is optional. This workflow works via raw API commands.
 
+## Recommended Launch
+
+Start Codex through the wrapper so checkpoints happen automatically:
+
+```bash
+remem-dev-sessions codex --
+```
+
+This runs periodic interval checkpoints, emits a milestone checkpoint on exit when changes exist, and writes a final rollup.
+
 ## Checkpoint Workflow
 
-Run periodic checkpoints:
+Manual checkpoints are still available:
 
 ```bash
 remem-dev-sessions checkpoint \
