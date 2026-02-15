@@ -75,6 +75,7 @@ When enabled, hooks automatically run:
 
 - `PostToolUse` (`Write|Edit|MultiEdit|Bash`) for interval checkpoints
 - `Stop` for milestone checkpoints
+- `PreCompact` for milestone checkpoints before context compaction
 - `SessionEnd` for final rollup
 
 If `REMEM_API_KEY` is unset, hooks still write local checkpoint logs and skip API ingest.
@@ -87,6 +88,17 @@ export REMEM_MEMORY_INTERVAL_SECONDS="1200"       # default: 20 minutes
 export REMEM_MEMORY_MIN_EVENTS="4"                # default: 4 tool events
 export REMEM_MEMORY_ROLLUP_ON_SESSION_END="1"     # default: enabled
 export REMEM_MEMORY_AUTO_ENABLED="1"              # default: enabled
+```
+
+Optional LLM-backed summaries (recommended):
+
+- Produces narrative summaries plus populated `decisions`, `open_questions`, and `next_actions`.
+- Default provider order: Claude CLI (`claude`) -> Codex CLI (`codex`) -> Anthropic API -> OpenAI API.
+
+```bash
+export REMEM_MEMORY_SUMMARY_ENABLED="1"           # default: enabled; requires claude/codex CLI or API key
+export REMEM_MEMORY_SUMMARY_PROVIDER="claude_cli" # claude_cli|codex_cli|anthropic|openai
+export REMEM_MEMORY_SUMMARY_MODEL="haiku"         # provider-specific model id/alias
 ```
 
 ## Install in Codex

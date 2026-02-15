@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +29,15 @@ _DEFAULT_MIN_EVENTS = 4
 _DEFAULT_STATE_PATH = ".remem/auto-memory-state.json"
 _DEFAULT_LOG_PATH = ".remem/session-checkpoints.ndjson"
 _DEFAULT_API_URL = "https://api.remem.io"
+_DEFAULT_SUMMARY_MAX_MESSAGES = 80
+_DEFAULT_SUMMARY_HEAD_LINES = 120
+_DEFAULT_SUMMARY_TAIL_LINES = 600
+_DEFAULT_SUMMARY_MAX_CHARS = 12000
+_DEFAULT_SUMMARY_MAX_TOKENS = 700
+_DEFAULT_SUMMARY_MODEL_CLAUDE_CLI = "haiku"
+_DEFAULT_SUMMARY_MODEL_CODEX_CLI = "gpt-5.3-codex-spark"
+_DEFAULT_SUMMARY_MODEL_ANTHROPIC = "claude-3-5-haiku-20241022"
+_DEFAULT_SUMMARY_MODEL_OPENAI = "gpt-4.1-nano"
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,16 @@ class Config:
     log_path: Path
     enabled: bool
     rollup_on_session_end: bool
+
+
+@dataclass(frozen=True)
+class StructuredSummary:
+    summary: str
+    decisions: list[str]
+    open_questions: list[str]
+    next_actions: list[str]
+    provider: str
+    model: str
 
 
 def _utc_now() -> datetime:
@@ -142,6 +164,7 @@ def _default_state(session_id: str) -> dict[str, Any]:
         "recent_events": [],
         "checkpoints_created": 0,
         "last_rollup_epoch": 0.0,
+        "transcript_path": "",
     }
 
 
@@ -232,6 +255,597 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
+def _sanitize_items(items: Any, *, limit: int) -> list[str]:
+    out: list[str] = []
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        cleaned = " ".join(item.strip().split())
+        if not cleaned:
+            continue
+        out.append(cleaned)
+        if len(out) >= limit:
+            break
+    return _dedupe(out)
+
+
+def _llm_enabled() -> bool:
+    if not _bool_env("REMEM_MEMORY_SUMMARY_ENABLED", True):
+        return False
+    return _select_llm_provider() is not None
+
+
+def _normalize_provider(value: str) -> str | None:
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    mapping = {
+        "claude": "claude_cli",
+        "claude-cli": "claude_cli",
+        "claude_cli": "claude_cli",
+        "codex": "codex_cli",
+        "codex-cli": "codex_cli",
+        "codex_cli": "codex_cli",
+    }
+    raw = mapping.get(raw, raw)
+    if raw in {"claude_cli", "codex_cli", "anthropic", "openai"}:
+        return raw
+    return None
+
+
+def _provider_available(provider: str) -> bool:
+    if provider == "claude_cli":
+        return shutil.which("claude") is not None
+    if provider == "codex_cli":
+        return shutil.which("codex") is not None
+    if provider == "anthropic":
+        return bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+    if provider == "openai":
+        return bool(os.getenv("OPENAI_API_KEY", "").strip())
+    return False
+
+
+def _select_llm_provider() -> str | None:
+    forced_raw = os.getenv("REMEM_MEMORY_SUMMARY_PROVIDER", "")
+    forced = _normalize_provider(forced_raw)
+    if forced is not None:
+        return forced if _provider_available(forced) else None
+
+    for candidate in ("claude_cli", "codex_cli", "anthropic", "openai"):
+        if _provider_available(candidate):
+            return candidate
+    return None
+
+
+def _llm_model_for(provider: str) -> str:
+    override = os.getenv("REMEM_MEMORY_SUMMARY_MODEL", "").strip()
+    if override:
+        return override
+    if provider == "claude_cli":
+        return _DEFAULT_SUMMARY_MODEL_CLAUDE_CLI
+    if provider == "codex_cli":
+        return _DEFAULT_SUMMARY_MODEL_CODEX_CLI
+    if provider == "openai":
+        return _DEFAULT_SUMMARY_MODEL_OPENAI
+    return _DEFAULT_SUMMARY_MODEL_ANTHROPIC
+
+
+def _extract_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                text = item["text"].strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(content, dict):
+        if content.get("type") == "text" and isinstance(content.get("text"), str):
+            return content["text"].strip()
+    return ""
+
+
+def _summarize_tool_use_items(items: Any) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        tool_input = item.get("input")
+        tool_input = tool_input if isinstance(tool_input, dict) else {}
+        snippet = name.strip()
+        if name == "Bash":
+            cmd = tool_input.get("command")
+            if isinstance(cmd, str) and cmd.strip():
+                cmd = " ".join(cmd.strip().split())
+                snippet = f"Bash {cmd[:180]}{'...' if len(cmd) > 180 else ''}"
+        else:
+            path = tool_input.get("file_path") or tool_input.get("path")
+            if isinstance(path, str) and path.strip():
+                snippet = f"{name} {path.strip()}"
+        out.append(snippet)
+    return out
+
+
+def _read_transcript_excerpt(transcript_path: str) -> str:
+    path = Path(transcript_path)
+    if not transcript_path or not path.exists():
+        return ""
+
+    head_lines = _int_env("REMEM_MEMORY_SUMMARY_HEAD_LINES", _DEFAULT_SUMMARY_HEAD_LINES)
+    tail_lines = _int_env("REMEM_MEMORY_SUMMARY_TAIL_LINES", _DEFAULT_SUMMARY_TAIL_LINES)
+    max_messages = _int_env("REMEM_MEMORY_SUMMARY_MAX_MESSAGES", _DEFAULT_SUMMARY_MAX_MESSAGES)
+    max_chars = _int_env("REMEM_MEMORY_SUMMARY_MAX_CHARS", _DEFAULT_SUMMARY_MAX_CHARS)
+
+    head_lines = max(0, int(head_lines))
+    tail_lines = max(0, int(tail_lines))
+    max_messages = max(1, int(max_messages))
+    max_chars = max(500, int(max_chars))
+
+    head: list[str] = []
+    tail: deque[str] = deque(maxlen=max(1, tail_lines or 1))
+    total_lines = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for total_lines, line in enumerate(fh, start=1):
+                line = line.rstrip("\n")
+                if head_lines and total_lines <= head_lines:
+                    head.append(line)
+                if tail_lines:
+                    tail.append(line)
+    except OSError:
+        return ""
+
+    if total_lines <= 0:
+        return ""
+
+    tail_list = list(tail) if tail_lines else []
+    if not tail_list or total_lines <= head_lines:
+        combined = head
+    else:
+        tail_start_idx = max(0, total_lines - tail_lines)
+        overlap = max(0, head_lines - tail_start_idx)
+        combined = head + tail_list[overlap:]
+
+    turns: list[str] = []
+    for raw in combined:
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        row_type = row.get("type")
+        if row_type not in {"user", "assistant"}:
+            continue
+        message = row.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if row_type == "assistant" and role != "assistant":
+            continue
+        if row_type == "user" and role != "user":
+            continue
+
+        content = message.get("content")
+        text = _extract_text_from_content(content)
+
+        # Drop bulky tool_result payloads from user pseudo-messages.
+        if isinstance(content, list) and any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content):
+            text = ""
+
+        if row_type == "assistant" and isinstance(content, list):
+            if not text:
+                tool_summaries = _summarize_tool_use_items(content)
+                if tool_summaries:
+                    text = "\n".join(f"[tool] {s}" for s in tool_summaries[:3]).strip()
+            else:
+                tool_summaries = _summarize_tool_use_items(content)
+                if tool_summaries:
+                    text = f"{text}\n[tool] {tool_summaries[0]}".strip()
+
+        if not text:
+            continue
+
+        lowered = text.lower()
+        if "<local-command-caveat>" in lowered or "<local-command-stdout>" in lowered:
+            continue
+
+        speaker = "User" if row_type == "user" else "Assistant"
+        turns.append(f"{speaker}: {text}")
+
+    turns = turns[-max_messages:]
+    excerpt = "\n\n".join(turns).strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[-max_chars:]
+        cut = excerpt.find("User: ")
+        if cut > 0:
+            excerpt = excerpt[cut:]
+    return excerpt.strip()
+
+
+def _extract_json_object(raw: str) -> dict[str, Any] | None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _call_anthropic(prompt: str, *, model: str, max_tokens: int, timeout: int) -> str | None:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return None
+    req = urllib_request.Request(
+        url="https://api.anthropic.com/v1/messages",
+        data=json.dumps(
+            {
+                "model": model,
+                "max_tokens": max(64, int(max_tokens)),
+                "temperature": 0.2,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            ensure_ascii=True,
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        content = data.get("content")
+        if isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict) and isinstance(first.get("text"), str):
+                return first["text"]
+    except Exception:
+        return None
+    return None
+
+
+def _call_openai(prompt: str, *, model: str, max_tokens: int, timeout: int) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    req = urllib_request.Request(
+        url="https://api.openai.com/v1/chat/completions",
+        data=json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max(64, int(max_tokens)),
+                "temperature": 0.2,
+            },
+            ensure_ascii=True,
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            msg = first.get("message") if isinstance(first, dict) else {}
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                return msg["content"]
+    except Exception:
+        return None
+    return None
+
+
+def _call_claude_cli(prompt: str, *, model: str, timeout: int) -> str | None:
+    if shutil.which("claude") is None:
+        return None
+
+    # Prevent nested Claude invocations from recursively triggering this plugin's hooks.
+    env = os.environ.copy()
+    env["REMEM_MEMORY_AUTO_ENABLED"] = "0"
+    env["REMEM_MEMORY_SUMMARY_ENABLED"] = "0"
+    env.setdefault("NO_COLOR", "1")
+
+    cmd = [
+        "claude",
+        "-p",
+        "--model",
+        model,
+        "--output-format",
+        "text",
+        "--no-session-persistence",
+        "--tools",
+        "",
+        "--disable-slash-commands",
+        "--setting-sources",
+        "user",
+        "--permission-mode",
+        "bypassPermissions",
+        prompt,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
+
+
+def _codex_summary_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["summary", "decisions", "open_questions", "next_actions"],
+        "properties": {
+            "summary": {"type": "string"},
+            "decisions": {"type": "array", "items": {"type": "string"}},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+            "next_actions": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def _call_codex_cli(prompt: str, *, model: str, timeout: int) -> str | None:
+    if shutil.which("codex") is None:
+        return None
+
+    base_home = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    auth_src = base_home / "auth.json"
+    if not auth_src.exists():
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="remem-codex-summary-") as tmpdir:
+        codex_home = Path(tmpdir)
+        try:
+            shutil.copy2(auth_src, codex_home / "auth.json")
+        except OSError:
+            return None
+
+        # Use a minimal AGENTS.md to avoid executing user-wide agent workflows.
+        (codex_home / "AGENTS.md").write_text(
+            "You are a summarization engine.\n"
+            "Do not run commands. Do not use tools. Do not read local files.\n"
+            "Return only the structured JSON requested.\n",
+            encoding="utf-8",
+        )
+
+        schema_path = codex_home / "output-schema.json"
+        schema_path.write_text(json.dumps(_codex_summary_schema(), ensure_ascii=True), encoding="utf-8")
+        out_path = codex_home / "last-message.txt"
+
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(codex_home)
+        env.setdefault("NO_COLOR", "1")
+
+        cmd = [
+            "codex",
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "-s",
+            "read-only",
+            "-m",
+            model,
+            "--color",
+            "never",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(out_path),
+            "-",
+        ]
+        try:
+            subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
+        except Exception:
+            return None
+
+        if not out_path.exists():
+            return None
+        rendered = out_path.read_text(encoding="utf-8", errors="ignore").strip()
+        return rendered or None
+
+
+def _prompt_llm(prompt: str) -> tuple[str | None, str | None, str | None]:
+    provider = _select_llm_provider()
+    if not provider:
+        return None, None, None
+    model = _llm_model_for(provider)
+    timeout = _int_env("REMEM_MEMORY_SUMMARY_TIMEOUT_SECONDS", 15)
+    max_tokens = _int_env("REMEM_MEMORY_SUMMARY_MAX_TOKENS", _DEFAULT_SUMMARY_MAX_TOKENS)
+    if provider == "claude_cli":
+        return _call_claude_cli(prompt, model=model, timeout=timeout), provider, model
+    if provider == "codex_cli":
+        return _call_codex_cli(prompt, model=model, timeout=timeout), provider, model
+    if provider == "openai":
+        return _call_openai(prompt, model=model, max_tokens=max_tokens, timeout=timeout), provider, model
+    return _call_anthropic(prompt, model=model, max_tokens=max_tokens, timeout=timeout), provider, model
+
+
+def _generate_checkpoint_structured_summary(
+    *,
+    config: Config,
+    kind: str,
+    hook_event: str,
+    files_touched: list[str],
+    recent_activity: list[str],
+    transcript_path: str | None,
+) -> StructuredSummary | None:
+    if not _llm_enabled() or not transcript_path:
+        return None
+    excerpt = _read_transcript_excerpt(transcript_path)
+    if not excerpt:
+        return None
+
+    files_block = "\n".join(f"- {p}" for p in files_touched[:12]) if files_touched else "- (none)"
+    activity_block = "\n".join(f"- {a}" for a in recent_activity[:12]) if recent_activity else "- (none)"
+    prompt = (
+        "You are generating a coding-session checkpoint for future engineers/agents.\n"
+        "Return ONLY valid JSON (no markdown) with keys: summary, decisions, open_questions, next_actions.\n"
+        "\n"
+        "Rules:\n"
+        "- summary: 2-5 sentences, concrete technical details, mention outcomes.\n"
+        "- decisions/open_questions/next_actions: arrays of strings, 0-10 items each.\n"
+        "- Keep each bullet under 140 characters.\n"
+        "- Do not include secrets or API keys; redact as [REDACTED] if needed.\n"
+        "\n"
+        f"Project: {config.project}\n"
+        f"Session: {config.session_id}\n"
+        f"Checkpoint kind: {kind}\n"
+        f"Trigger: {hook_event}\n"
+        "\n"
+        "Files touched (from tool activity):\n"
+        f"{files_block}\n"
+        "\n"
+        "Recent tool activity (high level):\n"
+        f"{activity_block}\n"
+        "\n"
+        "Conversation excerpt:\n"
+        f"{excerpt}\n"
+    )
+    raw, provider, model = _prompt_llm(prompt)
+    if not raw or not provider or not model:
+        return None
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return None
+    summary = parsed.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    decisions = _sanitize_items(parsed.get("decisions"), limit=10)
+    open_questions = _sanitize_items(parsed.get("open_questions"), limit=10)
+    next_actions = _sanitize_items(parsed.get("next_actions"), limit=10)
+    return StructuredSummary(
+        summary=summary.strip(),
+        decisions=decisions,
+        open_questions=open_questions,
+        next_actions=next_actions,
+        provider=provider,
+        model=model,
+    )
+
+
+def _extract_summary_from_markdown(content: str) -> str:
+    if not content or "## Summary" not in content:
+        return ""
+    after = content.split("## Summary", 1)[1].lstrip("\n")
+    lines: list[str] = []
+    for line in after.splitlines():
+        if line.startswith("## "):
+            break
+        if line.strip():
+            lines.append(line.strip())
+        if len(lines) >= 6:
+            break
+    return " ".join(lines).strip()
+
+
+def _generate_rollup_structured_summary(
+    *,
+    config: Config,
+    checkpoint_summaries: list[str],
+    decisions: list[str],
+    open_questions: list[str],
+    next_actions: list[str],
+) -> StructuredSummary | None:
+    if not _llm_enabled():
+        return None
+    if not checkpoint_summaries and not decisions and not open_questions and not next_actions:
+        return None
+
+    summaries_block = "\n".join(f"- {s}" for s in checkpoint_summaries[:40]) if checkpoint_summaries else "- (none)"
+    decisions_block = "\n".join(f"- {s}" for s in decisions[:40]) if decisions else "- (none)"
+    open_block = "\n".join(f"- {s}" for s in open_questions[:40]) if open_questions else "- (none)"
+    next_block = "\n".join(f"- {s}" for s in next_actions[:40]) if next_actions else "- (none)"
+
+    prompt = (
+        "You are synthesizing a coding-session rollup from checkpoint notes.\n"
+        "Return ONLY valid JSON (no markdown) with keys: summary, decisions, open_questions, next_actions.\n"
+        "\n"
+        "Rules:\n"
+        "- summary: 1-3 short paragraphs. Mention major outcomes, failures, and next steps.\n"
+        "- Consolidate duplicates and keep the most important items.\n"
+        "- Keep each bullet under 140 characters.\n"
+        "\n"
+        f"Project: {config.project}\n"
+        f"Session: {config.session_id}\n"
+        "\n"
+        "Checkpoint summaries:\n"
+        f"{summaries_block}\n"
+        "\n"
+        "Decisions (raw):\n"
+        f"{decisions_block}\n"
+        "\n"
+        "Open questions (raw):\n"
+        f"{open_block}\n"
+        "\n"
+        "Next actions (raw):\n"
+        f"{next_block}\n"
+    )
+    raw, provider, model = _prompt_llm(prompt)
+    if not raw or not provider or not model:
+        return None
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return None
+    summary = parsed.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    return StructuredSummary(
+        summary=summary.strip(),
+        decisions=_sanitize_items(parsed.get("decisions"), limit=18),
+        open_questions=_sanitize_items(parsed.get("open_questions"), limit=18),
+        next_actions=_sanitize_items(parsed.get("next_actions"), limit=18),
+        provider=provider,
+        model=model,
+    )
+
+
 def _build_checkpoint_payload(
     *,
     config: Config,
@@ -239,6 +853,7 @@ def _build_checkpoint_payload(
     hook_event: str,
     recent_events: list[dict[str, Any]],
     events_since_checkpoint: int,
+    transcript_path: str | None,
 ) -> dict[str, Any]:
     timestamp = _utc_now_iso()
     project_slug = _slug(config.project)
@@ -252,10 +867,35 @@ def _build_checkpoint_payload(
         ]
     )
     recent_activity = _dedupe([str(event.get("summary", "")).strip() for event in recent_events])[:8]
-    summary = (
-        f"Automatic {kind} checkpoint after {events_since_checkpoint} tool events."
-        f" Recent files: {', '.join(files_touched[:5]) if files_touched else 'none'}."
+    if events_since_checkpoint > 0:
+        summary = (
+            f"Automatic {kind} checkpoint after {events_since_checkpoint} tool events."
+            f" Recent files: {', '.join(files_touched[:5]) if files_touched else 'none'}."
+        )
+    else:
+        summary = (
+            f"Automatic {kind} checkpoint triggered by {hook_event}."
+            f" Recent files: {', '.join(files_touched[:5]) if files_touched else 'none'}."
+        )
+
+    structured = _generate_checkpoint_structured_summary(
+        config=config,
+        kind=kind,
+        hook_event=hook_event,
+        files_touched=files_touched,
+        recent_activity=recent_activity,
+        transcript_path=transcript_path,
     )
+    summary_text = structured.summary if structured else summary
+    decisions = structured.decisions if structured else []
+    open_questions = structured.open_questions if structured else []
+    next_actions = structured.next_actions if structured else []
+    llm_meta: dict[str, Any] = {}
+    if structured:
+        llm_meta = {
+            "llm_summary_provider": structured.provider,
+            "llm_summary_model": structured.model,
+        }
 
     lines = [
         "# Coding Session Checkpoint (Auto)",
@@ -268,13 +908,19 @@ def _build_checkpoint_payload(
         f"- Trigger: {hook_event}",
         "",
         "## Summary",
-        summary,
+        summary_text,
         "",
     ]
     if files_touched:
         lines.extend(["## Files Touched", *[f"- {item}" for item in files_touched], ""])
     if recent_activity:
         lines.extend(["## Recent Activity", *[f"- {item}" for item in recent_activity], ""])
+    if decisions:
+        lines.extend(["## Decisions", *[f"- {item}" for item in decisions], ""])
+    if open_questions:
+        lines.extend(["## Open Questions", *[f"- {item}" for item in open_questions], ""])
+    if next_actions:
+        lines.extend(["## Next Actions", *[f"- {item}" for item in next_actions], ""])
 
     source_id = f"auto-checkpoint:{project_slug}:{session_slug}:{kind}:{timestamp}".replace(":", "").replace("-", "")
     source_id = source_id[:200]
@@ -289,9 +935,10 @@ def _build_checkpoint_payload(
             "timestamp": timestamp,
             "repo_root": str(config.cwd),
             "files_touched": files_touched,
-            "decisions": [],
-            "open_questions": [],
-            "next_actions": [],
+            "summary": summary_text,
+            "decisions": decisions,
+            "open_questions": open_questions,
+            "next_actions": next_actions,
             "tags": [
                 "memory:checkpoint",
                 "memory:auto",
@@ -301,6 +948,7 @@ def _build_checkpoint_payload(
             ],
             "automation": "claude-hook",
             "hook_event": hook_event,
+            **llm_meta,
         },
         "source": "quick_capture",
         "source_id": source_id,
@@ -343,18 +991,63 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     session_slug = _slug(config.session_id)
     files_touched: list[str] = []
     checkpoints: list[str] = []
+    checkpoint_summaries: list[str] = []
+    decisions: list[str] = []
+    open_questions: list[str] = []
+    next_actions: list[str] = []
     for row in records:
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
         title = payload.get("title")
         if isinstance(title, str) and title.strip():
             checkpoints.append(title.strip())
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        summary_text = metadata.get("summary")
+        if isinstance(summary_text, str) and summary_text.strip():
+            checkpoint_summaries.append(summary_text.strip())
+        else:
+            content = payload.get("content")
+            if isinstance(content, str):
+                extracted = _extract_summary_from_markdown(content)
+                if extracted:
+                    checkpoint_summaries.append(extracted)
+
+        for value in metadata.get("decisions") or []:
+            if isinstance(value, str) and value.strip():
+                decisions.append(value.strip())
+        for value in metadata.get("open_questions") or []:
+            if isinstance(value, str) and value.strip():
+                open_questions.append(value.strip())
+        for value in metadata.get("next_actions") or []:
+            if isinstance(value, str) and value.strip():
+                next_actions.append(value.strip())
         for value in metadata.get("files_touched") or []:
             if isinstance(value, str):
                 files_touched.append(value)
 
     files_touched = _dedupe(files_touched)
     checkpoints = _dedupe(checkpoints)
+    checkpoint_summaries = _dedupe(checkpoint_summaries)
+    decisions = _dedupe(decisions)
+    open_questions = _dedupe(open_questions)
+    next_actions = _dedupe(next_actions)
+
+    structured = _generate_rollup_structured_summary(
+        config=config,
+        checkpoint_summaries=checkpoint_summaries,
+        decisions=decisions,
+        open_questions=open_questions,
+        next_actions=next_actions,
+    )
+    rollup_summary = (
+        structured.summary
+        if structured and structured.summary
+        else "Automatic final rollup generated from checkpoint activity captured during this session."
+    )
+    if structured:
+        decisions = structured.decisions or decisions
+        open_questions = structured.open_questions or open_questions
+        next_actions = structured.next_actions or next_actions
+
     lines = [
         "# Coding Session Rollup (Auto)",
         f"- Project: {config.project}",
@@ -363,16 +1056,29 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
         f"- Checkpoints summarized: {len(records)}",
         "",
         "## Summary",
-        "Automatic final rollup generated from checkpoint activity captured during this session.",
+        rollup_summary,
         "",
     ]
     if checkpoints:
         lines.extend(["## Included Checkpoints", *[f"- {item}" for item in checkpoints], ""])
     if files_touched:
         lines.extend(["## Files Touched", *[f"- {item}" for item in files_touched], ""])
+    if decisions:
+        lines.extend(["## Decisions", *[f"- {item}" for item in decisions], ""])
+    if open_questions:
+        lines.extend(["## Open Questions", *[f"- {item}" for item in open_questions], ""])
+    if next_actions:
+        lines.extend(["## Next Actions", *[f"- {item}" for item in next_actions], ""])
 
     source_id = f"auto-rollup:{project_slug}:{session_slug}:{timestamp}".replace(":", "").replace("-", "")
     source_id = source_id[:200]
+
+    llm_meta: dict[str, Any] = {}
+    if structured:
+        llm_meta = {
+            "llm_summary_provider": structured.provider,
+            "llm_summary_model": structured.model,
+        }
 
     return {
         "title": f"{config.project} | {config.session_id} | final rollup (auto)",
@@ -382,6 +1088,10 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
             "session_id": config.session_id,
             "checkpoint_kind": "final",
             "timestamp": timestamp,
+            "summary": rollup_summary,
+            "decisions": decisions,
+            "open_questions": open_questions,
+            "next_actions": next_actions,
             "tags": [
                 "memory:checkpoint",
                 "memory:rollup",
@@ -392,6 +1102,7 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
             ],
             "automation": "claude-hook",
             "hook_event": "SessionEnd",
+            **llm_meta,
         },
         "source": "quick_capture",
         "source_id": source_id,
@@ -436,12 +1147,15 @@ def _persist_checkpoint(
     recent_events = state.get("recent_events")
     recent_events = recent_events if isinstance(recent_events, list) else []
     events_since = int(state.get("events_since_checkpoint") or 0)
+    transcript_path = state.get("transcript_path")
+    transcript_path = transcript_path if isinstance(transcript_path, str) and transcript_path.strip() else None
     payload = _build_checkpoint_payload(
         config=config,
         kind=kind,
         hook_event=hook_event,
         recent_events=[event for event in recent_events if isinstance(event, dict)],
         events_since_checkpoint=events_since,
+        transcript_path=transcript_path,
     )
     response = _ingest(config, payload)
     _append_ndjson(
@@ -481,6 +1195,9 @@ def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
         state["project"] = config.project
+        transcript_path = payload.get("transcript_path")
+        if isinstance(transcript_path, str) and transcript_path.strip():
+            state["transcript_path"] = transcript_path.strip()
         recent = state.get("recent_events")
         recent = recent if isinstance(recent, list) else []
         recent.append(event)
@@ -506,6 +1223,9 @@ def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
+        transcript_path = payload.get("transcript_path")
+        if isinstance(transcript_path, str) and transcript_path.strip():
+            state["transcript_path"] = transcript_path.strip()
         events_since = int(state.get("events_since_checkpoint") or 0)
         if events_since <= 0:
             _save_state(config.state_path, state)
@@ -524,10 +1244,43 @@ def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
     return 0
 
 
+def _handle_pre_compact(config: Config, payload: dict[str, Any]) -> int:
+    lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
+    with _state_lock(lock_path):
+        state = _load_state(config.state_path, config.session_id)
+        state["project"] = config.project
+        transcript_path = payload.get("transcript_path")
+        if isinstance(transcript_path, str) and transcript_path.strip():
+            state["transcript_path"] = transcript_path.strip()
+
+        # Avoid spamming duplicate checkpoints if PreCompact fires repeatedly without new activity.
+        last_epoch = float(state.get("last_checkpoint_epoch") or 0.0)
+        events_since = int(state.get("events_since_checkpoint") or 0)
+        if last_epoch > 0 and events_since <= 0 and (_utc_now().timestamp() - last_epoch) < 30:
+            _save_state(config.state_path, state)
+            return 0
+
+        _persist_checkpoint(
+            config=config,
+            kind="milestone",
+            hook_event=str(payload.get("hook_event_name") or "PreCompact"),
+            state=state,
+        )
+        state["last_checkpoint_epoch"] = _utc_now().timestamp()
+        state["events_since_checkpoint"] = 0
+        state["recent_events"] = []
+        state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+        _save_state(config.state_path, state)
+    return 0
+
+
 def _handle_session_end(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
+        transcript_path = payload.get("transcript_path")
+        if isinstance(transcript_path, str) and transcript_path.strip():
+            state["transcript_path"] = transcript_path.strip()
         events_since = int(state.get("events_since_checkpoint") or 0)
         if events_since > 0:
             _persist_checkpoint(
@@ -552,7 +1305,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("post_tool_use", "task_completed", "session_end"),
+        choices=("post_tool_use", "task_completed", "pre_compact", "session_end"),
         help="Hook mode to execute.",
     )
     return parser.parse_args(argv)
@@ -568,6 +1321,8 @@ def main(argv: list[str] | None = None) -> int:
         return _handle_post_tool_use(config, payload)
     if args.mode == "task_completed":
         return _handle_task_completed(config, payload)
+    if args.mode == "pre_compact":
+        return _handle_pre_compact(config, payload)
     return _handle_session_end(config, payload)
 
 

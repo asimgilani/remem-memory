@@ -26,6 +26,18 @@
         ]
       }
     ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode pre_compact",
+            "async": true,
+            "timeout": 60
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

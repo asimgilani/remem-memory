@@ -9,7 +9,7 @@
     {
       "name": "remem-dev-sessions",
       "description": "Automatic session checkpoint and rollup workflows for Remem",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": "./plugins/remem-memory",
       "author": {
         "name": "Remem",

@@ -1,7 +1,7 @@
 {
   "name": "remem-dev-sessions",
   "description": "Automatic coding-session checkpoints and rollups for Remem",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "Remem",
     "email": "support@remem.io"
