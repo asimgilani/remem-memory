@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,11 @@ _SPEC.loader.exec_module(_MODULE)
 
 
 class CodexWrapperTests(unittest.TestCase):
+    def test_utc_now_helper_exists_and_returns_datetime(self) -> None:
+        now = _MODULE._utc_now()
+        self.assertIsInstance(now, datetime)
+        self.assertIsNotNone(now.tzinfo)
+
     def test_parse_porcelain_paths_handles_rename_and_untracked(self) -> None:
         lines = [
             " M src/main.py",

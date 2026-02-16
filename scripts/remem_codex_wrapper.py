@@ -39,8 +39,12 @@ class StructuredSummary:
     model: str
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _utc_now().isoformat()
 
 
 def _int_env(name: str, default: int) -> int:
