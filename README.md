@@ -159,6 +159,23 @@ Behavior:
 - Runs interval checkpoints in the background (default every 20 minutes).
 - Captures a milestone checkpoint on Codex exit if git changes are detected.
 - Writes a final rollup after exit (unless `--no-rollup`).
+- Reads Codex session transcripts and generates structured checkpoint/rollup summaries
+  (`summary`, `decisions`, `open_questions`, `next_actions`) using Codex CLI.
+
+Codex summary tuning:
+
+```bash
+export REMEM_MEMORY_SUMMARY_ENABLED="1"             # default: enabled
+export REMEM_MEMORY_SUMMARY_PROVIDER="codex_cli"    # wrapper supports codex_cli
+export REMEM_MEMORY_SUMMARY_MODEL="gpt-5.3-codex-spark"
+export REMEM_MEMORY_SUMMARY_TIMEOUT_SECONDS="15"    # default: 15
+```
+
+Optional transcript discovery override:
+
+```bash
+export REMEM_MEMORY_CODEX_SESSIONS_DIR="$HOME/.codex/sessions"
+```
 
 Useful flags:
 

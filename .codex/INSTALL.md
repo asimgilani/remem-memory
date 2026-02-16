@@ -65,8 +65,17 @@ This automatically:
 - Creates periodic interval checkpoints (default 20 min)
 - Writes milestone checkpoint on Codex exit when changes exist
 - Writes final rollup on exit
+- Generates structured checkpoint/rollup summaries from Codex session transcript using Codex CLI
 
 MCP (`remem_query`) is configured during install and available after restart.
+
+Optional summary tuning:
+
+```bash
+export REMEM_MEMORY_SUMMARY_ENABLED="1"
+export REMEM_MEMORY_SUMMARY_PROVIDER="codex_cli"
+export REMEM_MEMORY_SUMMARY_MODEL="gpt-5.3-codex-spark"
+```
 
 ## Update
 
