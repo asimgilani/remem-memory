@@ -80,6 +80,10 @@ def build_query_payload(args: argparse.Namespace) -> dict[str, Any]:
     filters = build_filters(args)
     if filters:
         payload["filters"] = filters
+    if args.include_facts:
+        payload["include_facts"] = True
+    if args.entity:
+        payload["entity"] = args.entity
     return payload
 
 
@@ -113,6 +117,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--checkpoint-session", action="append", default=[], help="Checkpoint session filter.")
     parser.add_argument("--checkpoint-kind", action="append", default=[], help="Checkpoint kind filter.")
     parser.add_argument("--filters-json", help="Additional filters as JSON object.")
+    parser.add_argument("--include-facts", action="store_true", help="Include memory layer facts in results.")
+    parser.add_argument("--entity", default=None, help="Scope facts to a specific entity name.")
     parser.add_argument("--api-url", default=os.getenv("REMEM_API_URL", ""), help="Remem API base URL.")
     parser.add_argument("--api-key", default=os.getenv("REMEM_API_KEY", ""), help="Remem API key.")
     parser.add_argument("--output", help="Write API response JSON to this file.")
@@ -154,6 +160,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         Path(args.output).write_text(json.dumps(output, indent=2, ensure_ascii=True), encoding="utf-8")
     print(json.dumps(output, indent=2, ensure_ascii=True))
+
+    if response and response.get("facts"):
+        facts = response["facts"]
+        print(f"\n--- Facts ({response.get('fact_count', len(facts))}) ---\n", file=sys.stderr)
+        for f in facts:
+            line = f"  [{f.get('fact_type', 'fact')}] {f.get('content', '')}"
+            if f.get("confidence"):
+                line += f" (confidence: {f['confidence']:.1f})"
+            if f.get("entities"):
+                line += f" | entities: {', '.join(f['entities'])}"
+            print(line, file=sys.stderr)
+
     return 0
 
 

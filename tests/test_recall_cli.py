@@ -64,5 +64,73 @@ class RecallCliTests(unittest.TestCase):
         self.assertIn('"payload"', result.stdout)
 
 
+    def test_include_facts_flag_in_payload(self) -> None:
+        """--include-facts is forwarded in the query payload."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "remem_recall.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--query",
+                "what tools do we use",
+                "--include-facts",
+                "--dry-run",
+                "--no-log",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
+        self.assertIn('"include_facts"', result.stdout)
+        self.assertIn("true", result.stdout.lower())
+
+    def test_entity_flag_in_payload(self) -> None:
+        """--entity is forwarded in the query payload."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "remem_recall.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--query",
+                "tech stack",
+                "--include-facts",
+                "--entity",
+                "Acme Corp",
+                "--dry-run",
+                "--no-log",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
+        self.assertIn('"entity"', result.stdout)
+        self.assertIn("Acme Corp", result.stdout)
+
+    def test_no_facts_flags_omitted_from_payload(self) -> None:
+        """Without --include-facts, neither include_facts nor entity appear in payload."""
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / "scripts" / "remem_recall.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--query",
+                "test",
+                "--dry-run",
+                "--no-log",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
+        self.assertNotIn('"include_facts"', result.stdout)
+        self.assertNotIn('"entity"', result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
