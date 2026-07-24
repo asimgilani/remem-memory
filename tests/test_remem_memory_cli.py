@@ -2820,6 +2820,73 @@ class MCPLauncherTests(unittest.TestCase):
         self.assertNotIn("namespaces", omitted_read)
         self.assertEqual(explicit_read["namespaces"], ["one", "two"])
 
+    def test_bundled_mcp_schema_rejects_explicit_empty_namespace_intent(self):
+        tools = {
+            tool.name: tool
+            for tool in asyncio.run(bundled_mcp_server.list_tools())
+        }
+        write_schema = tools["remem_ingest"].inputSchema["properties"][
+            "namespace"
+        ]
+        read_schema = tools["remem_query"].inputSchema["properties"][
+            "namespaces"
+        ]
+
+        self.assertEqual(write_schema.get("minLength"), 1)
+        self.assertEqual(write_schema.get("pattern"), r".*\S.*")
+        self.assertEqual(read_schema.get("minItems"), 1)
+        self.assertEqual(read_schema["items"].get("minLength"), 1)
+        self.assertEqual(read_schema["items"].get("pattern"), r".*\S.*")
+
+    def test_bundled_mcp_explicit_empty_namespace_never_calls_api(self):
+        cases = (
+            (
+                "remem_ingest",
+                {"content": "write", "namespace": ""},
+            ),
+            (
+                "remem_ingest",
+                {"content": "write", "namespace": "   "},
+            ),
+            (
+                "remem_query",
+                {"query": "read", "namespaces": []},
+            ),
+            (
+                "remem_query",
+                {"query": "read", "namespaces": [""]},
+            ),
+            (
+                "remem_query",
+                {"query": "read", "namespaces": ["   "]},
+            ),
+            (
+                "remem_query",
+                {"query": "read", "namespaces": ["valid", ""]},
+            ),
+        )
+        for tool, arguments in cases:
+            with self.subTest(tool=tool, arguments=arguments):
+                request = mock.AsyncMock(return_value={"ok": True})
+                with mock.patch.object(
+                    bundled_mcp_server,
+                    "_request",
+                    request,
+                ):
+                    result = asyncio.run(
+                        bundled_mcp_server.call_tool(tool, arguments)
+                    )
+
+                request.assert_not_awaited()
+                self.assertEqual(
+                    result[0].text,
+                    (
+                        "Remem request failed: "
+                        "status=unavailable kind=request"
+                    ),
+                )
+                self.assertNotIn("valid", result[0].text)
+
     def test_bundled_mcp_retries_only_fixed_transient_matrix(self):
         class Response:
             def __init__(self, status, *, body="vlt_response-body-canary"):

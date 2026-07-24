@@ -208,7 +208,12 @@ async def _request(
 
 _NAMESPACES_SCHEMA: dict[str, Any] = {
     "type": "array",
-    "items": {"type": "string"},
+    "minItems": 1,
+    "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": r".*\S.*",
+    },
     "description": (
         "Filter results to these namespaces. "
         'Use ["*"] to search across all namespaces.'
@@ -217,6 +222,8 @@ _NAMESPACES_SCHEMA: dict[str, Any] = {
 
 _NAMESPACE_SCHEMA: dict[str, Any] = {
     "type": "string",
+    "minLength": 1,
+    "pattern": r".*\S.*",
     "description": (
         "Target namespace for this write operation. "
         "When omitted, the selected key's server-defined default is used."
@@ -471,20 +478,29 @@ def _format_search_results(data: dict[str, Any]) -> str:
 
 def _resolve_write_namespace(arguments: dict[str, Any]) -> str | None:
     """Return the namespace for a write operation, or *None* to omit."""
-    namespace = arguments.get("namespace")
-    return (
-        namespace
-        if isinstance(namespace, str) and namespace
-        else None
-    )
+    if "namespace" not in arguments:
+        return None
+    namespace = arguments["namespace"]
+    if not isinstance(namespace, str) or not namespace.strip():
+        raise _RequestError(None, "request")
+    return namespace
 
 
 def _resolve_read_namespaces(arguments: dict[str, Any]) -> list[str] | None:
     """Return the namespaces list for a read operation, or *None* to omit."""
-    ns = arguments.get("namespaces")
-    if isinstance(ns, list) and ns:
-        return ns
-    return None
+    if "namespaces" not in arguments:
+        return None
+    namespaces = arguments["namespaces"]
+    if (
+        not isinstance(namespaces, list)
+        or not namespaces
+        or any(
+            not isinstance(namespace, str) or not namespace.strip()
+            for namespace in namespaces
+        )
+    ):
+        raise _RequestError(None, "request")
+    return list(namespaces)
 
 
 def _inject_namespaces_post(payload: dict[str, Any], namespaces: list[str] | None) -> None:

@@ -15,6 +15,7 @@
     "Prepare the locked environment without the user credential; the credential-bearing launch executes cached Python directly against the integrity-checked source.",
     "Validate document and entity identifiers as canonical UUIDs before constructing API paths.",
     "Delegate omitted read and write namespaces to the selected API key instead of injecting a plugin default.",
-    "Retry only the audited transient matrix with stable requests and return fixed status/kind errors without response bodies."
+    "Retry only the audited transient matrix with stable requests and return fixed status/kind errors without response bodies.",
+    "Reject explicit empty or whitespace-only namespace intent instead of broadening it to server-default or all-readable scope."
   ]
 }
