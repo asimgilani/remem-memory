@@ -156,6 +156,51 @@ class CanonicalDispatchSecurityTests(unittest.TestCase):
             (int(captured["environment"]["REMEM_API_KEY_FD"]),),
         )
 
+    def test_selected_named_connection_crosses_only_by_anonymous_fd(
+        self,
+    ) -> None:
+        named_account = "connection:0123456789abcdef0123456789abcdef"
+        named_connection = remem_memory.remem_api.Connection(
+            "conn_0123456789abcdef0123456789abcdef",
+            "Named",
+            named_account,
+            True,
+        )
+        keychain = {
+            (remem_memory.remem_api.KEYCHAIN_SERVICE, named_account): "named-key"
+        }
+
+        class LocalKeychain:
+            def read(self, service, account=None):
+                return keychain.get((service, account))
+
+            def write(self, service, account, value):
+                keychain[(service, account)] = value
+
+        selected = remem_memory.remem_api.resolve_connection_api_key(
+            named_connection,
+            environment={"REMEM_API_KEY": "primary-ambient-key"},
+            keychain=LocalKeychain(),
+        )
+        descriptor = remem_memory._write_anonymous_payload(
+            selected.encode("utf-8")
+        )
+        child_environment = {"REMEM_API_KEY_FD": str(descriptor)}
+
+        try:
+            received = remem_memory.remem_api.consume_explicit_api_key(
+                child_environment
+            )
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+        self.assertEqual(received, "named-key")
+        self.assertNotIn("REMEM_API_KEY_FD", child_environment)
+        self.assertNotEqual(received, "primary-ambient-key")
+
     def test_local_only_workflow_never_transports_or_resolves_credential(
         self,
     ) -> None:

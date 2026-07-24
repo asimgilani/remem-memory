@@ -539,6 +539,107 @@ class RememAPITests(unittest.TestCase):
         self.assertEqual(resolved, "env-key")
         keychain.read.assert_not_called()
 
+    def test_connection_keychain_accounts_are_isolated(self) -> None:
+        named_account = "connection:0123456789abcdef0123456789abcdef"
+        keychain = FakeKeychain(
+            {
+                (_API.KEYCHAIN_SERVICE, _API.KEYCHAIN_ACCOUNT): "primary-key",
+                (_API.KEYCHAIN_SERVICE, named_account): "named-key",
+            }
+        )
+
+        primary = _API.resolve_keychain_api_key(
+            _API.KEYCHAIN_ACCOUNT,
+            keychain=keychain,
+        )
+        named = _API.resolve_keychain_api_key(
+            named_account,
+            keychain=keychain,
+        )
+
+        self.assertEqual(primary, "primary-key")
+        self.assertEqual(named, "named-key")
+        self.assertEqual(
+            keychain.reads,
+            [
+                (_API.KEYCHAIN_SERVICE, _API.KEYCHAIN_ACCOUNT),
+                (_API.KEYCHAIN_SERVICE, named_account),
+            ],
+        )
+
+    def test_named_connection_ignores_ambient_credential_and_descriptor(
+        self,
+    ) -> None:
+        named_account = "connection:0123456789abcdef0123456789abcdef"
+        named_connection = _API.Connection(
+            "conn_0123456789abcdef0123456789abcdef",
+            "Named",
+            named_account,
+            True,
+        )
+        keychain = FakeKeychain(
+            {(_API.KEYCHAIN_SERVICE, named_account): "named-key"}
+        )
+        read_descriptor, write_descriptor = os.pipe()
+        os.write(write_descriptor, b"descriptor-key")
+        os.close(write_descriptor)
+        environment = {
+            "REMEM_API_KEY": "primary-ambient-key",
+            "REMEM_API_KEY_FD": str(read_descriptor),
+        }
+
+        try:
+            resolved = _API.resolve_connection_api_key(
+                named_connection,
+                environment=environment,
+                keychain=keychain,
+            )
+            descriptor_value = os.read(read_descriptor, 4096).decode("utf-8")
+        finally:
+            try:
+                os.close(read_descriptor)
+            except OSError:
+                pass
+
+        self.assertEqual(resolved, "named-key")
+        self.assertEqual(descriptor_value, "descriptor-key")
+        self.assertEqual(
+            keychain.reads,
+            [(_API.KEYCHAIN_SERVICE, named_account)],
+        )
+
+    def test_primary_connection_allows_only_ambient_legacy_override(self) -> None:
+        primary = _API.Connection(
+            "primary",
+            "Primary",
+            _API.KEYCHAIN_ACCOUNT,
+            True,
+        )
+        keychain = FakeKeychain(
+            {(_API.KEYCHAIN_SERVICE, _API.KEYCHAIN_ACCOUNT): "stored-key"}
+        )
+
+        resolved = _API.resolve_connection_api_key(
+            primary,
+            environment={"REMEM_API_KEY": " ambient-primary-key "},
+            keychain=keychain,
+        )
+
+        self.assertEqual(resolved, "ambient-primary-key")
+        self.assertEqual(keychain.reads, [])
+
+    def test_invalid_connection_account_uses_fixed_secret_free_error(self) -> None:
+        canary = "connection:vlt_opaque-account-canary"
+        with self.assertRaises(_API.RememKeychainError) as caught:
+            _API.store_keychain_api_key(canary, "vlt_secret-canary")
+
+        self.assertEqual(
+            str(caught.exception),
+            "Remem credential storage failed",
+        )
+        self.assertNotIn(canary, str(caught.exception))
+        self.assertNotIn("vlt_secret-canary", str(caught.exception))
+
     def test_explicit_credential_fd_is_consumed_once_without_keychain(
         self,
     ) -> None:

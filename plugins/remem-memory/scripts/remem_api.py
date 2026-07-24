@@ -6,6 +6,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -14,6 +15,8 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Protocol, Tuple
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+
+from remem_routing import Connection
 
 _DEFAULT_API_URL = "https://api.remem.io"
 _PRODUCTION_API_HOST = "api.remem.io"
@@ -25,6 +28,7 @@ _MAX_QUERY = 2000
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 16 * 1024
 _KEYCHAIN_INTERACTION_LOCK = threading.RLock()
+_CONNECTION_ACCOUNT = re.compile(r"connection:[0-9a-f]{32}\Z")
 
 
 class RememAPIError(RuntimeError):
@@ -579,6 +583,97 @@ def default_keychain() -> MacOSKeychain:
     return MacOSKeychain()
 
 
+def _is_keychain_account(account: object) -> bool:
+    return (
+        account == KEYCHAIN_ACCOUNT
+        or isinstance(account, str)
+        and _CONNECTION_ACCOUNT.fullmatch(account) is not None
+    )
+
+
+def _is_resolvable_connection(connection: object) -> bool:
+    if not isinstance(connection, Connection) or not connection.configured:
+        return False
+    if connection.id == "primary":
+        return connection.keychain_account == KEYCHAIN_ACCOUNT
+    match = re.fullmatch(r"conn_([0-9a-f]{32})", connection.id)
+    return (
+        match is not None
+        and connection.keychain_account
+        == f"connection:{match.group(1)}"
+    )
+
+
+def resolve_keychain_api_key(
+    account: str,
+    *,
+    keychain: Optional[Keychain] = None,
+) -> Optional[str]:
+    """Resolve one validated Keychain account without exposing failures."""
+
+    if not _is_keychain_account(account):
+        return None
+    selected_keychain = (
+        keychain if keychain is not None else default_keychain()
+    )
+    try:
+        current = selected_keychain.read(KEYCHAIN_SERVICE, account)
+        normalized = current.strip() if isinstance(current, str) else ""
+        return normalized or None
+    except Exception:
+        return None
+
+
+def store_keychain_api_key(
+    account: str,
+    value: str,
+    *,
+    keychain: Optional[Keychain] = None,
+) -> None:
+    """Store one validated Keychain account with fixed diagnostics."""
+
+    normalized = value.strip() if isinstance(value, str) else ""
+    if (
+        not _is_keychain_account(account)
+        or not normalized
+        or "\x00" in normalized
+    ):
+        raise RememKeychainError("Remem credential storage failed")
+    selected_keychain = (
+        keychain if keychain is not None else default_keychain()
+    )
+    try:
+        selected_keychain.write(KEYCHAIN_SERVICE, account, normalized)
+    except Exception:
+        raise RememKeychainError(
+            "Remem credential storage failed"
+        ) from None
+
+
+def resolve_connection_api_key(
+    connection: Connection,
+    *,
+    environment: Optional[Mapping[str, str]] = None,
+    keychain: Optional[Keychain] = None,
+) -> Optional[str]:
+    """Resolve a routed connection without treating a descriptor as routing."""
+
+    if not _is_resolvable_connection(connection):
+        return None
+    if connection.id == "primary":
+        selected_environment = (
+            os.environ if environment is None else environment
+        )
+        ambient = selected_environment.get("REMEM_API_KEY", "")
+        explicit = ambient.strip() if isinstance(ambient, str) else ""
+        if explicit:
+            return explicit
+    return resolve_keychain_api_key(
+        connection.keychain_account,
+        keychain=keychain,
+    )
+
+
 def resolve_api_key(
     environment: Optional[Mapping[str, str]] = None,
     keychain: Optional[Keychain] = None,
@@ -590,18 +685,10 @@ def resolve_api_key(
     if explicit:
         return explicit
 
-    selected_keychain = (
-        keychain if keychain is not None else default_keychain()
+    return resolve_keychain_api_key(
+        KEYCHAIN_ACCOUNT,
+        keychain=keychain,
     )
-    try:
-        current = selected_keychain.read(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-        )
-        normalized = current.strip() if isinstance(current, str) else ""
-        return normalized or None
-    except Exception:
-        return None
 
 
 def consume_explicit_api_key(
@@ -683,18 +770,10 @@ def resolve_api_access(
         return normalized, explicit
     if explicit:
         return normalized, explicit
-    selected_keychain = keychain if keychain is not None else default_keychain()
-    try:
-        current = selected_keychain.read(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-        )
-        normalized_key = (
-            current.strip() if isinstance(current, str) else ""
-        )
-        return normalized, normalized_key or None
-    except Exception:
-        return normalized, None
+    return normalized, resolve_keychain_api_key(
+        KEYCHAIN_ACCOUNT,
+        keychain=keychain,
+    )
 
 
 def store_api_key(
@@ -703,22 +782,11 @@ def store_api_key(
 ) -> None:
     """Store the canonical Remem credential with fixed failure diagnostics."""
 
-    normalized = value.strip() if isinstance(value, str) else ""
-    if not normalized or "\x00" in normalized:
-        raise RememKeychainError("Remem credential storage failed")
-    selected_keychain = (
-        keychain if keychain is not None else default_keychain()
+    store_keychain_api_key(
+        KEYCHAIN_ACCOUNT,
+        value,
+        keychain=keychain,
     )
-    try:
-        selected_keychain.write(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-            normalized,
-        )
-    except Exception:
-        raise RememKeychainError(
-            "Remem credential storage failed"
-        ) from None
 
 
 class RememAPI:
@@ -844,7 +912,10 @@ __all__ = [
     "consume_explicit_api_key",
     "normalize_api_origin",
     "normalize_api_origin_for_environment",
+    "resolve_connection_api_key",
     "resolve_api_access",
     "resolve_api_key",
+    "resolve_keychain_api_key",
     "store_api_key",
+    "store_keychain_api_key",
 ]
