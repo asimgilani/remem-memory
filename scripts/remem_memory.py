@@ -1261,6 +1261,10 @@ def _load_or_initialize_routing() -> remem_routing.RoutingConfig:
     return remem_routing.load_or_initialize_routing(
         default_data_dir(),
         os.environ,
+        credential_loader=lambda: remem_api.default_keychain().read(
+            remem_api.KEYCHAIN_SERVICE,
+            remem_api.KEYCHAIN_ACCOUNT,
+        ),
     )
 
 

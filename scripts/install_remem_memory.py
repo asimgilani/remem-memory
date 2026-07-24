@@ -580,6 +580,7 @@ class Installer:
 
         legacy_config = self._load_legacy_config()
         legacy_discovery = self._discover_legacy_routing(legacy_config)
+        self._stage_routing(legacy_discovery)
 
         if codex_available:
             self._prepare_harness_root(self.codex_home)
@@ -725,6 +726,20 @@ class Installer:
         except Exception:
             raise InstallerError(
                 "Routing migration could not be completed"
+            ) from None
+
+    def _stage_routing(
+        self,
+        discovery: _remem_routing.LegacyDiscovery,
+    ) -> None:
+        try:
+            _remem_routing.stage_legacy_routing(
+                discovery,
+                self.routing_data_dir,
+            )
+        except Exception:
+            raise InstallerError(
+                "Routing migration could not be staged"
             ) from None
 
     @staticmethod

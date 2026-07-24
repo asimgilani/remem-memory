@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 from uuid import uuid4
 
+import remem_api
 from memory_policy import (
     RecallSource,
     contains_secret,
@@ -644,7 +645,14 @@ def _resolved_route(
     resolver = dependencies.routing_resolver
     if resolver is not None:
         return resolver(behavior, harness)
-    config = load_or_initialize_routing(dependencies.state_dir)
+    config = load_or_initialize_routing(
+        dependencies.state_dir,
+        os.environ,
+        credential_loader=lambda: remem_api.default_keychain().read(
+            remem_api.KEYCHAIN_SERVICE,
+            remem_api.KEYCHAIN_ACCOUNT,
+        ),
+    )
     return (
         config,
         resolve_routes(

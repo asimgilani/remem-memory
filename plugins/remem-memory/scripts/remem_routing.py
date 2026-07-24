@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -24,6 +25,8 @@ except ImportError:  # pragma: no cover - this plugin runs on macOS
 _SCHEMA_VERSION = 1
 _MAX_CONFIG_BYTES = 65_536
 _MAX_HEALTH_BYTES = 32_768
+_MAX_MIGRATION_STAGE_BYTES = 4_096
+_MAX_LEGACY_CONFIG_BYTES = 65_536
 _MAX_CONNECTIONS = 16
 _MAX_RECALL_TARGETS = 16
 _MAX_HEALTH_RECORDS = 64
@@ -47,6 +50,18 @@ _UTC_RFC3339 = re.compile(
 )
 _ROUTES_FILE = "routes.json"
 _HEALTH_FILE = "route-health.json"
+_MIGRATION_STAGE_FILE = "routing-migration-stage.json"
+_LEGACY_ENV_TABLE = "mcp_servers.remem.env"
+_LEGACY_KEY = "REMEM_API_KEY"
+_LEGACY_ESCAPES = {
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "f": "\f",
+    "r": "\r",
+    '"': '"',
+    "\\": "\\",
+}
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,10 @@ class MigrationOutcome:
     credential_ambiguous: bool = False
     destination_ambiguous: bool = False
     deprecations: tuple[str, ...] = ()
+
+
+class LegacyCredentialError(ValueError):
+    """The old Codex credential is outside the accepted narrow grammar."""
 
 
 def _default_data_dir() -> Path:
@@ -803,6 +822,165 @@ def reset_routing_to_defaults(
         return updated
 
 
+def _decode_legacy_basic_string(value: str) -> tuple[str, str]:
+    if not value.startswith('"'):
+        raise LegacyCredentialError("unsupported legacy credential")
+    decoded: list[str] = []
+    index = 1
+    while index < len(value):
+        character = value[index]
+        if character == '"':
+            return "".join(decoded), value[index + 1 :]
+        if character in {"\n", "\r"} or ord(character) < 0x20:
+            raise LegacyCredentialError("unsupported legacy credential")
+        if character != "\\":
+            decoded.append(character)
+            index += 1
+            continue
+        index += 1
+        if index >= len(value):
+            raise LegacyCredentialError("unsupported legacy credential")
+        escaped = value[index]
+        if escaped in _LEGACY_ESCAPES:
+            decoded.append(_LEGACY_ESCAPES[escaped])
+            index += 1
+            continue
+        if escaped not in {"u", "U"}:
+            raise LegacyCredentialError("unsupported legacy credential")
+        width = 4 if escaped == "u" else 8
+        digits = value[index + 1 : index + 1 + width]
+        if len(digits) != width or any(
+            character not in "0123456789abcdefABCDEF" for character in digits
+        ):
+            raise LegacyCredentialError("unsupported legacy credential")
+        codepoint = int(digits, 16)
+        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            raise LegacyCredentialError("unsupported legacy credential")
+        decoded.append(chr(codepoint))
+        index += width + 1
+    raise LegacyCredentialError("unsupported legacy credential")
+
+
+def _parse_legacy_key_assignment(line: str) -> str:
+    if not line.startswith(_LEGACY_KEY):
+        raise LegacyCredentialError("unsupported legacy credential")
+    remainder = line[len(_LEGACY_KEY) :]
+    if not remainder or remainder[0] not in {" ", "\t", "="}:
+        raise LegacyCredentialError("unsupported legacy credential")
+    remainder = remainder.lstrip(" \t")
+    if not remainder.startswith("="):
+        raise LegacyCredentialError("unsupported legacy credential")
+    encoded = remainder[1:].lstrip(" \t")
+    decoded, trailing = _decode_legacy_basic_string(encoded)
+    trailing = trailing.strip(" \t")
+    if trailing and not trailing.startswith("#"):
+        raise LegacyCredentialError("unsupported legacy credential")
+    if not decoded or "\x00" in decoded:
+        raise LegacyCredentialError("unsupported legacy credential")
+    return decoded
+
+
+def parse_legacy_api_key(text: str) -> str | None:
+    """Parse only one exact basic string from the old Codex Remem table."""
+
+    if not isinstance(text, str):
+        raise LegacyCredentialError("unsupported legacy credential")
+    current_table: str | None = None
+    exact_table_count = 0
+    api_key: str | None = None
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("["):
+            header = stripped.split("#", 1)[0].rstrip()
+            if (
+                not header.startswith("[")
+                or not header.endswith("]")
+                or header.startswith("[[")
+                or header.endswith("]]")
+            ):
+                current_table = None
+                continue
+            current_table = header[1:-1]
+            if current_table == _LEGACY_ENV_TABLE:
+                exact_table_count += 1
+                if exact_table_count > 1:
+                    raise LegacyCredentialError(
+                        "unsupported legacy credential"
+                    )
+            continue
+        candidate = stripped.split("#", 1)[0].rstrip()
+        if "=" not in candidate:
+            continue
+        assignment_key = candidate.split("=", 1)[0].strip()
+        if _LEGACY_KEY.lower() not in assignment_key.lower():
+            continue
+        if current_table != _LEGACY_ENV_TABLE or api_key is not None:
+            raise LegacyCredentialError("unsupported legacy credential")
+        api_key = _parse_legacy_key_assignment(stripped)
+    return api_key
+
+
+def _environment_home(environment: Mapping[str, str]) -> Path:
+    home = environment.get("HOME", "")
+    if isinstance(home, str) and home.strip():
+        return Path(home).expanduser()
+    return Path.home()
+
+
+def _legacy_codex_config_path(environment: Mapping[str, str]) -> Path:
+    home = _environment_home(environment)
+    configured = environment.get("CODEX_HOME", "")
+    if not isinstance(configured, str):
+        raise ValueError("Invalid legacy environment")
+    value = configured.strip()
+    if not value:
+        return home / ".codex" / "config.toml"
+    if value == "~":
+        return home / "config.toml"
+    if value.startswith("~/"):
+        return home / value[2:] / "config.toml"
+    return Path(value) / "config.toml"
+
+
+def _read_legacy_api_key(environment: Mapping[str, str]) -> str | None:
+    path = _legacy_codex_config_path(environment)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError("Legacy routing discovery failed") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _MAX_LEGACY_CONFIG_BYTES
+        ):
+            raise ValueError("Legacy routing discovery failed")
+        chunks: list[bytes] = []
+        remaining = _MAX_LEGACY_CONFIG_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > _MAX_LEGACY_CONFIG_BYTES:
+            raise ValueError("Legacy routing discovery failed")
+    finally:
+        os.close(descriptor)
+    try:
+        return parse_legacy_api_key(content.decode("utf-8"))
+    except (UnicodeDecodeError, LegacyCredentialError):
+        raise ValueError("Legacy routing discovery failed") from None
+
+
 def discover_legacy_routing(
     environment: Mapping[str, str] | None = None,
     *,
@@ -827,14 +1005,52 @@ def discover_legacy_routing(
     return LegacyDiscovery(distinct_credentials, destinations)
 
 
+def discover_local_legacy_routing(
+    environment: Mapping[str, str],
+    credential_loader: Callable[[], str | None],
+) -> LegacyDiscovery:
+    """Compare canonical and legacy local credentials without persisting either."""
+
+    if not isinstance(environment, Mapping) or not callable(credential_loader):
+        raise ValueError("Invalid legacy discovery")
+    legacy = _read_legacy_api_key(environment)
+    if legacy is None:
+        return discover_legacy_routing(environment)
+    try:
+        canonical = credential_loader()
+    except Exception:
+        raise ValueError("Legacy routing discovery failed") from None
+    if canonical is not None and (
+        not isinstance(canonical, str) or not canonical
+    ):
+        raise ValueError("Legacy routing discovery failed")
+    distinct_credentials = 1
+    if canonical is not None:
+        try:
+            equal = hmac.compare_digest(
+                legacy.encode("utf-8"),
+                canonical.encode("utf-8"),
+            )
+        except UnicodeError:
+            raise ValueError("Legacy routing discovery failed") from None
+        if not equal:
+            distinct_credentials = 2
+    return discover_legacy_routing(
+        environment,
+        distinct_credentials=distinct_credentials,
+    )
+
+
 def _checked_legacy_discovery(discovery: object) -> LegacyDiscovery:
     if not isinstance(discovery, LegacyDiscovery):
         raise ValueError("Invalid legacy discovery")
     if not _is_plain_int(discovery.distinct_credentials) or (
         discovery.distinct_credentials < 0
+        or discovery.distinct_credentials > 2
     ):
         raise ValueError("Invalid legacy credential count")
     destinations: dict[str, tuple[str, ...]] = {}
+    candidate_count = 0
     for behavior, candidates in discovery.destination_candidates.items():
         if behavior not in {"memory", "sessions"} or not isinstance(
             candidates, tuple
@@ -847,9 +1063,140 @@ def _checked_legacy_discovery(discovery: object) -> LegacyDiscovery:
             candidate = candidate.strip()
             if candidate:
                 nonempty.append(_validate_namespace(candidate, behavior=behavior))
+                candidate_count += 1
+                if candidate_count > _MAX_RECALL_TARGETS:
+                    raise ValueError("Too many legacy destinations")
         if nonempty:
             destinations[behavior] = tuple(nonempty)
     return LegacyDiscovery(discovery.distinct_credentials, destinations)
+
+
+def _merge_legacy_discoveries(
+    *discoveries: LegacyDiscovery,
+) -> LegacyDiscovery:
+    checked = tuple(_checked_legacy_discovery(item) for item in discoveries)
+    destinations: dict[str, tuple[str, ...]] = {}
+    for behavior in ("memory", "sessions"):
+        candidates: list[str] = []
+        for discovery in checked:
+            candidates.extend(
+                discovery.destination_candidates.get(behavior, ())
+            )
+        distinct = tuple(dict.fromkeys(candidates))
+        if distinct:
+            destinations[behavior] = distinct
+    return _checked_legacy_discovery(
+        LegacyDiscovery(
+            max(
+                (item.distinct_credentials for item in checked),
+                default=0,
+            ),
+            destinations,
+        )
+    )
+
+
+def _stage_to_data(discovery: LegacyDiscovery) -> dict[str, object]:
+    checked = _checked_legacy_discovery(discovery)
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "distinct_credentials": checked.distinct_credentials,
+        "destination_candidates": {
+            behavior: list(candidates)
+            for behavior, candidates in checked.destination_candidates.items()
+        },
+    }
+
+
+def _data_to_stage(value: object) -> LegacyDiscovery:
+    fields = _require_exact_keys(
+        value,
+        frozenset(
+            (
+                "schema_version",
+                "distinct_credentials",
+                "destination_candidates",
+            )
+        ),
+        message="Invalid routing migration stage",
+    )
+    if fields["schema_version"] != _SCHEMA_VERSION:
+        raise ValueError("Invalid routing migration stage")
+    destinations = fields["destination_candidates"]
+    if not isinstance(destinations, dict):
+        raise ValueError("Invalid routing migration stage")
+    decoded: dict[str, tuple[str, ...]] = {}
+    for behavior, candidates in destinations.items():
+        if not isinstance(candidates, list):
+            raise ValueError("Invalid routing migration stage")
+        decoded[behavior] = tuple(candidates)  # type: ignore[arg-type]
+    return _checked_legacy_discovery(
+        LegacyDiscovery(
+            fields["distinct_credentials"],  # type: ignore[arg-type]
+            decoded,
+        )
+    )
+
+
+def _load_staged_legacy_routing(data_dir: Path) -> LegacyDiscovery | None:
+    try:
+        content = _read_bounded(
+            data_dir,
+            _MIGRATION_STAGE_FILE,
+            _MAX_MIGRATION_STAGE_BYTES,
+        )
+        decoded = _decode_json(content)
+        return _data_to_stage(decoded)
+    except FileNotFoundError:
+        return None
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("Routing migration stage is invalid") from None
+
+
+def _store_staged_legacy_routing(
+    discovery: LegacyDiscovery,
+    data_dir: Path,
+) -> None:
+    encoded = _encode(_stage_to_data(discovery))
+    if len(encoded) > _MAX_MIGRATION_STAGE_BYTES:
+        raise ValueError("Routing migration stage exceeds its size limit")
+    _atomic_write(data_dir, _MIGRATION_STAGE_FILE, encoded)
+
+
+def _clear_staged_legacy_routing(data_dir: Path) -> None:
+    try:
+        path = _secure_file_path(data_dir, _MIGRATION_STAGE_FILE)
+        path.unlink()
+        descriptor = _open_directory(data_dir)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        # Final routing state is already durable. Retaining a valid stage lets
+        # a later initializer retry cleanup without weakening migration safety.
+        pass
+
+
+def stage_legacy_routing(
+    discovery: LegacyDiscovery,
+    data_dir: Path | None = None,
+) -> LegacyDiscovery:
+    """Durably stage credential-free discovery before installer mutations."""
+
+    selected = _selected_data_dir(data_dir)
+    checked = _checked_legacy_discovery(discovery)
+    with _locked(selected, "routes.lock"):
+        existing = _load_staged_legacy_routing(selected)
+        merged = (
+            checked
+            if existing is None
+            else _merge_legacy_discoveries(existing, checked)
+        )
+        _store_staged_legacy_routing(merged, selected)
+        return merged
 
 
 def _legacy_default_deprecations(environment: Mapping[str, str]) -> tuple[str, ...]:
@@ -904,6 +1251,8 @@ def initialize_routing(
     data_dir: Path | None = None,
     environment: Mapping[str, str] | None = None,
     discovery: LegacyDiscovery | None = None,
+    *,
+    credential_loader: Callable[[], str | None] | None = None,
 ) -> tuple[RoutingConfig, MigrationOutcome]:
     selected = _selected_data_dir(data_dir)
     with _locked(selected, "routes.lock"):
@@ -911,14 +1260,66 @@ def initialize_routing(
             current = load_routing(selected)
         except FileNotFoundError:
             current = None
-        if current is not None and current.legacy_namespace_migration_completed:
-            return current, MigrationOutcome(False)
+        staged = _load_staged_legacy_routing(selected)
         source = os.environ if environment is None else environment
         if not isinstance(source, Mapping):
             raise ValueError("Invalid legacy environment")
-        selected_discovery = (
-            discover_legacy_routing(source) if discovery is None else discovery
+        selected_discovery: LegacyDiscovery | None = (
+            _checked_legacy_discovery(discovery)
+            if discovery is not None
+            else None
         )
+        if (
+            selected_discovery is None
+            and staged is None
+            and current is not None
+            and current.legacy_namespace_migration_completed
+        ):
+            return current, MigrationOutcome(False)
+        if selected_discovery is None and staged is None:
+            selected_discovery = (
+                discover_local_legacy_routing(source, credential_loader)
+                if credential_loader is not None
+                else discover_legacy_routing(source)
+            )
+            if credential_loader is not None:
+                _store_staged_legacy_routing(selected_discovery, selected)
+                staged = selected_discovery
+        if staged is not None:
+            selected_discovery = (
+                staged
+                if selected_discovery is None
+                else _merge_legacy_discoveries(
+                    staged,
+                    selected_discovery,
+                )
+            )
+        assert selected_discovery is not None
+        if current is not None and current.legacy_namespace_migration_completed:
+            checked = _checked_legacy_discovery(selected_discovery)
+            credential_ambiguous = checked.distinct_credentials > 1
+            destination_ambiguous = any(
+                len(tuple(dict.fromkeys(candidates))) > 1
+                for candidates in checked.destination_candidates.values()
+            )
+            if (
+                not current.migration_write_blocked
+                and (credential_ambiguous or destination_ambiguous)
+            ):
+                current = replace(
+                    current,
+                    revision=current.revision + 1,
+                    migration_write_blocked=True,
+                )
+                store_routing(current, selected)
+            _clear_staged_legacy_routing(selected)
+            return current, MigrationOutcome(
+                False,
+                distinct_credentials=checked.distinct_credentials,
+                credential_ambiguous=credential_ambiguous,
+                destination_ambiguous=destination_ambiguous,
+                deprecations=current.deprecations,
+            )
         config, outcome = _migrate_legacy_routing(
             selected_discovery,
             source,
@@ -926,14 +1327,28 @@ def initialize_routing(
             initialized=current is None,
         )
         store_routing(config, selected)
+        _clear_staged_legacy_routing(selected)
         return config, outcome
 
 
 def load_or_initialize_routing(
     data_dir: Path | None = None,
     environment: Mapping[str, str] | None = None,
+    *,
+    credential_loader: Callable[[], str | None] | None = None,
 ) -> RoutingConfig:
-    return initialize_routing(data_dir, environment)[0]
+    def unavailable_credential_loader() -> str | None:
+        raise ValueError("Canonical credential loader is unavailable")
+
+    return initialize_routing(
+        data_dir,
+        environment,
+        credential_loader=(
+            credential_loader
+            if credential_loader is not None
+            else unavailable_credential_loader
+        ),
+    )[0]
 
 
 def _validate_health_record(record: object) -> RouteHealthRecord:

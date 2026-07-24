@@ -885,6 +885,222 @@ class LegacyNamespaceMigrationTests(unittest.TestCase):
             ),
         )
 
+    def test_interrupted_installer_stage_blocks_runtime_and_later_installer(self):
+        environment = {"CODEX_HOME": str(self.data_dir.parent / "codex")}
+        remem_routing.stage_legacy_routing(
+            remem_routing.LegacyDiscovery(
+                2,
+                {"memory": ("legacy-memory",)},
+            ),
+            self.data_dir,
+        )
+
+        runtime = remem_routing.load_or_initialize_routing(
+            self.data_dir,
+            environment,
+            credential_loader=lambda: self.fail(
+                "staged discovery must be used without reading credentials"
+            ),
+        )
+        later, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            environment,
+            remem_routing.LegacyDiscovery(1, {}),
+        )
+
+        self.assertTrue(runtime.migration_write_blocked)
+        self.assertTrue(later.migration_write_blocked)
+        self.assertEqual(
+            (),
+            remem_routing.resolve_routes(
+                later,
+                behavior="memory",
+                client="codex",
+            ),
+        )
+
+    def test_skipped_installer_discovers_distinct_local_credentials_once(self):
+        codex_home = self.data_dir.parent / "codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            (
+                "[mcp_servers.remem.env]\n"
+                'REMEM_API_KEY = "vlt_legacy-local"\n'
+            ),
+            encoding="utf-8",
+        )
+        environment = {"CODEX_HOME": str(codex_home)}
+
+        runtime = remem_routing.load_or_initialize_routing(
+            self.data_dir,
+            environment,
+            credential_loader=lambda: "vlt_canonical-local",
+        )
+        later, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            environment,
+            remem_routing.LegacyDiscovery(1, {}),
+        )
+
+        self.assertTrue(runtime.migration_write_blocked)
+        self.assertTrue(later.migration_write_blocked)
+        self.assertNotIn(
+            "vlt_",
+            (self.data_dir / "routes.json").read_text(encoding="utf-8"),
+        )
+
+    def test_runtime_without_credential_loader_never_guesses_legacy_identity(self):
+        codex_home = self.data_dir.parent / "codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            (
+                "[mcp_servers.remem.env]\n"
+                'REMEM_API_KEY = "vlt_legacy-local"\n'
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError):
+            remem_routing.load_or_initialize_routing(
+                self.data_dir,
+                {"CODEX_HOME": str(codex_home)},
+            )
+
+        self.assertFalse((self.data_dir / "routes.json").exists())
+        self.assertFalse(
+            (self.data_dir / "routing-migration-stage.json").exists()
+        )
+
+    def test_completed_migration_can_only_be_strengthened_by_late_discovery(self):
+        completed, _ = remem_routing.initialize_routing(self.data_dir, {})
+
+        strengthened, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(2, {}),
+        )
+        repeated, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(1, {}),
+        )
+
+        self.assertFalse(completed.migration_write_blocked)
+        self.assertTrue(strengthened.migration_write_blocked)
+        self.assertEqual(completed.revision + 1, strengthened.revision)
+        self.assertTrue(repeated.migration_write_blocked)
+        self.assertEqual(strengthened.revision, repeated.revision)
+
+    def test_migration_stage_is_private_credential_free_and_idempotent(self):
+        first = remem_routing.stage_legacy_routing(
+            remem_routing.LegacyDiscovery(
+                1,
+                {"memory": ("one",)},
+            ),
+            self.data_dir,
+        )
+        merged = remem_routing.stage_legacy_routing(
+            remem_routing.LegacyDiscovery(
+                2,
+                {"memory": ("one", "two")},
+            ),
+            self.data_dir,
+        )
+        stage = self.data_dir / "routing-migration-stage.json"
+        encoded = stage.read_text(encoding="utf-8")
+
+        self.assertEqual(first.distinct_credentials, 1)
+        self.assertEqual(merged.distinct_credentials, 2)
+        self.assertEqual(
+            dict(merged.destination_candidates),
+            {"memory": ("one", "two")},
+        )
+        self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o600)
+        self.assertEqual(
+            set(json.loads(encoded)),
+            {
+                "schema_version",
+                "distinct_credentials",
+                "destination_candidates",
+            },
+        )
+        self.assertNotIn("credential", encoded.lower().replace(
+            "distinct_credentials", ""
+        ))
+        self.assertNotIn("fingerprint", encoded.lower())
+
+        config = remem_routing.load_or_initialize_routing(
+            self.data_dir,
+            {},
+            credential_loader=lambda: self.fail(
+                "staged discovery must avoid credential reads"
+            ),
+        )
+        self.assertTrue(config.migration_write_blocked)
+        self.assertFalse(stage.exists())
+
+    def test_migration_stage_rejects_oversize_duplicates_and_symlinks(self):
+        stage_name = "routing-migration-stage.json"
+        invalid_payloads = (
+            b"x" * 4_097,
+            (
+                b'{"schema_version":1,"schema_version":1,'
+                b'"distinct_credentials":1,"destination_candidates":{}}'
+            ),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(size=len(payload)):
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                stage = self.data_dir / stage_name
+                stage.write_bytes(payload)
+                stage.chmod(0o600)
+                with self.assertRaises(ValueError):
+                    remem_routing.load_or_initialize_routing(
+                        self.data_dir,
+                        {},
+                    )
+                stage.unlink()
+
+        target = self.data_dir.parent / "redirected-stage.json"
+        target.write_text("preserve", encoding="utf-8")
+        target.chmod(0o600)
+        (self.data_dir / stage_name).symlink_to(target)
+        with self.assertRaises(ValueError):
+            remem_routing.stage_legacy_routing(
+                remem_routing.LegacyDiscovery(2, {}),
+                self.data_dir,
+            )
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+
+    def test_migration_stage_update_is_crash_atomic(self):
+        remem_routing.stage_legacy_routing(
+            remem_routing.LegacyDiscovery(1, {}),
+            self.data_dir,
+        )
+        stage = self.data_dir / "routing-migration-stage.json"
+        before = stage.read_bytes()
+
+        with mock.patch.object(
+            remem_routing.os,
+            "replace",
+            side_effect=OSError("interrupted"),
+        ):
+            with self.assertRaises(ValueError):
+                remem_routing.stage_legacy_routing(
+                    remem_routing.LegacyDiscovery(2, {}),
+                    self.data_dir,
+                )
+
+        self.assertEqual(stage.read_bytes(), before)
+        self.assertEqual(
+            [
+                path.name
+                for path in self.data_dir.iterdir()
+                if path.name.endswith(".tmp")
+            ],
+            [],
+        )
+
     def test_destination_conflicts_are_per_behavior_and_block_writes(self):
         config, outcome = remem_routing.initialize_routing(
             self.data_dir,

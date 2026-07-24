@@ -435,6 +435,10 @@ def main(
             if isinstance(data_dir, str) and data_dir.strip()
             else None,
             selected,
+            credential_loader=lambda: remem_api.default_keychain().read(
+                remem_api.KEYCHAIN_SERVICE,
+                remem_api.KEYCHAIN_ACCOUNT,
+            ),
         )
         connection = remem_routing.resolve_mcp_connection(
             config,

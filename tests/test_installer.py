@@ -1081,6 +1081,92 @@ class SecureInstallerTests(unittest.TestCase):
             self.assertLess(initialize_index, min(cleanup_indices))
             api.assert_not_called()
 
+    def test_interrupted_install_stages_ambiguity_for_runtime_and_rerun(
+        self,
+    ) -> None:
+        events: list[tuple[Any, ...]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InstallerFixture(
+                directory,
+                legacy_config=(
+                    "[mcp_servers.remem]\n"
+                    'command = "uvx"\n\n'
+                    "[mcp_servers.remem.env]\n"
+                    f'REMEM_API_KEY = "{_CANARY}"\n'
+                ),
+            )
+            keychain = FakeKeychain("vlt_distinct-canonical")
+            runner = FakeRunner(
+                codex=True,
+                mcp_probe_succeeds=False,
+                events=events,
+            )
+            real_stage = remem_routing.stage_legacy_routing
+
+            def stage(*args: Any, **kwargs: Any):
+                events.append(("routing-stage", args[0]))
+                return real_stage(*args, **kwargs)
+
+            with mock.patch.object(
+                remem_routing,
+                "stage_legacy_routing",
+                side_effect=stage,
+            ), mock.patch.object(
+                remem_routing,
+                "initialize_routing",
+                side_effect=AssertionError(
+                    "interrupted install must not finalize routing"
+                ),
+            ):
+                result, output = fixture.install(
+                    runner=runner,
+                    keychain=keychain,
+                )
+
+            self.assertEqual(result, 1)
+            _assert_secret_absent(self, _CANARY, output)
+            staged = [
+                event for event in events if event[0] == "routing-stage"
+            ]
+            self.assertEqual(len(staged), 1)
+            self.assertEqual(staged[0][1].distinct_credentials, 2)
+            stage_path = (
+                fixture.data_dir / "routing-migration-stage.json"
+            )
+            self.assertTrue(stage_path.is_file())
+            _assert_secret_absent(
+                self,
+                _CANARY,
+                stage_path.read_text(encoding="utf-8"),
+            )
+
+            runtime = remem_routing.load_or_initialize_routing(
+                fixture.data_dir,
+                fixture.environment,
+                credential_loader=lambda: self.fail(
+                    "runtime must consume the staged discovery"
+                ),
+            )
+            self.assertTrue(runtime.migration_write_blocked)
+            self.assertFalse(stage_path.exists())
+
+            rerun_result, rerun_output = fixture.install(
+                runner=FakeRunner(codex=True),
+                keychain=keychain,
+            )
+            persisted = remem_routing.load_routing(fixture.data_dir)
+
+            self.assertEqual(rerun_result, 0, rerun_output)
+            self.assertTrue(persisted.migration_write_blocked)
+            self.assertEqual(
+                remem_routing.resolve_routes(
+                    persisted,
+                    behavior="memory",
+                    client="codex",
+                ),
+                (),
+            )
+
     def test_interrupted_cleanup_rerun_does_not_reimport_changed_legacy_routes(
         self,
     ) -> None:

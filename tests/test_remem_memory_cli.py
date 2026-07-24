@@ -594,6 +594,36 @@ class RoutingCliTests(unittest.TestCase):
         )
         self.assertTrue(config.legacy_namespace_migration_completed)
 
+    def test_cli_consumes_interrupted_installer_ambiguity_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_memory.remem_routing.stage_legacy_routing(
+                remem_memory.remem_routing.LegacyDiscovery(2, {}),
+                data_dir,
+            )
+            with mock.patch.object(
+                remem_memory.remem_api,
+                "default_keychain",
+                side_effect=AssertionError(
+                    "staged fallback must not read migration credentials"
+                ),
+            ), mock.patch.object(
+                remem_memory.remem_api,
+                "resolve_connection_api_key",
+                return_value=None,
+            ):
+                result, stdout, stderr = self._run(
+                    ["routes", "show", "--json"],
+                    environment={
+                        "REMEM_MEMORY_DATA_DIR": directory,
+                    },
+                )
+            config = remem_memory.remem_routing.load_routing(data_dir)
+
+        self.assertEqual(result, 0, (stdout, stderr))
+        self.assertTrue(config.migration_write_blocked)
+        self.assertTrue(json.loads(stdout)["migration_write_blocked"])
+
     def test_routes_show_json_is_deterministic_and_client_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
@@ -2824,6 +2854,44 @@ class MCPLauncherTests(unittest.TestCase):
             "runtime-memory",
         )
         self.assertTrue(config.legacy_namespace_migration_completed)
+
+    def test_launcher_consumes_interrupted_installer_ambiguity_stage(self):
+        class ExecIntercept(Exception):
+            pass
+
+        self._routing_patcher.stop()
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_routing.stage_legacy_routing(
+                remem_routing.LegacyDiscovery(2, {}),
+                data_dir,
+            )
+
+            def execvpe(executable, arguments, environment):
+                del executable, arguments, environment
+                raise ExecIntercept()
+
+            with mock.patch.object(
+                launcher.remem_api,
+                "default_keychain",
+                side_effect=AssertionError(
+                    "staged fallback must not read migration credentials"
+                ),
+            ):
+                with self.assertRaises(ExecIntercept):
+                    launcher.main(
+                        ["--client", "codex"],
+                        environment={
+                            "PATH": "/test/bin",
+                            "REMEM_MEMORY_DATA_DIR": directory,
+                        },
+                        resolver=lambda **kwargs: "vlt_runtime-selected",
+                        which=lambda command: "/test/bin/uv",
+                        execvpe=execvpe,
+                    )
+            config = remem_routing.load_routing(data_dir)
+
+        self.assertTrue(config.migration_write_blocked)
 
     def test_bundled_mcp_omits_unspecified_namespaces(self):
         request = mock.AsyncMock(

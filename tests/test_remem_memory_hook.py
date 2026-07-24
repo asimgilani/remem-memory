@@ -1635,6 +1635,41 @@ class RememMemoryHookTests(unittest.TestCase):
         )
         self.assertTrue(config.legacy_namespace_migration_completed)
 
+    def test_hook_consumes_interrupted_installer_ambiguity_stage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            _ROUTING.stage_legacy_routing(
+                _ROUTING.LegacyDiscovery(2, {}),
+                data_dir,
+            )
+            api = FakeAPI(query_response={"results": []})
+            with mock.patch.object(
+                _HOOK.remem_api,
+                "default_keychain",
+                side_effect=AssertionError(
+                    "staged fallback must not read migration credentials"
+                ),
+            ):
+                _HOOK.handle_event(
+                    prompt_payload("What did we decide?"),
+                    harness="codex",
+                    mode="user_prompt_submit",
+                    dependencies=self._dependencies(directory, api),
+                )
+            config = _ROUTING.load_routing(data_dir)
+
+        self.assertTrue(config.migration_write_blocked)
+        self.assertEqual(
+            _ROUTING.resolve_routes(
+                config,
+                behavior="memory",
+                client="codex",
+            ),
+            (),
+        )
+
     def test_recall_resolves_before_credentials_and_groups_namespaces(
         self,
     ) -> None:
