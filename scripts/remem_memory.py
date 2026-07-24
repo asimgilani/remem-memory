@@ -13,6 +13,7 @@ import sys
 import tempfile
 import uuid
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -561,7 +562,12 @@ def _latest_health(
             record.connection_id,
             record.namespace,
         )
-        if key in affected:
+        prior = selected.get(key)
+        if key in affected and (
+            prior is None
+            or _rfc3339_datetime(record.observed_at)
+            >= _rfc3339_datetime(prior.observed_at)
+        ):
             selected[key] = record
     return [
         {
@@ -577,6 +583,19 @@ def _latest_health(
         }
         for _key, record in sorted(selected.items())
     ]
+
+
+def _rfc3339_datetime(value: object) -> datetime:
+    if not isinstance(value, str):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        observed = datetime.fromisoformat(normalized)
+        if observed.tzinfo is None:
+            raise ValueError
+        return observed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _routes_payload(
@@ -1181,7 +1200,9 @@ def _status() -> int:
         if health:
             latest = max(
                 health,
-                key=lambda record: record["observed_at"],
+                key=lambda record: _rfc3339_datetime(
+                    record["observed_at"]
+                ),
             )
             print(
                 f"last API result: {latest['route']} "
@@ -1229,13 +1250,26 @@ def _plugin_record_enabled(record: Mapping[str, Any]) -> bool:
     return isinstance(status, str) and status.lower() == "enabled"
 
 
-def _doctor_client_registrations() -> tuple[str, str]:
+def _doctor_client_registrations(
+) -> tuple[tuple[str, str], tuple[str, str]]:
     child_environment = {
         name: os.environ[name]
         for name in _DOCTOR_ENVIRONMENT_KEYS
         if name in os.environ and isinstance(os.environ[name], str)
     }
     installed = 0
+    codex_enabled = False
+
+    def result(
+        registration: tuple[str, str],
+    ) -> tuple[tuple[str, str], tuple[str, str]]:
+        hook_presence = (
+            ("ok", "installed_plugin_enabled")
+            if codex_enabled
+            else ("warning", "trust_unverified")
+        )
+        return registration, hook_presence
+
     for client in _CLIENTS:
         try:
             executable = shutil.which(
@@ -1263,11 +1297,11 @@ def _doctor_client_registrations() -> tuple[str, str]:
                 or len(rendered.encode("utf-8"))
                 > _MAX_PLUGIN_LIST_BYTES
             ):
-                return "failed", "plugin_state_unavailable"
+                return result(("failed", "plugin_state_unavailable"))
             payload = json.loads(rendered)
             records = _plugin_records(payload)
         except Exception:
-            return "failed", "plugin_state_invalid"
+            return result(("failed", "plugin_state_invalid"))
         matching = [
             record
             for record in records
@@ -1275,12 +1309,15 @@ def _doctor_client_registrations() -> tuple[str, str]:
             in {"remem-memory", "remem-memory@remem-memory"}
         ]
         if not matching:
-            return "failed", "plugin_missing"
-        if not any(_plugin_record_enabled(record) for record in matching):
-            return "failed", "plugin_disabled"
+            return result(("failed", "plugin_missing"))
+        enabled = any(_plugin_record_enabled(record) for record in matching)
+        if client == "codex":
+            codex_enabled = enabled
+        if not enabled:
+            return result(("failed", "plugin_disabled"))
     if installed == 0:
-        return "info", "client_not_installed"
-    return "ok", "verified"
+        return result(("info", "client_not_installed"))
+    return result(("ok", "verified"))
 
 
 def _doctor_checks() -> list[dict[str, str]]:
@@ -1348,24 +1385,15 @@ def _doctor_checks() -> list[dict[str, str]]:
         if uv
         else ("failed", "uv_missing")
     )
-    checks["client_registrations"] = _doctor_client_registrations()
+    (
+        checks["client_registrations"],
+        checks["hook_presence"],
+    ) = _doctor_client_registrations()
     launcher = _PLUGIN_SCRIPTS / "remem_mcp_launcher.py"
     checks["mcp_startup"] = (
         ("warning", "no_read_only_probe")
         if uv and launcher.is_file()
         else ("failed", "launcher_unavailable")
-    )
-    hook_manifest = (
-        _REPOSITORY_ROOT
-        / "plugins"
-        / "remem-memory"
-        / "hooks"
-        / "hooks.json"
-    )
-    checks["hook_presence"] = (
-        ("ok", "manifest_available")
-        if hook_manifest.is_file()
-        else ("failed", "manifest_missing")
     )
     return [
         {
@@ -1379,7 +1407,14 @@ def _doctor_checks() -> list[dict[str, str]]:
 
 def _doctor(as_json: bool) -> int:
     checks = _doctor_checks()
-    healthy = all(check["status"] != "failed" for check in checks)
+    statuses = {check["status"] for check in checks}
+    if "failed" in statuses:
+        status = "failed"
+    elif "warning" in statuses:
+        status = "warning"
+    else:
+        status = "healthy"
+    healthy = status == "healthy"
     try:
         migration_diagnostics = list(
             remem_routing.inspect_routing(default_data_dir()).deprecations
@@ -1394,6 +1429,7 @@ def _doctor(as_json: bool) -> int:
                     "healthy": healthy,
                     "migration_diagnostics": migration_diagnostics,
                     "read_only": True,
+                    "status": status,
                 },
                 ensure_ascii=True,
                 separators=(",", ":"),
@@ -1401,7 +1437,7 @@ def _doctor(as_json: bool) -> int:
             )
         )
     else:
-        print("doctor: healthy" if healthy else "doctor: attention required")
+        print(f"doctor: {status}")
         for check in checks:
             print(
                 f"{check['name']}: {check['status']} "
@@ -1409,7 +1445,7 @@ def _doctor(as_json: bool) -> int:
             )
         for diagnostic in migration_diagnostics:
             print(f"migration: {diagnostic}")
-    return 0 if healthy else 1
+    return 1 if status == "failed" else 0
 
 
 def _usage(program: str) -> str:

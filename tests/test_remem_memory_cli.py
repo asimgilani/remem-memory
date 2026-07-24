@@ -1176,6 +1176,55 @@ class RoutingCliTests(unittest.TestCase):
         self.assertNotIn("connection:", stdout)
         self.assertNotIn("keychain_account", stdout)
 
+    def test_status_orders_fractional_rfc3339_timestamps_chronologically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            data_dir = Path(directory)
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                environment,
+            )
+            for client, status, detail_code, observed_at in (
+                (
+                    "codex",
+                    "permission_error",
+                    "earlier_denied",
+                    "2026-07-24T12:34:56Z",
+                ),
+                (
+                    "claude",
+                    "ok",
+                    "later_allowed",
+                    "2026-07-24T12:34:56.9Z",
+                ),
+            ):
+                remem_memory.remem_routing.record_route_health(
+                    remem_memory.remem_routing.RouteHealthRecord(
+                        client,
+                        "recall",
+                        "primary",
+                        "@readable",
+                        status,
+                        detail_code,
+                        observed_at,
+                    ),
+                    data_dir,
+                )
+
+            result, stdout, stderr = self._run(
+                ["status"],
+                environment=environment,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(
+            "last API result: primary/@readable recall (claude): "
+            "ok [later_allowed]\n",
+            stdout,
+        )
+        self.assertNotIn("earlier_denied", stdout)
+
     def test_doctor_missing_storage_and_unsafe_modes_are_strictly_read_only(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -1339,7 +1388,7 @@ class RoutingCliTests(unittest.TestCase):
                     remem_memory.subprocess,
                     "run",
                     side_effect=run,
-                ):
+                ) as plugin_list:
                     with mock.patch.object(
                         remem_memory.remem_api,
                         "resolve_connection_api_key",
@@ -1364,6 +1413,179 @@ class RoutingCliTests(unittest.TestCase):
             checks["client_registrations"]["detail_code"],
             "verified",
         )
+        self.assertEqual(
+            checks["hook_presence"],
+            {
+                "detail_code": "installed_plugin_enabled",
+                "name": "hook_presence",
+                "status": "ok",
+            },
+        )
+        self.assertEqual(plugin_list.call_count, 2)
+
+    def test_doctor_hook_presence_does_not_trust_checkout_only_manifest(self):
+        cases = (
+            (
+                {"plugins": []},
+                "plugin_missing",
+            ),
+            (
+                {
+                    "plugins": [
+                        {
+                            "name": "remem-memory",
+                            "enabled": False,
+                        }
+                    ]
+                },
+                "plugin_disabled",
+            ),
+        )
+        for plugin_payload, registration_detail in cases:
+            with self.subTest(registration_detail=registration_detail):
+                with tempfile.TemporaryDirectory() as directory:
+                    data_dir = Path(directory) / "state"
+                    remem_memory.remem_routing.load_or_initialize_routing(
+                        data_dir,
+                        {},
+                    )
+                    completed = subprocess.CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps(plugin_payload),
+                        stderr="",
+                    )
+                    with mock.patch(
+                        "shutil.which",
+                        side_effect=lambda command, path=None: (
+                            f"/test/{command}"
+                        ),
+                    ):
+                        with mock.patch.object(
+                            remem_memory.subprocess,
+                            "run",
+                            return_value=completed,
+                        ):
+                            with mock.patch.object(
+                                remem_memory.remem_api,
+                                "resolve_connection_api_key",
+                                return_value="available",
+                            ):
+                                result = self._run(
+                                    ["doctor", "--json"],
+                                    environment={
+                                        "REMEM_MEMORY_DATA_DIR": str(
+                                            data_dir
+                                        )
+                                    },
+                                )
+
+                checks = {
+                    item["name"]: item
+                    for item in json.loads(result[1])["checks"]
+                }
+                self.assertEqual(
+                    checks["client_registrations"]["detail_code"],
+                    registration_detail,
+                )
+                self.assertEqual(
+                    checks["hook_presence"],
+                    {
+                        "detail_code": "trust_unverified",
+                        "name": "hook_presence",
+                        "status": "warning",
+                    },
+                )
+
+    def test_doctor_warning_has_tri_state_summary_and_success_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                {},
+            )
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps(
+                    {
+                        "plugins": [
+                            {
+                                "name": "remem-memory",
+                                "enabled": True,
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+            with mock.patch(
+                "shutil.which",
+                side_effect=lambda command, path=None: f"/test/{command}",
+            ):
+                with mock.patch.object(
+                    remem_memory.subprocess,
+                    "run",
+                    return_value=completed,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_connection_api_key",
+                        return_value="available",
+                    ):
+                        with mock.patch.object(
+                            remem_memory,
+                            "_uv_available",
+                            return_value=True,
+                        ):
+                            json_result = self._run(
+                                ["doctor", "--json"],
+                                environment={
+                                    "REMEM_MEMORY_DATA_DIR": str(data_dir)
+                                },
+                            )
+                            human_result = self._run(
+                                ["doctor"],
+                                environment={
+                                    "REMEM_MEMORY_DATA_DIR": str(data_dir)
+                                },
+                            )
+
+        payload = json.loads(json_result[1])
+        self.assertEqual(json_result[0], 0)
+        self.assertEqual(payload["status"], "warning")
+        self.assertIs(payload["healthy"], False)
+        self.assertEqual(human_result[0], 0)
+        self.assertTrue(human_result[1].startswith("doctor: warning\n"))
+
+    def test_doctor_failed_checks_take_precedence_over_warning_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            with mock.patch("shutil.which", return_value=None):
+                with mock.patch.object(
+                    remem_memory,
+                    "_uv_available",
+                    return_value=True,
+                ):
+                    json_result = self._run(
+                        ["doctor", "--json"],
+                        environment={
+                            "REMEM_MEMORY_DATA_DIR": str(missing)
+                        },
+                    )
+                    human_result = self._run(
+                        ["doctor"],
+                        environment={
+                            "REMEM_MEMORY_DATA_DIR": str(missing)
+                        },
+                    )
+
+        payload = json.loads(json_result[1])
+        self.assertEqual(json_result[0], 1)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIs(payload["healthy"], False)
+        self.assertEqual(human_result[0], 1)
+        self.assertTrue(human_result[1].startswith("doctor: failed\n"))
 
     def test_doctor_readability_ignores_successful_and_failed_write_health(self):
         cases = (
