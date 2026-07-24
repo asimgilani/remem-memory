@@ -326,6 +326,16 @@ def routed(config, events=None):
     return resolve
 
 
+def worker_claim_payload(session_id, events):
+    return {
+        "session_id": session_id,
+        "claim": {
+            "schema_version": 1,
+            "event_ids": [event["id"] for event in events],
+        },
+    }
+
+
 class RememAPITests(unittest.TestCase):
     def test_readable_query_omits_namespaces_and_uses_fixed_transport(
         self,
@@ -1368,6 +1378,96 @@ class RememMemoryHookTests(unittest.TestCase):
             },
         )
 
+    def _claim_race_fixture(self):
+        secondary_hex = "5" * 32
+        secondary = _ROUTING.Connection(
+            f"conn_{secondary_hex}",
+            "Sessions",
+            f"connection:{secondary_hex}",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                secondary,
+            ),
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "durable-memory"),
+                ),
+                "sessions": (
+                    _ROUTING.RouteTarget(
+                        secondary.id,
+                        "session-history",
+                    ),
+                ),
+            },
+            revision=13,
+        )
+        secondary_payload = _HOOK._background_payload(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Write",
+            },
+            "post_tool_use",
+        )
+        primary_payload = _HOOK._background_payload(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "s1",
+                "turn_id": "t1",
+                "last_assistant_message": (
+                    "I will keep future answers concise."
+                ),
+                "_turn_state": {
+                    "current_prompt": (
+                        "Remember that I prefer concise answers."
+                    ),
+                    "turn_id": "t1",
+                    "off_record": False,
+                    "off_record_seen": False,
+                },
+            },
+            "stop",
+        )
+        assert secondary_payload is not None
+        assert primary_payload is not None
+        secondary_event = _HOOK._background_event(
+            client="codex",
+            behavior="sessions",
+            lifecycle_mode="post_tool_use",
+            target=_ROUTING.RouteTarget(
+                secondary.id,
+                "session-history",
+            ),
+            route_revision=13,
+            session_id="s1",
+            payload=secondary_payload,
+            off_record_seen=False,
+        )
+        primary_event = _HOOK._background_event(
+            client="codex",
+            behavior="memory",
+            lifecycle_mode="stop",
+            target=_ROUTING.RouteTarget(
+                "primary",
+                "durable-memory",
+            ),
+            route_revision=13,
+            session_id="s1",
+            payload=primary_payload,
+            off_record_seen=False,
+        )
+        assert secondary_event is not None
+        assert primary_event is not None
+        return secondary, config, secondary_event, primary_event
+
     def test_hook_dependencies_expose_routing_and_connection_resolvers(
         self,
     ) -> None:
@@ -2214,8 +2314,11 @@ class RememMemoryHookTests(unittest.TestCase):
                     "0",
                 )
                 self.assertNotIn("OPENAI_API_KEY", worker_environment)
+                queued_events = _HOOK.BackgroundQueueStore(
+                    Path(directory)
+                ).load("s1")
                 _HOOK.handle_event(
-                    {"session_id": "s1"},
+                    worker_claim_payload("s1", queued_events),
                     harness="codex",
                     mode="worker_drain",
                     dependencies=dependencies,
@@ -2637,7 +2740,7 @@ class RememMemoryHookTests(unittest.TestCase):
         written = process.stdin.write.call_args.args[0]
         self.assertEqual(
             json.loads(written.decode("utf-8")),
-            {"session_id": "s1"},
+            worker_claim_payload("s1", queued),
         )
         self.assertEqual(queued[0]["lifecycle_mode"], "session_end")
         self.assertEqual(queued[0]["behavior"], "sessions")
@@ -3147,8 +3250,11 @@ class RememMemoryHookTests(unittest.TestCase):
                     mode="stop",
                     dependencies=dependencies,
                 )
+            queued_events = _HOOK.BackgroundQueueStore(
+                Path(directory)
+            ).load("s1")
             _HOOK.handle_event(
-                {"session_id": "s1"},
+                worker_claim_payload("s1", queued_events),
                 harness="codex",
                 mode="worker_drain",
                 dependencies=dependencies,
@@ -3319,8 +3425,11 @@ class RememMemoryHookTests(unittest.TestCase):
                         current["off_record"] = True
                         state.save("s1", current)
 
+                    queued_events = _HOOK.BackgroundQueueStore(
+                        Path(directory)
+                    ).load("s1")
                     _HOOK.handle_event(
-                        {"session_id": "s1"},
+                        worker_claim_payload("s1", queued_events),
                         harness="codex",
                         mode="worker_drain",
                         dependencies=dependencies,
@@ -3446,8 +3555,11 @@ class RememMemoryHookTests(unittest.TestCase):
                         sys.modules,
                         {"auto_memory_hook": DelayedSessionPipeline},
                     ):
+                        queued_events = _HOOK.BackgroundQueueStore(
+                            Path(directory)
+                        ).load("s1")
                         _HOOK.handle_event(
-                            {"session_id": "s1"},
+                            worker_claim_payload("s1", queued_events),
                             harness="codex",
                             mode="worker_drain",
                             dependencies=dependencies,
@@ -3736,6 +3848,318 @@ class RememMemoryHookTests(unittest.TestCase):
                 )
                 self.assertNotIn(canary, json.dumps(environment))
 
+    def test_dispatcher_claim_transport_is_bounded_and_payload_free(
+        self,
+    ) -> None:
+        secondary, config, _secondary_event, _primary_event = (
+            self._claim_race_fixture()
+        )
+
+        class CapturingInput:
+            def __init__(self):
+                self.value = b""
+
+            def write(self, value):
+                self.value += value
+
+            def close(self):
+                return None
+
+        captured = CapturingInput()
+
+        def launch(arguments, **kwargs):
+            del arguments, kwargs
+            process = mock.Mock()
+            process.stdin = captured
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            dependencies = self._dependencies(
+                directory,
+                None,
+                background_writes=True,
+                routing_resolver=routed(config),
+            )
+            with mock.patch.object(
+                _HOOK.subprocess,
+                "Popen",
+                side_effect=launch,
+            ):
+                _HOOK.handle_event(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "s1",
+                        "tool_name": "Write",
+                        "tool_input": {
+                            "file_path": "private-source-canary.py",
+                        },
+                    },
+                    harness="codex",
+                    mode="post_tool_use",
+                    dependencies=dependencies,
+                )
+            queued = _HOOK.BackgroundQueueStore(
+                Path(directory)
+            ).load("s1")
+
+        transported = json.loads(captured.value.decode("utf-8"))
+        self.assertLessEqual(len(captured.value), 8192)
+        self.assertEqual(set(transported), {"session_id", "claim"})
+        self.assertEqual(transported["session_id"], "s1")
+        self.assertEqual(
+            transported["claim"],
+            {
+                "schema_version": 1,
+                "event_ids": [queued[0]["id"]],
+            },
+        )
+        self.assertNotIn("private-source-canary", captured.value.decode())
+        self.assertNotIn("payload", transported["claim"])
+
+    def test_background_claim_validation_is_exact_unique_and_bounded(
+        self,
+    ) -> None:
+        secondary, config, secondary_event, _primary_event = (
+            self._claim_race_fixture()
+        )
+        calls = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: calls.append(mode),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    "secondary-key"
+                    if connection.id == secondary.id
+                    else "primary-key"
+                ),
+            )
+            extra_ids = [
+                f"{index:032x}"
+                for index in range(1, 256)
+                if f"{index:032x}" != secondary_event["id"]
+            ]
+            valid_ids = [secondary_event["id"], *extra_ids[:127]]
+            store.save("s1", [secondary_event])
+            _HOOK.handle_event(
+                {
+                    "session_id": "s1",
+                    "claim": {
+                        "schema_version": 1,
+                        "event_ids": valid_ids,
+                    },
+                },
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+            self.assertEqual(calls, ["post_tool_use"])
+            self.assertEqual(store.load("s1"), [])
+
+            invalid_claims = (
+                None,
+                {},
+                {"schema_version": 2, "event_ids": [secondary_event["id"]]},
+                {
+                    "schema_version": 1,
+                    "event_ids": [secondary_event["id"]],
+                    "payload": "must-not-be-accepted",
+                },
+                {
+                    "schema_version": 1,
+                    "event_ids": [
+                        secondary_event["id"],
+                        secondary_event["id"],
+                    ],
+                },
+                {"schema_version": 1, "event_ids": ["not-an-event-id"]},
+                {
+                    "schema_version": 1,
+                    "event_ids": [
+                        secondary_event["id"],
+                        *extra_ids[:128],
+                    ],
+                },
+            )
+            for claim in invalid_claims:
+                with self.subTest(claim=claim):
+                    calls.clear()
+                    store.save("s1", [secondary_event])
+                    payload = {"session_id": "s1"}
+                    if claim is not None:
+                        payload["claim"] = claim
+                    _HOOK.handle_event(
+                        payload,
+                        harness="codex",
+                        mode="worker_drain",
+                        dependencies=dependencies,
+                    )
+                    self.assertEqual(calls, [])
+                    self.assertEqual(
+                        [event["id"] for event in store.load("s1")],
+                        [secondary_event["id"]],
+                    )
+
+    def test_secondary_claim_never_drains_primary_appended_before_lock(
+        self,
+    ) -> None:
+        secondary, config, secondary_event, primary_event = (
+            self._claim_race_fixture()
+        )
+        engineering_calls = []
+        credential_calls = []
+        factory_calls = []
+        memory_api = FakeAPI()
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [secondary_event])
+            claim_a = worker_claim_payload("s1", [secondary_event])
+            store.save("s1", [secondary_event, primary_event])
+
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: (
+                    engineering_calls.append(
+                        (mode, os.environ.get("REMEM_API_KEY"))
+                    )
+                ),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    credential_calls.append(connection.id)
+                    or (
+                        "secondary-key"
+                        if connection.id == secondary.id
+                        else "wrong-keychain-primary"
+                    )
+                ),
+                api_factory=lambda connection, credential: (
+                    factory_calls.append((connection.id, credential))
+                    or memory_api
+                ),
+            )
+            _HOOK.handle_event(
+                claim_a,
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+            remaining = store.load("s1")
+
+        self.assertEqual(
+            engineering_calls,
+            [("post_tool_use", "secondary-key")],
+        )
+        self.assertEqual(credential_calls, [secondary.id])
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(memory_api.ingests, [])
+        self.assertEqual(
+            [event["id"] for event in remaining],
+            [primary_event["id"]],
+        )
+
+    def test_overlapping_claims_are_safe_in_either_worker_lock_order(
+        self,
+    ) -> None:
+        for order in (("a", "b"), ("b", "a")):
+            with self.subTest(order=order):
+                secondary, config, secondary_event, primary_event = (
+                    self._claim_race_fixture()
+                )
+                engineering_calls = []
+                factory_calls = []
+                memory_api = FakeAPI()
+
+                with tempfile.TemporaryDirectory() as directory:
+                    self._seed_durable_turn(directory)
+                    store = _HOOK.BackgroundQueueStore(Path(directory))
+                    store.save("s1", [secondary_event, primary_event])
+
+                    def credentials(connection):
+                        return (
+                            "secondary-key"
+                            if connection.id == secondary.id
+                            else "wrong-keychain-primary"
+                        )
+
+                    def engineering(mode, payload):
+                        del payload
+                        engineering_calls.append(
+                            (mode, os.environ.get("REMEM_API_KEY"))
+                        )
+
+                    def api_factory(connection, credential):
+                        factory_calls.append(
+                            (connection.id, credential)
+                        )
+                        return memory_api
+
+                    common = {
+                        "engineering_handler": engineering,
+                        "background_writes": True,
+                        "routing_resolver": routed(config),
+                        "connection_credential_resolver": credentials,
+                        "api_factory": api_factory,
+                    }
+                    dependencies_a = self._dependencies(
+                        directory,
+                        None,
+                        **common,
+                    )
+                    dependencies_b = self._dependencies(
+                        directory,
+                        None,
+                        **common,
+                    )
+                    object.__setattr__(
+                        dependencies_b,
+                        "primary_credential_override",
+                        "ambient-primary-key",
+                    )
+                    dispatchers = {
+                        "a": (
+                            worker_claim_payload(
+                                "s1",
+                                [secondary_event],
+                            ),
+                            dependencies_a,
+                        ),
+                        "b": (
+                            worker_claim_payload(
+                                "s1",
+                                [secondary_event, primary_event],
+                            ),
+                            dependencies_b,
+                        ),
+                    }
+                    for name in order:
+                        payload, dependencies = dispatchers[name]
+                        _HOOK.handle_event(
+                            payload,
+                            harness="codex",
+                            mode="worker_drain",
+                            dependencies=dependencies,
+                        )
+                    remaining = store.load("s1")
+
+                self.assertEqual(
+                    engineering_calls,
+                    [("post_tool_use", "secondary-key")],
+                )
+                self.assertEqual(
+                    factory_calls,
+                    [("primary", "ambient-primary-key")],
+                )
+                self.assertEqual(len(memory_api.ingests), 1)
+                self.assertEqual(remaining, [])
+
     def test_worker_drain_consumes_primary_override_into_local_state(
         self,
     ) -> None:
@@ -3835,8 +4259,11 @@ class RememMemoryHookTests(unittest.TestCase):
                     mode="post_tool_use",
                     dependencies=dependencies,
                 )
+            queued_events = _HOOK.BackgroundQueueStore(
+                Path(directory)
+            ).load("s1")
             _HOOK.handle_event(
-                {"session_id": "s1"},
+                worker_claim_payload("s1", queued_events),
                 harness="codex",
                 mode="worker_drain",
                 dependencies=dependencies,

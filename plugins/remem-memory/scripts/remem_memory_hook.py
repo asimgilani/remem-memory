@@ -66,6 +66,7 @@ _INGEST_TIMEOUT = 2.0
 _MAX_COMPLETED_TURNS = 100
 _MAX_BACKGROUND_QUEUE = 128
 _MAX_BACKGROUND_QUEUE_BYTES = 262_144
+_MAX_BACKGROUND_CLAIM_BYTES = 8_192
 _MAX_CREDENTIAL_BYTES = 8192
 _DEFAULT_API_URL = "https://api.remem.io"
 _BASE_WORKER_ENVIRONMENT_KEYS = (
@@ -156,6 +157,12 @@ class RoutedBackgroundEvent:
     session_id: str
     payload: Mapping[str, Any]
     off_record_seen: bool
+
+
+@dataclass(frozen=True)
+class BackgroundClaim:
+    event_ids: tuple[str, ...]
+    connection_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1454,11 +1461,53 @@ def _normalize_background_queue(
     return normalized
 
 
+def _normalize_background_claim(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "event_ids",
+    }:
+        return None
+    event_ids = value.get("event_ids")
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or not isinstance(event_ids, list)
+        or not 1 <= len(event_ids) <= _MAX_BACKGROUND_QUEUE
+    ):
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for event_id in event_ids:
+        if (
+            not isinstance(event_id, str)
+            or _BACKGROUND_EVENT_ID.fullmatch(event_id) is None
+            or event_id in seen
+        ):
+            return None
+        seen.add(event_id)
+        normalized.append(event_id)
+    descriptor = {
+        "schema_version": 1,
+        "event_ids": normalized,
+    }
+    try:
+        encoded = json.dumps(
+            descriptor,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    if len(encoded) > _MAX_BACKGROUND_CLAIM_BYTES:
+        return None
+    return tuple(normalized)
+
+
 def _enqueue_background(
     store: BackgroundQueueStore,
     session_id: str,
     new_events: list[dict[str, Any]],
-) -> tuple[str, ...] | None:
+) -> BackgroundClaim | None:
     with store.locked(session_id):
         events = store.load(session_id)
         normalized_new = _normalize_background_queue(new_events)
@@ -1471,7 +1520,12 @@ def _enqueue_background(
             store.save(session_id, queued)
         except Exception:
             return None
-    return tuple(event["connection_id"] for event in queued)
+    return BackgroundClaim(
+        event_ids=tuple(event["id"] for event in queued),
+        connection_ids=tuple(
+            event["connection_id"] for event in queued
+        ),
+    )
 
 
 def _background_event(
@@ -1874,12 +1928,31 @@ def _spawn_background(
     if not new_events:
         return output
     queue = BackgroundQueueStore(dependencies.state_dir)
-    queued_connections = _enqueue_background(
+    queued_claim = _enqueue_background(
         queue,
         session_id,
         new_events,
     )
-    if queued_connections is None:
+    if queued_claim is None:
+        return output
+    claim_descriptor = {
+        "schema_version": 1,
+        "event_ids": list(queued_claim.event_ids),
+    }
+    if _normalize_background_claim(claim_descriptor) is None:
+        return output
+    try:
+        dispatch_payload = json.dumps(
+            {
+                "session_id": session_id,
+                "claim": claim_descriptor,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return output
+    if len(dispatch_payload) > _MAX_BACKGROUND_CLAIM_BYTES:
         return output
 
     environment = _worker_environment(
@@ -1889,7 +1962,7 @@ def _spawn_background(
     )
     credential = (
         os.environ.get("REMEM_API_KEY", "").strip()
-        if "primary" in queued_connections
+        if "primary" in queued_claim.connection_ids
         else ""
     )
     descriptor: int | None = None
@@ -1921,12 +1994,7 @@ def _spawn_background(
             pass_fds=(descriptor,) if descriptor is not None else (),
         )
         if process.stdin is not None:
-            process.stdin.write(
-                json.dumps(
-                    {"session_id": session_id},
-                    ensure_ascii=True,
-                ).encode("utf-8")
-            )
+            process.stdin.write(dispatch_payload)
             process.stdin.close()
     except Exception:
         pass
@@ -2101,18 +2169,37 @@ def _drain_background_queue(
     dependencies: Dependencies,
     settings: Settings,
 ) -> dict[str, Any]:
+    del settings
+    claimed_ids = _normalize_background_claim(payload.get("claim"))
+    if claimed_ids is None:
+        return {}
+    pending = set(claimed_ids)
     session_id = _session_id(payload)
     queue = BackgroundQueueStore(dependencies.state_dir)
     with queue.worker_locked(session_id):
-        while True:
+        while pending:
             with queue.locked(session_id):
                 events = queue.load(session_id)
-                if not events:
+                event = next(
+                    (
+                        candidate
+                        for candidate in events
+                        if candidate["id"] in pending
+                    ),
+                    None,
+                )
+                if event is None:
                     return {}
-                event = events[0]
                 live_settings = _settings(dependencies)
                 if live_settings.mode != "auto":
-                    queue.save(session_id, [])
+                    queue.save(
+                        session_id,
+                        [
+                            candidate
+                            for candidate in events
+                            if candidate["id"] not in pending
+                        ],
+                    )
                     return {}
             try:
                 _process_background_event(
@@ -2124,11 +2211,16 @@ def _drain_background_queue(
                 return {}
             with queue.locked(session_id):
                 current = queue.load(session_id)
-                if (
-                    current
-                    and current[0].get("id") == event.get("id")
-                ):
-                    queue.save(session_id, current[1:])
+                queue.save(
+                    session_id,
+                    [
+                        candidate
+                        for candidate in current
+                        if candidate["id"] != event["id"]
+                    ],
+                )
+            pending.discard(event["id"])
+    return {}
 
 
 def handle_event(
