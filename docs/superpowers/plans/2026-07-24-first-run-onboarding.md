@@ -562,14 +562,18 @@ env HOME="${qa_home}" CODEX_HOME="${qa_codex}" \
   CLAUDE_CONFIG_DIR="${qa_claude}" PATH="${qa_path}" \
   claude plugin list --json
 env HOME="${qa_home}" PATH="${qa_path}" \
-  python3 -I plugins/remem-memory/scripts/remem_mcp_launcher.py --probe
+  python3 -I -c \
+  "import os,runpy,sys;root=sys.argv[1];scripts=os.path.join(root,'scripts');launcher=os.path.join(scripts,'remem_mcp_launcher.py');sys.path.insert(0,scripts);sys.argv=[launcher,*sys.argv[2:]];runpy.run_path(launcher,run_name='__main__')" \
+  plugins/remem-memory --probe
 ```
 
 Expected: both installs succeed, the second is idempotent, both client lists
 show Remem Memory `0.3.2` enabled, and the direct MCP probe exits zero. Inspect
 only `${qa_codex}/config.toml` and `${qa_claude}/settings.json` for unexpected
 credential values; plugin source caches legitimately contain the fixed probe
-canary as source code and are not credential persistence.
+canary as source code and are not credential persistence. A genuinely clean
+QA home has an empty `uv` cache, so allow the first isolated install to fetch
+the locked PyPI artifacts; a restricted DNS sandbox is not a product failure.
 
 - [ ] **Step 3: Request independent code and security review**
 
