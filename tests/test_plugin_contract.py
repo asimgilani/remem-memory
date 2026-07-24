@@ -35,6 +35,7 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(codex_market["name"], "remem-memory")
         self.assertEqual(claude_market["plugins"][0]["name"], "remem-memory")
         self.assertEqual(codex_market["plugins"][0]["name"], "remem-memory")
+        self.assertEqual(claude_market["plugins"][0]["version"], "0.3.2")
         self.assertEqual(claude_plugin["name"], "remem-memory")
         self.assertEqual(codex_plugin["name"], "remem-memory")
         self.assertEqual(claude_plugin["version"], "0.3.2")
