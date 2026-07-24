@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -798,6 +799,45 @@ class RoutingCliTests(unittest.TestCase):
                 "error: invalid routes command\n",
             )
 
+    def test_client_recall_from_is_an_explicit_supported_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            result = self._run(
+                [
+                    "routes",
+                    "set",
+                    "recall",
+                    "--from",
+                    "client-a",
+                    "client-b",
+                    "--client",
+                    "claude",
+                ],
+                environment=environment,
+            )
+            shown = self._run(
+                [
+                    "routes",
+                    "show",
+                    "--client",
+                    "claude",
+                    "--json",
+                ],
+                environment=environment,
+            )
+
+        self.assertEqual(result[0], 0)
+        self.assertEqual(
+            json.loads(shown[1])["clients"]["claude"]["recall"],
+            {
+                "routes": [
+                    "primary/client-a",
+                    "primary/client-b",
+                ],
+                "source": "override",
+            },
+        )
+
     def test_global_write_choices_release_migration_block_only_when_complete(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {
@@ -976,6 +1016,97 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(len(config.connections), 2)
         self.assertTrue(config.legacy_namespace_migration_completed)
 
+    def test_connection_add_rejects_an_existing_pending_internal_id_as_label(self):
+        token = "0123456789abcdef0123456789abcdef"
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            config = remem_memory.remem_routing.load_or_initialize_routing(
+                Path(directory),
+                environment,
+            )
+            remem_memory.remem_routing.update_routing(
+                lambda current: replace(
+                    current,
+                    connections=(
+                        *current.connections,
+                        remem_memory.remem_routing.Connection(
+                            f"conn_{token}",
+                            "Pending",
+                            f"connection:{token}",
+                            False,
+                        ),
+                    ),
+                ),
+                Path(directory),
+            )
+            with mock.patch.object(
+                remem_memory.getpass,
+                "getpass",
+                return_value="must-not-be-written",
+            ) as prompt:
+                result = self._run(
+                    ["connections", "add", f"conn_{token}"],
+                    environment=environment,
+                )
+            stored = remem_memory.remem_routing.load_routing(
+                Path(directory)
+            )
+
+        self.assertEqual(
+            result,
+            (2, "", "error: invalid connections command\n"),
+        )
+        prompt.assert_not_called()
+        self.assertFalse(stored.connections[1].configured)
+        self.assertEqual("Pending", stored.connections[1].label)
+
+    def test_default_reset_commits_only_the_final_state_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            config = remem_memory.remem_routing.load_or_initialize_routing(
+                Path(directory),
+                environment,
+            )
+            configured = replace(
+                config,
+                revision=10,
+                global_routes=remem_memory.remem_routing.RouteLayer(
+                    {
+                        "memory": (
+                            remem_memory.remem_routing.RouteTarget(
+                                "primary",
+                                "personal",
+                            ),
+                        ),
+                        "sessions": (),
+                    }
+                ),
+                client_routes={
+                    "codex": remem_memory.remem_routing.RouteLayer(
+                        {"recall": ()}
+                    )
+                },
+                migration_write_blocked=True,
+            )
+            remem_memory.remem_routing.store_routing(
+                configured,
+                Path(directory),
+            )
+
+            result = self._run(
+                ["routes", "use-default"],
+                environment=environment,
+            )
+            reset = remem_memory.remem_routing.load_routing(
+                Path(directory)
+            )
+
+        self.assertEqual(result, (0, "routes: default\n", ""))
+        self.assertEqual(11, reset.revision)
+        self.assertEqual({}, dict(reset.global_routes.routes))
+        self.assertEqual({}, dict(reset.client_routes))
+        self.assertFalse(reset.migration_write_blocked)
+
     def test_status_extends_legacy_controls_with_compact_secret_free_routing(self):
         with tempfile.TemporaryDirectory() as directory:
             result, stdout, stderr = self._run(
@@ -1002,6 +1133,289 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn("connections: 1 configured, 0 missing\n", stdout)
         self.assertNotIn("keychain_account", stdout)
 
+    def test_status_includes_connection_health_and_latest_fixed_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            remem_memory.remem_routing.load_or_initialize_routing(
+                Path(directory),
+                environment,
+            )
+            remem_memory.remem_routing.record_route_health(
+                remem_memory.remem_routing.RouteHealthRecord(
+                    "codex",
+                    "recall",
+                    "primary",
+                    "@readable",
+                    "permission_error",
+                    "read_denied",
+                    "2026-07-24T12:34:56Z",
+                ),
+                Path(directory),
+            )
+            with mock.patch.object(
+                remem_memory.remem_api,
+                "resolve_connection_api_key",
+                return_value=None,
+            ):
+                result, stdout, stderr = self._run(
+                    ["status"],
+                    environment=environment,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(
+            "connection Primary: configured; credential missing\n",
+            stdout,
+        )
+        self.assertIn(
+            "last API result: primary/@readable recall (codex): "
+            "permission_error [read_denied]\n",
+            stdout,
+        )
+        self.assertNotIn("connection:", stdout)
+        self.assertNotIn("keychain_account", stdout)
+
+    def test_doctor_missing_storage_and_unsafe_modes_are_strictly_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            missing = parent / "missing"
+            parent_before = parent.stat()
+            with mock.patch("shutil.which", return_value=None):
+                missing_result = self._run(
+                    ["doctor", "--json"],
+                    environment={"REMEM_MEMORY_DATA_DIR": str(missing)},
+                )
+            parent_after = parent.stat()
+
+            self.assertEqual(missing_result[0], 1)
+            self.assertFalse(missing.exists())
+            self.assertEqual(parent_before.st_ino, parent_after.st_ino)
+            self.assertEqual(parent_before.st_mtime_ns, parent_after.st_mtime_ns)
+
+            data_dir = parent / "existing"
+            remem_memory.remem_routing.store_routing(
+                remem_memory.remem_routing.load_or_initialize_routing(
+                    parent / "seed",
+                    {},
+                ),
+                data_dir,
+            )
+            route_path = data_dir / "routes.json"
+            data_dir.chmod(0o750)
+            route_path.chmod(0o640)
+            directory_before = data_dir.stat()
+            file_before = route_path.stat()
+
+            with mock.patch("shutil.which", return_value=None):
+                unsafe_result = self._run(
+                    ["doctor", "--json"],
+                    environment={"REMEM_MEMORY_DATA_DIR": str(data_dir)},
+                )
+            directory_after = data_dir.stat()
+            file_after = route_path.stat()
+
+        self.assertEqual(unsafe_result[0], 1)
+        self.assertEqual(
+            (
+                directory_before.st_ino,
+                directory_before.st_mtime_ns,
+                stat.S_IMODE(directory_before.st_mode),
+                file_before.st_ino,
+                file_before.st_mtime_ns,
+                stat.S_IMODE(file_before.st_mode),
+            ),
+            (
+                directory_after.st_ino,
+                directory_after.st_mtime_ns,
+                stat.S_IMODE(directory_after.st_mode),
+                file_after.st_ino,
+                file_after.st_mtime_ns,
+                stat.S_IMODE(file_after.st_mode),
+            ),
+        )
+
+    def test_doctor_rejects_plugin_home_and_launcher_false_positives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".codex").mkdir()
+            (home / ".claude").mkdir()
+            data_dir = home / "state"
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                {},
+            )
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout='{"plugins":[]}',
+                stderr="",
+            )
+            with mock.patch(
+                "shutil.which",
+                side_effect=lambda command, path=None: f"/test/{command}",
+            ):
+                with mock.patch.object(
+                    remem_memory.subprocess,
+                    "run",
+                    return_value=completed,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_connection_api_key",
+                        return_value="available",
+                    ):
+                        with mock.patch.object(
+                            remem_memory,
+                            "_uv_available",
+                            return_value=True,
+                        ):
+                            result = self._run(
+                                ["doctor", "--json"],
+                                environment={
+                                    "HOME": str(home),
+                                    "REMEM_MEMORY_DATA_DIR": str(data_dir),
+                                },
+                            )
+
+        payload = json.loads(result[1])
+        checks = {item["name"]: item for item in payload["checks"]}
+        self.assertEqual(
+            checks["client_registrations"],
+            {
+                "detail_code": "plugin_missing",
+                "name": "client_registrations",
+                "status": "failed",
+            },
+        )
+        self.assertEqual(
+            checks["mcp_startup"],
+            {
+                "detail_code": "no_read_only_probe",
+                "name": "mcp_startup",
+                "status": "warning",
+            },
+        )
+
+    def test_doctor_verifies_exact_installed_plugin_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "state"
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                {},
+            )
+            payloads = {
+                "/test/codex": {
+                    "plugins": [
+                        {
+                            "name": "remem-memory",
+                            "enabled": True,
+                        }
+                    ]
+                },
+                "/test/claude": {
+                    "installed": [
+                        {
+                            "name": "remem-memory@remem-memory",
+                            "status": "enabled",
+                        }
+                    ]
+                },
+            }
+
+            def run(arguments, **_kwargs):
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout=json.dumps(payloads[arguments[0]]),
+                    stderr="",
+                )
+
+            with mock.patch(
+                "shutil.which",
+                side_effect=lambda command, path=None: f"/test/{command}",
+            ):
+                with mock.patch.object(
+                    remem_memory.subprocess,
+                    "run",
+                    side_effect=run,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_connection_api_key",
+                        return_value="available",
+                    ):
+                        result = self._run(
+                            ["doctor", "--json"],
+                            environment={
+                                "REMEM_MEMORY_DATA_DIR": str(data_dir)
+                            },
+                        )
+
+        checks = {
+            item["name"]: item
+            for item in json.loads(result[1])["checks"]
+        }
+        self.assertEqual(
+            checks["client_registrations"]["status"],
+            "ok",
+        )
+        self.assertEqual(
+            checks["client_registrations"]["detail_code"],
+            "verified",
+        )
+
+    def test_doctor_readability_ignores_successful_and_failed_write_health(self):
+        cases = (
+            ("memory", "ok", "ok"),
+            ("sessions", "permission_error", "write_denied"),
+        )
+        for behavior, status, detail_code in cases:
+            with self.subTest(behavior=behavior, status=status):
+                with tempfile.TemporaryDirectory() as directory:
+                    data_dir = Path(directory)
+                    remem_memory.remem_routing.load_or_initialize_routing(
+                        data_dir,
+                        {},
+                    )
+                    remem_memory.remem_routing.record_route_health(
+                        remem_memory.remem_routing.RouteHealthRecord(
+                            "codex",
+                            behavior,
+                            "primary",
+                            "@default",
+                            status,
+                            detail_code,
+                            "2026-07-24T12:34:56Z",
+                        ),
+                        data_dir,
+                    )
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_connection_api_key",
+                        return_value="available",
+                    ):
+                        with mock.patch("shutil.which", return_value=None):
+                            result = self._run(
+                                ["doctor", "--json"],
+                                environment={
+                                    "REMEM_MEMORY_DATA_DIR": str(data_dir)
+                                },
+                            )
+
+                checks = {
+                    item["name"]: item
+                    for item in json.loads(result[1])["checks"]
+                }
+                self.assertEqual(
+                    checks["namespace_readability"],
+                    {
+                        "detail_code": "no_prior_read",
+                        "name": "namespace_readability",
+                        "status": "info",
+                    },
+                )
+
     def test_doctor_is_deterministic_read_only_and_emits_no_query_content(self):
         canary = "vlt-doctor-recalled-content"
         with tempfile.TemporaryDirectory() as directory:
@@ -1027,14 +1441,15 @@ class RoutingCliTests(unittest.TestCase):
                     remem_memory.remem_api.RememAPI,
                     "ingest",
                 ) as ingest:
-                    first = self._run(
-                        ["doctor", "--json"],
-                        environment=environment,
-                    )
-                    second = self._run(
-                        ["doctor", "--json"],
-                        environment=environment,
-                    )
+                    with mock.patch("shutil.which", return_value=None):
+                        first = self._run(
+                            ["doctor", "--json"],
+                            environment=environment,
+                        )
+                        second = self._run(
+                            ["doctor", "--json"],
+                            environment=environment,
+                        )
             after = {
                 path.name: path.read_bytes()
                 for path in Path(directory).iterdir()

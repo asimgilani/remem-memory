@@ -269,6 +269,68 @@ class CanonicalDispatchSecurityTests(unittest.TestCase):
 
 
 class RoutingCliSecurityTests(unittest.TestCase):
+    def test_doctor_plugin_checks_use_a_secret_free_bounded_environment(
+        self,
+    ) -> None:
+        canary = "vlt-doctor-plugin-env-secret"
+        observed = []
+
+        def run(arguments, **kwargs):
+            observed.append((list(arguments), dict(kwargs["env"])))
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=(
+                    '{"plugins":[{"name":"remem-memory",'
+                    '"enabled":true}]}'
+                ),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "state"
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                {},
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": directory,
+                    "PATH": "/test/bin",
+                    "REMEM_MEMORY_DATA_DIR": str(data_dir),
+                    "REMEM_API_KEY": canary,
+                    "AWS_SECRET_ACCESS_KEY": canary,
+                },
+                clear=True,
+            ):
+                with mock.patch(
+                    "shutil.which",
+                    side_effect=lambda command, path=None: f"/test/{command}",
+                ):
+                    with mock.patch.object(
+                        remem_memory.subprocess,
+                        "run",
+                        side_effect=run,
+                    ):
+                        with mock.patch.object(
+                            remem_memory.remem_api,
+                            "resolve_connection_api_key",
+                            return_value="available",
+                        ):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                remem_memory.main(["doctor", "--json"])
+
+        self.assertEqual(len(observed), 2)
+        for arguments, environment in observed:
+            self.assertEqual(
+                arguments[1:],
+                ["plugin", "list", "--json"],
+            )
+            self.assertNotIn(canary, json.dumps(environment))
+            self.assertNotIn("REMEM_API_KEY", environment)
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
+
     def test_named_key_never_enters_arguments_environment_routes_or_output(
         self,
     ) -> None:

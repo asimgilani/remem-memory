@@ -7,6 +7,7 @@ import getpass
 import hmac
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,20 @@ _VALID_SENSITIVITIES = {
 }
 _CLIENTS = ("codex", "claude")
 _BEHAVIORS = ("recall", "memory", "sessions")
+_DOCTOR_ENVIRONMENT_KEYS = (
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "NO_COLOR",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+)
+_MAX_PLUGIN_LIST_BYTES = 64 * 1024
 _DEFAULT_DATA_DIR = ".config/remem-memory"
 
 
@@ -503,13 +518,19 @@ def _latest_health(
     config: remem_routing.RoutingConfig,
     clients: tuple[str, ...],
     mode: str,
+    *,
+    read_only: bool = False,
 ) -> list[dict[str, str]]:
     selected: dict[
         tuple[str, str, str, str],
         remem_routing.RouteHealthRecord,
     ] = {}
     try:
-        records = remem_routing.load_route_health(default_data_dir())
+        records = (
+            remem_routing.inspect_route_health(default_data_dir())
+            if read_only
+            else remem_routing.load_route_health(default_data_dir())
+        )
     except Exception:
         return []
     affected = {
@@ -829,28 +850,8 @@ def _set_routes(arguments: List[str]) -> int:
 
 def _use_default_routes() -> int:
     try:
-        current = _load_or_initialize_routing()
-        if current.migration_write_blocked:
-            defaults = remem_routing.built_in_routes()
-
-            def resolve_block(
-                config: remem_routing.RoutingConfig,
-            ) -> remem_routing.RoutingConfig:
-                routes = dict(config.global_routes.routes)
-                routes["memory"] = defaults["memory"]
-                routes["sessions"] = defaults["sessions"]
-                return replace(
-                    config,
-                    global_routes=remem_routing.RouteLayer(routes),
-                )
-
-            remem_routing.update_routing(
-                resolve_block,
-                default_data_dir(),
-                resolve_migration_write_block=True,
-            )
-        remem_routing.update_routing(
-            remem_routing.use_default_routes,
+        _load_or_initialize_routing()
+        remem_routing.reset_routing_to_defaults(
             default_data_dir(),
         )
     except Exception:
@@ -922,6 +923,25 @@ def _connections_list(as_json: bool) -> int:
 
 def _add_connection(name: str) -> int:
     try:
+        config = _load_or_initialize_routing()
+    except Exception:
+        print(
+            "error: unable to configure Remem connection",
+            file=sys.stderr,
+        )
+        return 1
+    if any(connection.id == name for connection in config.connections):
+        print("error: invalid connections command", file=sys.stderr)
+        return 2
+    matches = [
+        connection
+        for connection in config.connections
+        if connection.label == name
+    ]
+    if matches and matches[0].configured:
+        print("error: invalid connections command", file=sys.stderr)
+        return 2
+    try:
         value = getpass.getpass("Remem API key: ")
     except Exception:
         print("error: unable to read Remem credential", file=sys.stderr)
@@ -931,16 +951,8 @@ def _add_connection(name: str) -> int:
         print("error: Remem credential cannot be empty", file=sys.stderr)
         return 2
     try:
-        config = _load_or_initialize_routing()
-        matches = [
-            connection
-            for connection in config.connections
-            if connection.label == name
-        ]
         if matches:
             connection = matches[0]
-            if connection.configured:
-                raise ValueError("Connection already configured")
         else:
             if name.lower() == "primary":
                 raise ValueError("Reserved connection name")
@@ -1143,6 +1155,39 @@ def _status() -> int:
         print(
             f"connections: {configured} configured, {missing} missing"
         )
+        for connection in config.connections:
+            try:
+                connection_credential = (
+                    remem_api.resolve_connection_api_key(
+                        connection,
+                        environment=os.environ,
+                    )
+                )
+            except Exception:
+                connection_credential = None
+            state = "configured" if connection.configured else "missing"
+            credential_state = (
+                "available" if connection_credential else "missing"
+            )
+            print(
+                f"connection {connection.label}: {state}; "
+                f"credential {credential_state}"
+            )
+        health = _latest_health(
+            config,
+            _CLIENTS,
+            settings["mode"],
+        )
+        if health:
+            latest = max(
+                health,
+                key=lambda record: record["observed_at"],
+            )
+            print(
+                f"last API result: {latest['route']} "
+                f"{latest['behavior']} ({latest['client']}): "
+                f"{latest['status']} [{latest['detail_code']}]"
+            )
         for diagnostic in config.deprecations:
             print(f"migration: {diagnostic}")
     if _uv_available():
@@ -1152,10 +1197,96 @@ def _status() -> int:
     return 0
 
 
+def _plugin_records(value: object) -> list[dict[str, Any]]:
+    selected = value
+    if isinstance(value, dict):
+        if "plugins" in value:
+            selected = value["plugins"]
+        elif "installed" in value:
+            selected = value["installed"]
+        else:
+            selected = []
+    if isinstance(selected, dict):
+        selected = list(selected.values())
+    if not isinstance(selected, list):
+        raise ValueError("Invalid plugin list")
+    return [item for item in selected if isinstance(item, dict)]
+
+
+def _plugin_record_name(record: Mapping[str, Any]) -> str:
+    for field in ("name", "id", "plugin", "identity"):
+        value = record.get(field)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _plugin_record_enabled(record: Mapping[str, Any]) -> bool:
+    enabled = record.get("enabled")
+    if isinstance(enabled, bool):
+        return enabled
+    status = record.get("status")
+    return isinstance(status, str) and status.lower() == "enabled"
+
+
+def _doctor_client_registrations() -> tuple[str, str]:
+    child_environment = {
+        name: os.environ[name]
+        for name in _DOCTOR_ENVIRONMENT_KEYS
+        if name in os.environ and isinstance(os.environ[name], str)
+    }
+    installed = 0
+    for client in _CLIENTS:
+        try:
+            executable = shutil.which(
+                client,
+                path=os.environ.get("PATH"),
+            )
+        except Exception:
+            executable = None
+        if not executable:
+            continue
+        installed += 1
+        try:
+            completed = subprocess.run(
+                [executable, "plugin", "list", "--json"],
+                env=child_environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            rendered = completed.stdout
+            if (
+                completed.returncode != 0
+                or not isinstance(rendered, str)
+                or len(rendered.encode("utf-8"))
+                > _MAX_PLUGIN_LIST_BYTES
+            ):
+                return "failed", "plugin_state_unavailable"
+            payload = json.loads(rendered)
+            records = _plugin_records(payload)
+        except Exception:
+            return "failed", "plugin_state_invalid"
+        matching = [
+            record
+            for record in records
+            if _plugin_record_name(record)
+            in {"remem-memory", "remem-memory@remem-memory"}
+        ]
+        if not matching:
+            return "failed", "plugin_missing"
+        if not any(_plugin_record_enabled(record) for record in matching):
+            return "failed", "plugin_disabled"
+    if installed == 0:
+        return "info", "client_not_installed"
+    return "ok", "verified"
+
+
 def _doctor_checks() -> list[dict[str, str]]:
     checks: dict[str, tuple[str, str]] = {}
     try:
-        config = remem_routing.load_routing(default_data_dir())
+        config = remem_routing.inspect_routing(default_data_dir())
     except FileNotFoundError:
         config = None
         checks["routing_storage"] = ("failed", "missing")
@@ -1184,11 +1315,20 @@ def _doctor_checks() -> list[dict[str, str]]:
             if missing == 0
             else ("failed", "credential_unavailable")
         )
-        health = _latest_health(config, _CLIENTS, load_settings()["mode"])
+        health = [
+            record
+            for record in _latest_health(
+                config,
+                _CLIENTS,
+                load_settings()["mode"],
+                read_only=True,
+            )
+            if record["behavior"] == "recall"
+        ]
         if not health:
             checks["namespace_readability"] = (
                 "info",
-                "no_prior_result",
+                "no_prior_read",
             )
         elif all(record["status"] == "ok" for record in health):
             checks["namespace_readability"] = ("ok", "authorized")
@@ -1208,22 +1348,10 @@ def _doctor_checks() -> list[dict[str, str]]:
         if uv
         else ("failed", "uv_missing")
     )
-    codex_home = Path(
-        os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
-    )
-    claude_home = Path(
-        os.environ.get(
-            "CLAUDE_CONFIG_DIR",
-            str(Path.home() / ".claude"),
-        )
-    )
-    if codex_home.is_dir() or claude_home.is_dir():
-        checks["client_registrations"] = ("ok", "client_home_present")
-    else:
-        checks["client_registrations"] = ("failed", "client_home_missing")
+    checks["client_registrations"] = _doctor_client_registrations()
     launcher = _PLUGIN_SCRIPTS / "remem_mcp_launcher.py"
     checks["mcp_startup"] = (
-        ("ok", "launcher_available")
+        ("warning", "no_read_only_probe")
         if uv and launcher.is_file()
         else ("failed", "launcher_unavailable")
     )
@@ -1254,7 +1382,7 @@ def _doctor(as_json: bool) -> int:
     healthy = all(check["status"] != "failed" for check in checks)
     try:
         migration_diagnostics = list(
-            remem_routing.load_routing(default_data_dir()).deprecations
+            remem_routing.inspect_routing(default_data_dir()).deprecations
         )
     except Exception:
         migration_diagnostics = []

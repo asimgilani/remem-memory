@@ -132,6 +132,36 @@ class RoutingResolutionTests(unittest.TestCase):
 
 
 class RoutingValidationTests(unittest.TestCase):
+    def test_store_rejects_a_label_that_matches_another_connection_id(self):
+        first_id = "conn_0123456789abcdef0123456789abcdef"
+        second_id = "conn_fedcba9876543210fedcba9876543210"
+        config = routing_config(
+            connections=(
+                remem_routing.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                remem_routing.Connection(
+                    first_id,
+                    second_id,
+                    "connection:0123456789abcdef0123456789abcdef",
+                    False,
+                ),
+                remem_routing.Connection(
+                    second_id,
+                    "Other",
+                    "connection:fedcba9876543210fedcba9876543210",
+                    False,
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                remem_routing.store_routing(config, Path(directory))
+
     def test_parse_target_requires_one_valid_connection_and_namespace(self):
         self.assertEqual(
             target("primary", "project-a"),
@@ -175,6 +205,113 @@ class RoutingValidationTests(unittest.TestCase):
 
 
 class RoutingStorageTests(unittest.TestCase):
+    def test_read_only_inspection_never_creates_or_repairs_storage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            missing = parent / "missing"
+            parent_before = parent.stat()
+
+            with self.assertRaises(FileNotFoundError):
+                remem_routing.inspect_routing(missing)
+
+            parent_after = parent.stat()
+            self.assertFalse(missing.exists())
+            self.assertEqual(parent_before.st_ino, parent_after.st_ino)
+            self.assertEqual(parent_before.st_mtime_ns, parent_after.st_mtime_ns)
+
+            data_dir = parent / "existing"
+            remem_routing.store_routing(routing_config(), data_dir)
+            route_path = data_dir / "routes.json"
+            data_dir.chmod(0o750)
+            route_path.chmod(0o640)
+            directory_before = data_dir.stat()
+            file_before = route_path.stat()
+
+            with self.assertRaises(ValueError):
+                remem_routing.inspect_routing(data_dir)
+
+            directory_after = data_dir.stat()
+            file_after = route_path.stat()
+            self.assertEqual(
+                (
+                    directory_before.st_ino,
+                    directory_before.st_mtime_ns,
+                    stat.S_IMODE(directory_before.st_mode),
+                    file_before.st_ino,
+                    file_before.st_mtime_ns,
+                    stat.S_IMODE(file_before.st_mode),
+                ),
+                (
+                    directory_after.st_ino,
+                    directory_after.st_mtime_ns,
+                    stat.S_IMODE(directory_after.st_mode),
+                    file_after.st_ino,
+                    file_after.st_mtime_ns,
+                    stat.S_IMODE(file_after.st_mode),
+                ),
+            )
+
+    def test_default_reset_is_one_revision_and_crash_atomic(self):
+        connection_id = "conn_0123456789abcdef0123456789abcdef"
+        named = remem_routing.Connection(
+            connection_id,
+            "Work",
+            "connection:0123456789abcdef0123456789abcdef",
+            True,
+        )
+        original = replace(
+            routing_config(
+                connections=(
+                    remem_routing.Connection(
+                        "primary",
+                        "Primary",
+                        "default",
+                        True,
+                    ),
+                    named,
+                ),
+                global_routes={
+                    "recall": (target("primary", "global"),),
+                    "memory": (target("primary", "personal"),),
+                    "sessions": (target("primary", "engineering"),),
+                },
+                client_routes={
+                    "codex": {"recall": ()},
+                    "claude": {"memory": ()},
+                },
+                mcp_connections={"codex": connection_id},
+                revision=7,
+            ),
+            legacy_namespace_migration_completed=True,
+            migration_write_blocked=True,
+            deprecations=("REMEM_DEFAULT_NAMESPACE is deprecated",),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_routing.store_routing(original, data_dir)
+
+            reset = remem_routing.reset_routing_to_defaults(data_dir)
+
+            self.assertEqual(8, reset.revision)
+            self.assertEqual({}, dict(reset.global_routes.routes))
+            self.assertEqual({}, dict(reset.client_routes))
+            self.assertFalse(reset.migration_write_blocked)
+            self.assertEqual(original.connections, reset.connections)
+            self.assertEqual(original.mcp_connections, reset.mcp_connections)
+            self.assertTrue(reset.legacy_namespace_migration_completed)
+            self.assertEqual(original.deprecations, reset.deprecations)
+
+            remem_routing.store_routing(original, data_dir)
+            with mock.patch.object(
+                remem_routing,
+                "_atomic_write",
+                side_effect=ValueError("simulated crash"),
+            ):
+                with self.assertRaises(ValueError):
+                    remem_routing.reset_routing_to_defaults(data_dir)
+
+            self.assertEqual(original, remem_routing.load_routing(data_dir))
+
     def test_loaded_configuration_mappings_cannot_be_mutated_in_place(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)

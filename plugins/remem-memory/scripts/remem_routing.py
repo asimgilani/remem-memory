@@ -291,6 +291,12 @@ def _validate_config(config: object) -> RoutingConfig:
         checked_connections.append(checked)
     if not primary_seen:
         raise ValueError("Primary routing connection is required")
+    if any(
+        connection.label in seen_connections
+        and connection.label != connection.id
+        for connection in checked_connections
+    ):
+        raise ValueError("Routing connection label collides with an ID")
     connection_ids = frozenset(seen_connections)
     global_routes = _validate_layer(
         config.global_routes,
@@ -414,6 +420,23 @@ def _ensure_data_dir(data_dir: Path) -> None:
         os.fchmod(descriptor, 0o700)
     finally:
         os.close(descriptor)
+
+
+def _inspect_data_dir(data_dir: Path) -> None:
+    try:
+        metadata = data_dir.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ValueError("Routing storage is unavailable") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise ValueError("Routing storage has unsafe permissions")
+    descriptor = _open_directory(data_dir)
+    os.close(descriptor)
 
 
 def _open_directory(data_dir: Path) -> int:
@@ -713,6 +736,21 @@ def load_routing(data_dir: Path | None = None) -> RoutingConfig:
     return _data_to_config(decoded)
 
 
+def inspect_routing(data_dir: Path | None = None) -> RoutingConfig:
+    """Read and validate routing without creating or repairing storage."""
+
+    selected = _selected_data_dir(data_dir)
+    _inspect_data_dir(selected)
+    try:
+        content = _read_bounded(selected, _ROUTES_FILE, _MAX_CONFIG_BYTES)
+        decoded = _decode_json(content)
+    except FileNotFoundError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("Routing configuration is invalid") from None
+    return _data_to_config(decoded)
+
+
 def store_routing(config: RoutingConfig, data_dir: Path | None = None) -> None:
     checked = _validate_config(config)
     encoded = _encode(_config_to_data(checked))
@@ -744,6 +782,22 @@ def update_routing(
         elif current.migration_write_blocked:
             updated = replace(updated, migration_write_blocked=True)
         updated = replace(updated, revision=current.revision + 1)
+        store_routing(updated, selected)
+        return updated
+
+
+def reset_routing_to_defaults(
+    data_dir: Path | None = None,
+) -> RoutingConfig:
+    """Atomically clear automatic routes and the migration write block."""
+
+    selected = _selected_data_dir(data_dir)
+    with _locked(selected, "routes.lock"):
+        current = load_routing(selected)
+        updated = replace(
+            use_default_routes(current),
+            revision=current.revision + 1,
+        )
         store_routing(updated, selected)
         return updated
 
@@ -959,6 +1013,26 @@ def _data_to_health(value: object) -> RouteHealthRecord:
 def load_route_health(data_dir: Path | None = None) -> tuple[RouteHealthRecord, ...]:
     selected = _selected_data_dir(data_dir)
     _ensure_data_dir(selected)
+    try:
+        content = _read_bounded(selected, _HEALTH_FILE, _MAX_HEALTH_BYTES)
+    except FileNotFoundError:
+        return ()
+    try:
+        decoded = _decode_json(content)
+        if not isinstance(decoded, list) or len(decoded) > _MAX_HEALTH_RECORDS:
+            raise ValueError("Invalid route health storage")
+        return tuple(_data_to_health(item) for item in decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("Route health storage is invalid") from None
+
+
+def inspect_route_health(
+    data_dir: Path | None = None,
+) -> tuple[RouteHealthRecord, ...]:
+    """Read validated route health without mutating its storage."""
+
+    selected = _selected_data_dir(data_dir)
+    _inspect_data_dir(selected)
     try:
         content = _read_bounded(selected, _HEALTH_FILE, _MAX_HEALTH_BYTES)
     except FileNotFoundError:
