@@ -2884,6 +2884,195 @@ class RememMemoryHookTests(unittest.TestCase):
             ):
                 store.load("s1")
 
+    def test_background_queue_rejects_redirected_directory_and_lock_symlink(
+        self,
+    ) -> None:
+        event = {
+            "schema_version": 1,
+            "id": "1" * 32,
+            "client": "codex",
+            "behavior": "sessions",
+            "lifecycle_mode": "session_end",
+            "connection_id": "primary",
+            "namespace": "@default",
+            "route_revision": 1,
+            "session_id": "s1",
+            "payload": {
+                "hook_event_name": "SessionEnd",
+                "session_id": "s1",
+            },
+            "off_record_seen": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "data"
+            redirected = root / "redirected"
+            data_dir.mkdir(mode=0o700)
+            redirected.mkdir(mode=0o700)
+            (data_dir / "queues").symlink_to(
+                redirected,
+                target_is_directory=True,
+            )
+            redirected_store = _HOOK.BackgroundQueueStore(data_dir)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "background queue unavailable",
+            ):
+                redirected_store.save("s1", [event])
+            self.assertEqual(list(redirected.iterdir()), [])
+
+            (data_dir / "queues").unlink()
+            safe_store = _HOOK.BackgroundQueueStore(data_dir)
+            safe_store._ensure_directories()
+            victim = root / "victim"
+            victim.write_text("must remain unchanged", encoding="utf-8")
+            os.chmod(victim, 0o644)
+            lock_path = safe_store.path_for("s1").with_suffix(".lock")
+            lock_path.symlink_to(victim)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "background queue unavailable",
+            ):
+                with safe_store.locked("s1"):
+                    self.fail("a symlink lock must never be acquired")
+
+            self.assertEqual(
+                victim.read_text(encoding="utf-8"),
+                "must remain unchanged",
+            )
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
+
+    def test_background_queue_rejects_duplicate_json_names_at_every_depth(
+        self,
+    ) -> None:
+        canary = "api_key=vlt_hidden-duplicate-canary"
+        event_fields = (
+            '"id":"11111111111111111111111111111111",'
+            '"client":"codex",'
+            '"behavior":"sessions",'
+            '"lifecycle_mode":"session_end",'
+            '"connection_id":"primary",'
+            '"namespace":"@default",'
+            '"route_revision":1,'
+            '"session_id":"s1",'
+            '"off_record_seen":false'
+        )
+        payload = (
+            '"payload":{'
+            '"hook_event_name":"SessionEnd",'
+            '"session_id":"s1"'
+            "}"
+        )
+        raw_documents = (
+            (
+                '{"events":[{"schema_version":2,'
+                f'"schema_version":1,{event_fields},{payload}'
+                "}]}"
+            ),
+            (
+                '{"events":[{"schema_version":1,'
+                f"{event_fields},"
+                '"payload":{'
+                '"hook_event_name":"SessionEnd",'
+                f'"session_id":"{canary}",'
+                '"session_id":"s1"'
+                "}}]}"
+            ),
+            (
+                '{"events":[{"schema_version":1,'
+                f"{event_fields},{payload},"
+                f'"credential":"{canary}",'
+                '"credential":"benign"'
+                "}]}"
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store._ensure_directories()
+            for raw in raw_documents:
+                with self.subTest(raw=raw):
+                    store.path_for("s1").write_text(
+                        raw,
+                        encoding="utf-8",
+                    )
+                    os.chmod(store.path_for("s1"), 0o600)
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "background queue unavailable",
+                    ) as caught:
+                        store.load("s1")
+                    self.assertNotIn(canary, str(caught.exception))
+
+    def test_overlong_session_is_rejected_before_off_record_state_can_alias(
+        self,
+    ) -> None:
+        session_id = "s" * 201
+        truncated = session_id[:200]
+        calls = []
+        config = routing_config(
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-history"),
+                )
+            },
+            revision=7,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = _HOOK.StateStore(Path(directory))
+            state.save(
+                session_id,
+                {
+                    "current_prompt": "",
+                    "turn_id": "",
+                    "off_record": False,
+                    "off_record_seen": False,
+                    "completed_turn_ids": [],
+                    "metrics": {"hits": 0, "misses": 0},
+                },
+            )
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: calls.append(mode),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: "key",
+            )
+            with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                popen.return_value.stdin = mock.Mock()
+                _HOOK.handle_event(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": session_id,
+                        "tool_name": "Write",
+                    },
+                    harness="codex",
+                    mode="post_tool_use",
+                    dependencies=dependencies,
+                )
+
+            current = state.load(session_id)
+            current["off_record"] = True
+            state.save(session_id, current)
+            _HOOK.handle_event(
+                {"session_id": truncated},
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+
+            self.assertEqual(
+                _HOOK.BackgroundQueueStore(Path(directory)).load(truncated),
+                [],
+            )
+
+        popen.assert_not_called()
+        self.assertEqual(calls, [])
+
     def test_worker_uses_each_jobs_exact_route_credential_and_destination(
         self,
     ) -> None:
@@ -3147,6 +3336,126 @@ class RememMemoryHookTests(unittest.TestCase):
                     ["primary"] if label == "missing credential" else [],
                 )
 
+    def test_session_write_gate_rechecks_live_route_privacy_and_credential(
+        self,
+    ) -> None:
+        primary = _ROUTING.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        initial = routing_config(
+            connections=(primary,),
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-a"),
+                )
+            },
+            revision=4,
+        )
+
+        for change in ("route", "mode", "off-record", "credential"):
+            with self.subTest(change=change):
+                selected_config = [initial]
+                selected_credential = ["original-key"]
+                gate_results = []
+                writes = []
+
+                def route(behavior, client):
+                    config = selected_config[0]
+                    return (
+                        config,
+                        _ROUTING.resolve_routes(
+                            config,
+                            behavior=behavior,
+                            client=client,
+                        ),
+                    )
+
+                with tempfile.TemporaryDirectory() as directory:
+                    dependencies = self._dependencies(
+                        directory,
+                        None,
+                        background_writes=True,
+                        routing_resolver=route,
+                        connection_credential_resolver=(
+                            lambda connection: selected_credential[0]
+                        ),
+                    )
+                    with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                        popen.return_value.stdin = mock.Mock()
+                        _HOOK.handle_event(
+                            {
+                                "hook_event_name": "PostToolUse",
+                                "session_id": "s1",
+                                "tool_name": "Write",
+                            },
+                            harness="codex",
+                            mode="post_tool_use",
+                            dependencies=dependencies,
+                        )
+
+                    def mutate_before_write() -> None:
+                        if change == "route":
+                            selected_config[0] = routing_config(
+                                connections=(primary,),
+                                global_routes={
+                                    "sessions": (
+                                        _ROUTING.RouteTarget(
+                                            "primary",
+                                            "session-b",
+                                        ),
+                                    )
+                                },
+                                revision=5,
+                            )
+                        elif change == "mode":
+                            object.__setattr__(
+                                dependencies,
+                                "settings",
+                                _HOOK.Settings(mode="off"),
+                            )
+                        elif change == "off-record":
+                            state = _HOOK.StateStore(Path(directory))
+                            current = state.load("s1")
+                            current["off_record"] = True
+                            state.save("s1", current)
+                        else:
+                            selected_credential[0] = "replacement-key"
+
+                    class DelayedSessionPipeline:
+                        @staticmethod
+                        def handle_payload(
+                            mode,
+                            payload,
+                            *,
+                            connection_id,
+                            namespace,
+                            write_gate,
+                        ):
+                            del mode, payload, connection_id, namespace
+                            mutate_before_write()
+                            allowed = write_gate()
+                            gate_results.append(allowed)
+                            if allowed:
+                                writes.append("ingest")
+                            return 0
+
+                    with mock.patch.dict(
+                        sys.modules,
+                        {"auto_memory_hook": DelayedSessionPipeline},
+                    ):
+                        _HOOK.handle_event(
+                            {"session_id": "s1"},
+                            harness="codex",
+                            mode="worker_drain",
+                            dependencies=dependencies,
+                        )
+
+                self.assertEqual(gate_results, [False])
+                self.assertEqual(writes, [])
+
     def test_sessions_off_suppresses_enqueue_before_credentials(self) -> None:
         calls = []
         config = routing_config(global_routes={"sessions": ()})
@@ -3178,7 +3487,7 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertEqual(calls, [])
         popen.assert_not_called()
 
-    def test_background_dispatcher_has_no_remem_credential(
+    def test_background_dispatcher_transports_primary_override_only_by_fd(
         self,
     ) -> None:
         canary = "vlt_trusted-worker-canary"
@@ -3188,6 +3497,15 @@ class RememMemoryHookTests(unittest.TestCase):
             observed["arguments"] = list(arguments)
             observed["environment"] = dict(kwargs["env"])
             observed["pass_fds"] = tuple(kwargs["pass_fds"])
+            if observed["pass_fds"]:
+                duplicate = os.dup(observed["pass_fds"][0])
+                try:
+                    observed["credential"] = os.read(
+                        duplicate,
+                        8193,
+                    ).decode("utf-8")
+                finally:
+                    os.close(duplicate)
             process = mock.Mock()
             process.stdin = mock.Mock()
             return process
@@ -3248,8 +3566,12 @@ class RememMemoryHookTests(unittest.TestCase):
         )
         worker_environment = observed["environment"]
         self.assertNotIn("REMEM_API_KEY", worker_environment)
-        self.assertNotIn("REMEM_API_KEY_FD", worker_environment)
-        self.assertEqual(observed["pass_fds"], ())
+        self.assertEqual(len(observed["pass_fds"]), 1)
+        self.assertEqual(
+            worker_environment["REMEM_API_KEY_FD"],
+            str(observed["pass_fds"][0]),
+        )
+        self.assertEqual(observed["credential"], canary)
         self.assertEqual(
             worker_environment["ANTHROPIC_API_KEY"],
             "anthropic-summary-canary",
@@ -3264,6 +3586,7 @@ class RememMemoryHookTests(unittest.TestCase):
             "LC_ALL",
             "LC_CTYPE",
             "REMEM_API_URL",
+            "REMEM_API_KEY_FD",
             "REMEM_MEMORY_DATA_DIR",
             "REMEM_MEMORY_SUMMARY_ENABLED",
             "REMEM_MEMORY_SUMMARY_PROVIDER",
@@ -3276,6 +3599,115 @@ class RememMemoryHookTests(unittest.TestCase):
             self.assertFalse(name.startswith("LD_"), name)
         self.assertNotIn(canary, json.dumps(observed["arguments"]))
         self.assertNotIn(canary, json.dumps(worker_environment))
+
+    def test_worker_drain_consumes_primary_override_into_local_state(
+        self,
+    ) -> None:
+        canary = "vlt_worker-primary-override"
+        observed = {}
+        read_descriptor, write_descriptor = os.pipe()
+        os.write(write_descriptor, canary.encode("utf-8"))
+        os.close(write_descriptor)
+
+        def handle(payload, harness, mode, dependencies=None):
+            del payload, harness, mode
+            observed["credential"] = getattr(
+                dependencies,
+                "primary_credential_override",
+                None,
+            )
+            observed["environment_key"] = os.environ.get("REMEM_API_KEY")
+            observed["environment_fd"] = os.environ.get("REMEM_API_KEY_FD")
+            return {}
+
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_API_KEY_FD": str(read_descriptor),
+                    "REMEM_API_URL": "https://api.remem.io",
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    _HOOK,
+                    "handle_event",
+                    side_effect=handle,
+                ):
+                    self.assertEqual(
+                        _HOOK.main(
+                            [
+                                "--mode",
+                                "worker_drain",
+                                "--harness",
+                                "claude",
+                            ]
+                        ),
+                        0,
+                    )
+        finally:
+            try:
+                os.close(read_descriptor)
+            except OSError:
+                pass
+
+        self.assertEqual(observed["credential"], canary)
+        self.assertIsNone(observed["environment_key"])
+        self.assertIsNone(observed["environment_fd"])
+
+    def test_primary_background_job_uses_captured_override_not_keychain(
+        self,
+    ) -> None:
+        selected = []
+        keychain_calls = []
+        config = routing_config(
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-history"),
+                )
+            },
+            revision=8,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: selected.append(
+                    os.environ.get("REMEM_API_KEY")
+                ),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    keychain_calls.append(connection.id) or "keychain-key"
+                ),
+            )
+            object.__setattr__(
+                dependencies,
+                "primary_credential_override",
+                "ambient-primary-key",
+            )
+            with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                popen.return_value.stdin = mock.Mock()
+                _HOOK.handle_event(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "s1",
+                        "tool_name": "Write",
+                    },
+                    harness="codex",
+                    mode="post_tool_use",
+                    dependencies=dependencies,
+                )
+            _HOOK.handle_event(
+                {"session_id": "s1"},
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+
+        self.assertEqual(selected, ["ambient-primary-key"])
+        self.assertEqual(keychain_calls, [])
 
     def test_background_worker_without_env_key_resolves_keychain_in_process(
         self,

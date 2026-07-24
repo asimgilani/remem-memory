@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -179,6 +180,7 @@ class Dependencies:
     ) = None
     api_factory: Callable[[Connection, str], object] | None = None
     health_recorder: Callable[[RouteHealthRecord], None] | None = None
+    primary_credential_override: str | None = None
 
 
 def default_data_dir() -> Path:
@@ -348,6 +350,17 @@ class StateStore:
             os.close(descriptor)
 
 
+def _unique_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in parsed:
+            raise ValueError
+        parsed[name] = value
+    return parsed
+
+
 class BackgroundQueueStore:
     """Private per-session FIFO for detached hook work."""
 
@@ -360,44 +373,51 @@ class BackgroundQueueStore:
         return self.queues_dir / f"{digest}.json"
 
     def load(self, session_id: str) -> list[dict[str, Any]]:
-        path = self.path_for(session_id)
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(path, flags)
-        except FileNotFoundError:
-            return []
-        except OSError:
-            raise RuntimeError("background queue unavailable") from None
-        try:
-            metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) & 0o077
-                or metadata.st_size > _MAX_BACKGROUND_QUEUE_BYTES
+        with self._queue_directory() as directory_descriptor:
+            try:
+                descriptor = os.open(
+                    self.path_for(session_id).name,
+                    flags,
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                return []
+            except OSError:
+                raise RuntimeError("background queue unavailable")
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                    or metadata.st_size > _MAX_BACKGROUND_QUEUE_BYTES
+                ):
+                    raise RuntimeError("background queue unavailable")
+                chunks: list[bytes] = []
+                remaining = _MAX_BACKGROUND_QUEUE_BYTES + 1
+                while remaining:
+                    chunk = os.read(descriptor, min(65_536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                encoded = b"".join(chunks)
+                if len(encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+                    raise RuntimeError("background queue unavailable")
+                parsed = json.loads(
+                    encoded.decode("utf-8"),
+                    object_pairs_hook=_unique_json_object,
+                )
+            except (
+                OSError,
+                UnicodeDecodeError,
+                ValueError,
             ):
-                raise RuntimeError("background queue unavailable")
-            chunks: list[bytes] = []
-            remaining = _MAX_BACKGROUND_QUEUE_BYTES + 1
-            while remaining:
-                chunk = os.read(descriptor, min(65_536, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            encoded = b"".join(chunks)
-            if len(encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
-                raise RuntimeError("background queue unavailable")
-            parsed = json.loads(encoded.decode("utf-8"))
-        except (
-            OSError,
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-        ):
-            raise RuntimeError("background queue unavailable") from None
-        finally:
-            os.close(descriptor)
+                raise RuntimeError("background queue unavailable") from None
+            finally:
+                os.close(descriptor)
         events = parsed.get("events") if isinstance(parsed, dict) else None
         if not isinstance(events, list):
             raise RuntimeError("background queue unavailable")
@@ -408,8 +428,6 @@ class BackgroundQueueStore:
         session_id: str,
         events: list[dict[str, Any]],
     ) -> None:
-        self._ensure_directories()
-        path = self.path_for(session_id)
         normalized = _normalize_background_queue(events)
         try:
             encoded = json.dumps(
@@ -423,62 +441,131 @@ class BackgroundQueueStore:
             raise RuntimeError("background queue unavailable")
         descriptor = -1
         temporary = ""
-        try:
-            descriptor, temporary = tempfile.mkstemp(
-                prefix=f".{path.stem}.",
-                suffix=".tmp",
-                dir=str(self.queues_dir),
-            )
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb") as stream:
-                descriptor = -1
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if temporary:
-                try:
-                    Path(temporary).unlink(missing_ok=True)
-                except OSError:
-                    pass
+        path = self.path_for(session_id)
+        with self._queue_directory() as directory_descriptor:
+            try:
+                temporary = f".{path.stem}.{uuid4().hex}.tmp"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(
+                    temporary,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(encoded)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(
+                    temporary,
+                    path.name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                temporary = ""
+                os.fsync(directory_descriptor)
+            except OSError:
+                raise RuntimeError("background queue unavailable") from None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                if temporary:
+                    try:
+                        os.unlink(
+                            temporary,
+                            dir_fd=directory_descriptor,
+                        )
+                    except OSError:
+                        pass
 
     def _ensure_directories(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.queues_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.data_dir, 0o700)
-        os.chmod(self.queues_dir, 0o700)
+        with self._queue_directory():
+            pass
+
+    @contextmanager
+    def _queue_directory(self):
+        data_descriptor = -1
+        queue_descriptor = -1
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            self.data_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700,
+            )
+            data_descriptor = os.open(self.data_dir, flags)
+            if not stat.S_ISDIR(os.fstat(data_descriptor).st_mode):
+                raise OSError
+            os.fchmod(data_descriptor, 0o700)
+            try:
+                os.mkdir("queues", 0o700, dir_fd=data_descriptor)
+            except FileExistsError:
+                pass
+            queue_descriptor = os.open(
+                "queues",
+                flags,
+                dir_fd=data_descriptor,
+            )
+            if not stat.S_ISDIR(os.fstat(queue_descriptor).st_mode):
+                raise OSError
+            os.fchmod(queue_descriptor, 0o700)
+            yield queue_descriptor
+        except OSError:
+            raise RuntimeError("background queue unavailable") from None
+        finally:
+            if queue_descriptor >= 0:
+                os.close(queue_descriptor)
+            if data_descriptor >= 0:
+                os.close(data_descriptor)
 
     @contextmanager
     def locked(self, session_id: str):
         with self._file_lock(
-            self.path_for(session_id).with_suffix(".lock")
+            self.path_for(session_id).with_suffix(".lock").name
         ):
             yield
 
     @contextmanager
     def worker_locked(self, session_id: str):
         with self._file_lock(
-            self.path_for(session_id).with_suffix(".worker.lock")
+            self.path_for(session_id).with_suffix(".worker.lock").name
         ):
             yield
 
     @contextmanager
-    def _file_lock(self, path: Path):
-        self._ensure_directories()
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            os.fchmod(descriptor, 0o600)
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+    def _file_lock(self, name: str):
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        with self._queue_directory() as directory_descriptor:
+            try:
+                descriptor = os.open(
+                    name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError:
+                raise RuntimeError("background queue unavailable") from None
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise RuntimeError("background queue unavailable")
+                os.fchmod(descriptor, 0o600)
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
 
 def _session_id(payload: dict[str, Any]) -> str:
@@ -579,6 +666,12 @@ def _connection_credential(
     dependencies: Dependencies,
     connection: Connection,
 ) -> str | None:
+    if (
+        connection.id == "primary"
+        and dependencies.primary_credential_override is not None
+    ):
+        credential = dependencies.primary_credential_override
+        return credential.strip() if credential.strip() else None
     resolver = (
         dependencies.connection_credential_resolver
         or resolve_connection_api_key
@@ -730,6 +823,7 @@ def _default_engineering_handler(
     *,
     connection_id: str | None = None,
     namespace: str | None = None,
+    write_gate: Callable[[], bool] | None = None,
 ) -> int:
     import auto_memory_hook
 
@@ -738,6 +832,7 @@ def _default_engineering_handler(
         payload,
         connection_id=connection_id,
         namespace=namespace,
+        write_gate=write_gate,
     )
 
 
@@ -750,6 +845,7 @@ def _invoke_engineering(
     summaries_allowed: bool = True,
     connection_id: str | None = None,
     namespace: str | None = None,
+    write_gate: Callable[[], bool] | None = None,
 ) -> None:
     if not _engineering_enabled():
         return
@@ -792,6 +888,7 @@ def _invoke_engineering(
                         payload,
                         connection_id=connection_id,
                         namespace=namespace,
+                        write_gate=write_gate,
                     )
                 else:
                     handler(mode, payload)
@@ -1170,6 +1267,9 @@ def _background_payload(
 ) -> dict[str, Any] | None:
     """Copy only bounded fields required by the one-shot worker."""
 
+    raw_session_id = payload.get("session_id")
+    if isinstance(raw_session_id, str) and len(raw_session_id.strip()) > 200:
+        return None
     minimized: dict[str, Any] = {}
     for name, limit in (
         ("hook_event_name", 64),
@@ -1661,6 +1761,13 @@ def _spawn_background(
         return output
     store = StateStore(dependencies.state_dir)
     raw_session_id = _session_id(payload)
+    if (
+        not raw_session_id
+        or len(raw_session_id) > 200
+        or contains_secret(raw_session_id)
+        or any(ord(character) < 32 for character in raw_session_id)
+    ):
+        return output
     try:
         with store.locked(raw_session_id):
             current = store.load(raw_session_id)
@@ -1672,13 +1779,7 @@ def _spawn_background(
         str,
     ):
         return output
-    session_id = raw_session_id.strip()[:200]
-    if (
-        not session_id
-        or contains_secret(session_id)
-        or any(ord(character) < 32 for character in session_id)
-    ):
-        return output
+    session_id = raw_session_id
     minimized["session_id"] = session_id
     turn_state: dict[str, Any] | None = None
     if mode == "stop":
@@ -1784,7 +1885,12 @@ def _spawn_background(
         harness,
         summaries_allowed=not current["off_record_seen"],
     )
+    credential = os.environ.get("REMEM_API_KEY", "").strip()
+    descriptor: int | None = None
     try:
+        if credential:
+            descriptor = _credential_descriptor(credential)
+            environment["REMEM_API_KEY_FD"] = str(descriptor)
         python = str(Path(sys.executable).resolve(strict=True))
         script = Path(__file__).resolve(strict=True)
         process = subprocess.Popen(
@@ -1806,7 +1912,7 @@ def _spawn_background(
             start_new_session=True,
             close_fds=True,
             env=environment,
-            pass_fds=(),
+            pass_fds=(descriptor,) if descriptor is not None else (),
         )
         if process.stdin is not None:
             process.stdin.write(
@@ -1818,7 +1924,54 @@ def _spawn_background(
             process.stdin.close()
     except Exception:
         pass
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     return output
+
+
+def _background_write_is_current(
+    event: dict[str, Any],
+    dependencies: Dependencies,
+    expected_credential: str,
+) -> bool:
+    if _settings(dependencies).mode != "auto":
+        return False
+    if event["behavior"] == "sessions" and not _engineering_enabled():
+        return False
+    live_state = _read_current_state(
+        StateStore(dependencies.state_dir),
+        event["session_id"],
+    )
+    if live_state is None or live_state["off_record"]:
+        return False
+    try:
+        config, targets = _resolved_route(
+            dependencies,
+            behavior=event["behavior"],
+            harness=event["client"],
+        )
+    except Exception:
+        return False
+    if config.revision != event["route_revision"] or len(targets) != 1:
+        return False
+    target = targets[0]
+    if (
+        target.connection_id != event["connection_id"]
+        or target.namespace != event["namespace"]
+    ):
+        return False
+    connection = _connection_for(config, target.connection_id)
+    if connection is None or not connection.configured:
+        return False
+    credential = _connection_credential(dependencies, connection)
+    return bool(
+        credential
+        and hmac.compare_digest(credential, expected_credential)
+    )
 
 
 def _process_background_event(
@@ -1880,6 +2033,11 @@ def _process_background_event(
             engineering_mode = (
                 "task_completed" if mode == "stop" else mode
             )
+            write_gate = lambda: _background_write_is_current(
+                event,
+                dependencies,
+                selected_credential,
+            )
             _invoke_engineering(
                 dependencies,
                 engineering_mode,
@@ -1888,6 +2046,7 @@ def _process_background_event(
                 summaries_allowed=not off_record_seen,
                 connection_id=connection.id,
                 namespace=namespace,
+                write_gate=write_gate,
             )
             return
         turn_state = payload.get("_turn_state")
@@ -2119,13 +2278,32 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _consume_dispatcher_primary_credential(mode: str) -> str | None:
+    if mode != _WORKER_DRAIN_MODE:
+        return None
+    raw_descriptor = os.environ.pop("REMEM_API_KEY_FD", "")
+    os.environ.pop("REMEM_API_KEY", None)
+    if not raw_descriptor:
+        return None
+    return _consume_credential_descriptor(raw_descriptor)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
+    primary_override = _consume_dispatcher_primary_credential(args.mode)
     with _worker_credential_scope(args.mode):
         result = handle_event(
             _read_stdin_json(),
             harness=args.harness,
             mode=args.mode,
+            dependencies=(
+                Dependencies(
+                    background_writes=True,
+                    primary_credential_override=primary_override,
+                )
+                if args.mode == _WORKER_DRAIN_MODE
+                else None
+            ),
         )
     sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")
     return 0

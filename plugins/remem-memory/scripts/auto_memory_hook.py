@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -43,6 +43,7 @@ _DEFAULT_MIN_EVENTS = 4
 _DEFAULT_STATE_PATH = ".remem/auto-memory-state.json"
 _DEFAULT_LOG_PATH = ".remem/session-checkpoints.ndjson"
 _DEFAULT_API_URL = "https://api.remem.io"
+_WRITE_GATE_REJECTED = object()
 _DEFAULT_SUMMARY_MAX_MESSAGES = 80
 _DEFAULT_SUMMARY_HEAD_LINES = 120
 _DEFAULT_SUMMARY_TAIL_LINES = 600
@@ -115,6 +116,7 @@ class Config:
     connection_id: str = "primary"
     namespace: str | None = None
     allow_local_dev: bool = False
+    write_gate: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -297,6 +299,7 @@ def _load_config(
     *,
     connection_id: str | None = None,
     namespace: str | None = None,
+    write_gate: Callable[[], bool] | None = None,
 ) -> Config:
     cwd_raw = payload.get("cwd")
     safe_cwd = _safe_cwd_path(cwd_raw)
@@ -368,6 +371,7 @@ def _load_config(
         connection_id=selected_connection,
         namespace=namespace,
         allow_local_dev=api_url != _DEFAULT_API_URL,
+        write_gate=write_gate,
     )
 
 
@@ -1783,7 +1787,7 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     return result
 
 
-def _ingest(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
+def _ingest(config: Config, payload: dict[str, Any]) -> object | None:
     if (
         _payload_contains_secret(
             payload,
@@ -1798,6 +1802,13 @@ def _ingest(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
             api_key=config.api_key,
             allow_local_dev=config.allow_local_dev,
         )
+        if config.write_gate is not None:
+            try:
+                allowed = config.write_gate()
+            except Exception:
+                allowed = False
+            if not allowed:
+                return _WRITE_GATE_REJECTED
         return api.ingest(payload, config.namespace, timeout=20)
     except Exception:  # pragma: no cover
         sys.stderr.write("[remem-memory] ingest failed\n")
@@ -1825,6 +1836,8 @@ def _persist_checkpoint(
         transcript_path=transcript_path,
     )
     response = _ingest(config, payload)
+    if response is _WRITE_GATE_REJECTED:
+        return
     _append_ndjson(
         config.log_path,
         {"timestamp": _utc_now_iso(), "event": "auto_checkpoint", "payload": payload, "response": response},
@@ -1838,6 +1851,8 @@ def _persist_rollup(config: Config) -> None:
         return
     payload = _build_rollup_payload(config, records)
     response = _ingest(config, payload)
+    if response is _WRITE_GATE_REJECTED:
+        return
     _append_ndjson(
         config.log_path,
         {"timestamp": _utc_now_iso(), "event": "auto_rollup", "payload": payload, "response": response},
@@ -1986,6 +2001,7 @@ def handle_payload(
     *,
     connection_id: str | None = None,
     namespace: str | None = None,
+    write_gate: Callable[[], bool] | None = None,
 ) -> int:
     """Run one existing engineering hook mode for an already-parsed payload."""
 
@@ -1993,6 +2009,7 @@ def handle_payload(
         payload,
         connection_id=connection_id,
         namespace=namespace,
+        write_gate=write_gate,
     )
     if not config.enabled:
         return 0

@@ -599,6 +599,58 @@ class AutoMemoryHookTests(unittest.TestCase):
                     timeout=20,
                 )
 
+    def test_session_write_gate_runs_after_summary_immediately_before_ingest(
+        self,
+    ) -> None:
+        order = []
+        allowed = [True]
+
+        def summarize(**kwargs):
+            del kwargs
+            order.append("summary")
+            allowed[0] = False
+            return None
+
+        def write_gate():
+            order.append("gate")
+            return allowed[0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = _MODULE.Config(
+                **{
+                    **_build_cfg().__dict__,
+                    "api_key": "selected-key",
+                    "state_path": Path(directory) / "state.json",
+                    "log_path": Path(directory) / "log.ndjson",
+                }
+            )
+            object.__setattr__(config, "write_gate", write_gate)
+            api = mock.Mock()
+            with mock.patch.object(
+                _MODULE,
+                "_generate_checkpoint_structured_summary",
+                side_effect=summarize,
+            ):
+                with mock.patch.object(
+                    _MODULE,
+                    "RememAPI",
+                    return_value=api,
+                ):
+                    _MODULE._persist_checkpoint(
+                        config=config,
+                        kind="milestone",
+                        hook_event="PreCompact",
+                        state={
+                            "events_since_checkpoint": 4,
+                            "recent_events": [],
+                            "transcript_path": "",
+                        },
+                    )
+            self.assertFalse(config.log_path.exists())
+
+        self.assertEqual(order, ["summary", "gate"])
+        api.ingest.assert_not_called()
+
     def test_checkpoint_payload_stays_destination_neutral(self) -> None:
         with mock.patch.object(_MODULE, "_utc_now_iso", return_value="fixed"):
             with mock.patch.object(_MODULE, "_git_branch", return_value=None):
