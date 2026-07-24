@@ -8,10 +8,12 @@ import hmac
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -32,6 +34,10 @@ import remem_api  # noqa: E402
 import remem_mcp_launcher  # noqa: E402
 import remem_routing  # noqa: E402
 from memory_policy import RecallSource, merge_recall_items  # noqa: E402
+try:  # noqa: E402
+    from scripts.remem_checkpoint import _consume_route_descriptor
+except ImportError:  # pragma: no cover - isolated script execution
+    from remem_checkpoint import _consume_route_descriptor  # type: ignore
 
 
 _COMMAND_TO_SCRIPT = {
@@ -65,6 +71,7 @@ _RUNTIME_ENV_FD = "REMEM_MEMORY_RUNTIME_ENV_FD"
 _MAX_PIPE_PAYLOAD_BYTES = 8 * 1024
 _MAX_ROUTE_DESCRIPTOR_BYTES = 4096
 _MAX_RECALL_CHILD_OUTPUT_BYTES = 2 * 1024 * 1024
+_RECALL_CHILD_TIMEOUT_SECONDS = 150.0
 _FIXED_QUERY_FAILURE = re.compile(
     r"\Aerror: query failed "
     r"\[(auth|permission|namespace|request|transient)\]\r?\n?\Z"
@@ -355,21 +362,23 @@ def _run_routed_child(
         environment = dict(child_environment)
         environment[_ROUTE_FD_ENV] = str(route_fd)
         environment[_CREDENTIAL_FD_ENV] = str(credential_fd)
-        options: dict[str, Any] = {
-            "env": environment,
-            "check": False,
-            "pass_fds": (route_fd, credential_fd),
-        }
-        if capture_output:
-            options.update({"capture_output": True, "text": True})
-        return subprocess.run(
-            [
-                _python_executable(),
-                "-I",
-                str(script_path),
-                *forwarded_args,
-            ],
-            **options,
+        invocation = [
+            _python_executable(),
+            "-I",
+            str(script_path),
+            *forwarded_args,
+        ]
+        if not capture_output:
+            return subprocess.run(
+                invocation,
+                env=environment,
+                check=False,
+                pass_fds=(route_fd, credential_fd),
+            )
+        return _run_bounded_capture(
+            invocation,
+            environment=environment,
+            pass_fds=(route_fd, credential_fd),
         )
     finally:
         for descriptor in (route_fd, credential_fd):
@@ -378,6 +387,123 @@ def _run_routed_child(
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+def _run_bounded_capture(
+    invocation: List[str],
+    *,
+    environment: Mapping[str, str],
+    pass_fds: tuple[int, ...],
+) -> subprocess.CompletedProcess:
+    """Drain both child pipes concurrently with one hard cap and deadline."""
+
+    process = subprocess.Popen(
+        invocation,
+        env=dict(environment),
+        pass_fds=pass_fds,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    streams = {
+        "stdout": process.stdout,
+        "stderr": process.stderr,
+    }
+    try:
+        for name, stream in streams.items():
+            if stream is None:
+                raise RuntimeError("routed child capture failed")
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        deadline = time.monotonic() + _RECALL_CHILD_TIMEOUT_SECONDS
+        total = 0
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("routed child capture failed")
+            if not selector.get_map():
+                time.sleep(min(remaining, 0.01))
+                continue
+            events = selector.select(min(remaining, 0.1))
+            if not events:
+                continue
+            for key, _mask in events:
+                stream = key.fileobj
+                try:
+                    chunk = os.read(
+                        stream.fileno(),
+                        min(
+                            65536,
+                            _MAX_RECALL_CHILD_OUTPUT_BYTES + 1 - total,
+                        ),
+                    )
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffers[key.data].extend(chunk)
+                total += len(chunk)
+                if total > _MAX_RECALL_CHILD_OUTPUT_BYTES:
+                    raise RuntimeError("routed child capture failed")
+        returncode = process.wait(
+            timeout=max(0.001, deadline - time.monotonic())
+        )
+        try:
+            stdout = bytes(buffers["stdout"]).decode("utf-8")
+            stderr = bytes(buffers["stderr"]).decode("utf-8")
+        except UnicodeDecodeError:
+            raise RuntimeError("routed child capture failed") from None
+        return subprocess.CompletedProcess(
+            invocation,
+            returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except Exception:
+        try:
+            if process.poll() is None:
+                process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait()
+        except OSError:
+            pass
+        raise RuntimeError("routed child capture failed") from None
+    finally:
+        selector.close()
+        for stream in streams.values():
+            if stream is not None:
+                stream.close()
+
+
+def _local_dev_enabled(environment: Mapping[str, str]) -> bool:
+    value = environment.get("REMEM_MEMORY_ALLOW_LOCAL_DEV", "")
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+
+def _normalize_origin_for_connection(
+    api_url: str,
+    connection: remem_routing.Connection,
+    environment: Mapping[str, str],
+) -> str:
+    explicit = environment.get("REMEM_API_KEY", "")
+    primary_override = (
+        explicit.strip() if isinstance(explicit, str) else ""
+    )
+    return remem_api.normalize_api_origin(
+        api_url,
+        allow_local_dev=bool(
+            connection.id == "primary"
+            and primary_override
+            and _local_dev_enabled(environment)
+        ),
+    )
 
 
 def _run_manual_routed_command(
@@ -410,6 +536,15 @@ def _run_manual_routed_command(
         target = targets[0]
         try:
             connection = _connection_for_id(config, target.connection_id)
+            selected_api_url = _normalize_origin_for_connection(
+                child_environment.get("REMEM_API_URL", _DEFAULT_API_URL),
+                connection,
+                parent_environment,
+            )
+        except Exception:
+            print("error: invalid Remem API URL", file=sys.stderr)
+            return 2
+        try:
             credential = remem_api.resolve_connection_api_key(
                 connection,
                 environment=parent_environment,
@@ -440,7 +575,10 @@ def _run_manual_routed_command(
                     client,
                     *child_args,
                 ],
-                child_environment=child_environment,
+                child_environment={
+                    **child_environment,
+                    "REMEM_API_URL": selected_api_url,
+                },
                 route_descriptor=descriptor,
                 credential=credential,
                 capture_output=False,
@@ -485,6 +623,14 @@ def _run_manual_routed_command(
     ):
         try:
             connection = _connection_for_id(config, connection_id)
+            selected_api_url = _normalize_origin_for_connection(
+                child_environment.get("REMEM_API_URL", _DEFAULT_API_URL),
+                connection,
+                parent_environment,
+            )
+        except Exception:
+            continue
+        try:
             credential = remem_api.resolve_connection_api_key(
                 connection,
                 environment=parent_environment,
@@ -522,7 +668,10 @@ def _run_manual_routed_command(
                     client,
                     *child_args,
                 ],
-                child_environment=child_environment,
+                child_environment={
+                    **child_environment,
+                    "REMEM_API_URL": selected_api_url,
+                },
                 route_descriptor=descriptor,
                 credential=credential,
                 capture_output=True,
@@ -603,6 +752,142 @@ def _run_manual_routed_command(
     return 0
 
 
+def _run_inherited_descriptor_command(
+    *,
+    command: str,
+    script_path: Path,
+    forwarded_args: List[str],
+    parent_environment: dict[str, str],
+) -> Optional[int]:
+    """Consume inherited aliases once; never discard and re-resolve them."""
+
+    route_present = _ROUTE_FD_ENV in parent_environment
+    credential_present = _CREDENTIAL_FD_ENV in parent_environment
+    if not route_present and not credential_present:
+        return None
+
+    credential: Optional[str] = None
+    route: Optional[dict[str, Any]] = None
+    valid = True
+    if credential_present:
+        credential_environment = {
+            _CREDENTIAL_FD_ENV: parent_environment.pop(
+                _CREDENTIAL_FD_ENV,
+                "",
+            )
+        }
+        credential = remem_api.consume_explicit_api_key(
+            credential_environment
+        )
+        valid = bool(credential)
+
+    if route_present:
+        client = _forwarded_option(forwarded_args, "--client") or "codex"
+        behavior = "recall" if command == "recall" else "sessions"
+        if command not in {"checkpoint", "rollup", "recall"}:
+            valid = False
+            client = "codex"
+        try:
+            route = _consume_route_descriptor(
+                parent_environment,
+                expected_client=client,
+                expected_behavior=behavior,
+            )
+            config = _load_or_initialize_routing()
+            connection = _connection_for_id(
+                config,
+                route["connection_id"],
+            )
+            valid = bool(
+                valid
+                and connection.configured
+                and route["route_revision"] == config.revision
+            )
+        except Exception:
+            valid = False
+    if not valid:
+        print("error: invalid inherited descriptor", file=sys.stderr)
+        return 1
+
+    configured_api_url = (
+        _forwarded_option(forwarded_args, "--api-url")
+        or parent_environment.get("REMEM_API_URL", "")
+        or _DEFAULT_API_URL
+    )
+    if route is not None:
+        validation_environment = dict(parent_environment)
+        if credential and route["connection_id"] == "primary":
+            validation_environment["REMEM_API_KEY"] = credential
+        try:
+            configured_api_url = _normalize_origin_for_connection(
+                configured_api_url,
+                connection,
+                validation_environment,
+            )
+        except Exception:
+            print("error: invalid Remem API URL", file=sys.stderr)
+            return 2
+
+    sanitized = {
+        name: value
+        for name, value in parent_environment.items()
+        if not _is_process_injection_variable(name)
+    }
+    sanitized.pop("REMEM_API_KEY", None)
+    sanitized.pop(_ROUTE_FD_ENV, None)
+    sanitized.pop(_CREDENTIAL_FD_ENV, None)
+    sanitized.pop(_RUNTIME_ENV_FD, None)
+    if command == "codex":
+        child_environment = sanitized
+    else:
+        child_environment = {
+            name: sanitized[name]
+            for name in _HELPER_ENVIRONMENT_KEYS
+            if name in sanitized
+        }
+        child_environment.update(
+            {
+                name: value
+                for name, value in sanitized.items()
+                if name.startswith("REMEM_")
+            }
+        )
+    child_environment["REMEM_API_URL"] = configured_api_url
+    descriptors: list[int] = []
+    try:
+        if route is not None:
+            descriptor = _write_route_descriptor(route)
+            child_environment[_ROUTE_FD_ENV] = str(descriptor)
+            descriptors.append(descriptor)
+        if credential is not None:
+            descriptor = _write_anonymous_payload(
+                credential.encode("utf-8")
+            )
+            child_environment[_CREDENTIAL_FD_ENV] = str(descriptor)
+            descriptors.append(descriptor)
+        result = subprocess.run(
+            [
+                _python_executable(),
+                "-I",
+                str(script_path),
+                *forwarded_args,
+            ],
+            env=child_environment,
+            check=False,
+            pass_fds=tuple(descriptors),
+        )
+    except Exception:
+        print("error: Remem Memory helper could not start", file=sys.stderr)
+        return 2
+    finally:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    return int(result.returncode)
+
+
 def run_command(command: str, forwarded_args: List[str]) -> int:
     """Run one compatibility workflow through the current interpreter."""
 
@@ -627,9 +912,25 @@ def run_command(command: str, forwarded_args: List[str]) -> int:
         print("error: Remem Memory helper is unavailable", file=sys.stderr)
         return 2
     parent_environment = dict(os.environ)
+    inherited_result = _run_inherited_descriptor_command(
+        command=command,
+        script_path=script_path,
+        forwarded_args=forwarded_args,
+        parent_environment=parent_environment,
+    )
+    if inherited_result is not None:
+        return inherited_result
     needs_credential = _workflow_needs_credential(
         command,
         forwarded_args,
+    )
+    repository_dispatch = (
+        _REPOSITORY_ROOT == _SCRIPT_PATH.parent.parent
+    )
+    routed_manual = (
+        needs_credential
+        and repository_dispatch
+        and command in {"checkpoint", "rollup", "recall"}
     )
     configured_api_url = (
         _forwarded_option(forwarded_args, "--api-url")
@@ -672,14 +973,7 @@ def run_command(command: str, forwarded_args: List[str]) -> int:
             }
         )
     child_environment["REMEM_API_URL"] = configured_api_url
-    repository_dispatch = (
-        _REPOSITORY_ROOT == _SCRIPT_PATH.parent.parent
-    )
-    if needs_credential and repository_dispatch and command in {
-        "checkpoint",
-        "rollup",
-        "recall",
-    }:
+    if routed_manual:
         try:
             config = _load_or_initialize_routing()
         except Exception:
@@ -712,7 +1006,7 @@ def run_command(command: str, forwarded_args: List[str]) -> int:
     inherited_descriptors: List[int] = []
     explicit_key = parent_environment.get("REMEM_API_KEY", "")
     if (
-        needs_credential
+        (needs_credential or command == "codex")
         and isinstance(explicit_key, str)
         and explicit_key.strip()
     ):

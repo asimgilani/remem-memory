@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import importlib.util
 import json
 import os
@@ -292,6 +293,9 @@ def _engineering_control(session_id: str) -> EngineeringControl:
 
 def _resolve_live_sessions_route(
     environment: dict[str, str] | None = None,
+    *,
+    primary_override: str | None = None,
+    api_url: str = _DEFAULT_API_URL,
 ) -> SessionsRouteSnapshot | None:
     """Resolve one current Codex sessions destination and credential."""
 
@@ -320,9 +324,34 @@ def _resolve_live_sessions_route(
             for item in config.connections
             if item.id == target.connection_id
         )
+        credential_environment = dict(selected)
+        credential_environment.pop("REMEM_API_KEY", None)
+        credential_environment.pop("REMEM_API_KEY_FD", None)
+        selected_override = (
+            primary_override.strip()
+            if (
+                connection.id == "primary"
+                and isinstance(primary_override, str)
+            )
+            else ""
+        )
+        if selected_override:
+            credential_environment["REMEM_API_KEY"] = selected_override
+        allow_local_dev = bool(
+            selected_override
+            and credential_environment.get(
+                "REMEM_MEMORY_ALLOW_LOCAL_DEV",
+                "",
+            ).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        remem_api.normalize_api_origin(
+            api_url,
+            allow_local_dev=allow_local_dev,
+        )
         credential = remem_api.resolve_connection_api_key(
             connection,
-            environment=selected,
+            environment=credential_environment,
         )
     except Exception:
         return None
@@ -343,7 +372,7 @@ def _same_sessions_route(
     second: SessionsRouteSnapshot | Any,
 ) -> bool:
     try:
-        return (
+        same_identity = (
             first.route_revision,
             first.connection_id,
             first.write_namespace,
@@ -351,6 +380,17 @@ def _same_sessions_route(
             second.route_revision,
             second.connection_id,
             second.write_namespace,
+        )
+        first_credential = first.credential
+        second_credential = second.credential
+        return bool(
+            same_identity
+            and isinstance(first_credential, str)
+            and isinstance(second_credential, str)
+            and hmac.compare_digest(
+                first_credential.encode("utf-8"),
+                second_credential.encode("utf-8"),
+            )
         )
     except Exception:
         return False
@@ -1485,7 +1525,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     startup_environment = dict(os.environ)
-    explicit_key = remem_api.consume_explicit_api_key(os.environ)
+    primary_override = remem_api.consume_explicit_api_key(os.environ)
     startup_environment.pop("REMEM_API_KEY", None)
     startup_environment.pop("REMEM_API_KEY_FD", None)
     transported_runtime = _consume_runtime_environment(os.environ)
@@ -1520,8 +1560,8 @@ def main(argv: list[str] | None = None) -> int:
                 "",
             )
         }
-        if explicit_key:
-            credential_environment["REMEM_API_KEY"] = explicit_key
+        if primary_override:
+            credential_environment["REMEM_API_KEY"] = primary_override
         try:
             api_url = remem_api.normalize_api_origin_for_environment(
                 api_url,
@@ -1530,7 +1570,6 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             print("error: invalid Remem API URL", file=sys.stderr)
             return 2
-    explicit_key = None
     credential_environment.clear()
     ingest = ingest_requested
 
@@ -1553,6 +1592,13 @@ def main(argv: list[str] | None = None) -> int:
     memory_env["REMEM_API_URL"] = api_url
     memory_env.setdefault("REMEM_MEMORY_PROJECT", project)
     memory_env.setdefault("REMEM_MEMORY_SESSION_ID", session_id)
+
+    def resolve_live_route() -> SessionsRouteSnapshot | None:
+        return _resolve_live_sessions_route(
+            startup_environment,
+            primary_override=primary_override,
+            api_url=api_url,
+        )
 
     in_git_repo = _is_git_repo(cwd, safe_environment)
     summary_enabled = _summary_enabled(resolved_codex)
@@ -1657,7 +1703,7 @@ def main(argv: list[str] | None = None) -> int:
                 last_snapshot = changed
             return False
         route_before = (
-            _resolve_live_sessions_route()
+            resolve_live_route()
             if ingest
             else None
         )
@@ -1700,7 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
                 last_snapshot = changed
             return False
         route_after = (
-            _resolve_live_sessions_route()
+            resolve_live_route()
             if ingest
             else None
         )
@@ -1708,6 +1754,11 @@ def main(argv: list[str] | None = None) -> int:
             route_after is None
             or not _same_sessions_route(route_before, route_after)
         ):
+            with lock:
+                last_snapshot = changed
+            return False
+        final_gate = refresh_engineering_gate()
+        if not final_gate.writes_allowed:
             with lock:
                 last_snapshot = changed
             return False
@@ -1788,7 +1839,7 @@ def main(argv: list[str] | None = None) -> int:
         and not rollup_privacy_pending
     ):
         rollup_route_before = (
-            _resolve_live_sessions_route()
+            resolve_live_route()
             if ingest
             else None
         )
@@ -1814,18 +1865,23 @@ def main(argv: list[str] | None = None) -> int:
             and not rollup_privacy_pending
         ):
             rollup_route_after = (
-                _resolve_live_sessions_route()
+                resolve_live_route()
                 if ingest
                 else None
             )
+            final_rollup_gate = refresh_engineering_gate()
             if (
-                not ingest
-                or (
-                    rollup_route_before is not None
-                    and rollup_route_after is not None
-                    and _same_sessions_route(
-                        rollup_route_before,
-                        rollup_route_after,
+                final_rollup_gate.writes_allowed
+                and not final_rollup_gate.privacy_suppressed
+                and (
+                    not ingest
+                    or (
+                        rollup_route_before is not None
+                        and rollup_route_after is not None
+                        and _same_sessions_route(
+                            rollup_route_before,
+                            rollup_route_after,
+                        )
                     )
                 )
             ):

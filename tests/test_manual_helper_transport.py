@@ -5,8 +5,10 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -352,7 +354,7 @@ class ManualHelperTransportTests(unittest.TestCase):
         }
 
         def run_helper(arguments, **kwargs):
-            environment = kwargs["env"]
+            environment = kwargs["environment"]
             descriptor = json.loads(
                 os.read(
                     int(environment["REMEM_MEMORY_ROUTE_FD"]),
@@ -400,8 +402,8 @@ class ManualHelperTransportTests(unittest.TestCase):
                         ],
                     ):
                         with mock.patch.object(
-                            remem_memory.subprocess,
-                            "run",
+                            remem_memory,
+                            "_run_bounded_capture",
                             side_effect=run_helper,
                         ) as run:
                             with contextlib.redirect_stdout(stdout):
@@ -484,8 +486,8 @@ class ManualHelperTransportTests(unittest.TestCase):
                         return_value="vlt_selected-canary",
                     ):
                         with mock.patch.object(
-                            remem_memory.subprocess,
-                            "run",
+                            remem_memory,
+                            "_run_bounded_capture",
                             return_value=mock.Mock(
                                 returncode=1,
                                 stdout="",
@@ -505,6 +507,248 @@ class ManualHelperTransportTests(unittest.TestCase):
             stderr.getvalue(),
             "error: query failed [permission]\n",
         )
+
+    def test_named_route_cannot_borrow_primary_override_for_loopback(
+        self,
+    ) -> None:
+        config = self._routing_config()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": directory,
+                    "REMEM_API_KEY": "vlt_primary-override-canary",
+                    "REMEM_API_URL": "http://127.0.0.1:8765",
+                    "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+                    "REMEM_MEMORY_DATA_DIR": directory,
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    remem_memory,
+                    "_load_or_initialize_routing",
+                    return_value=config,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_connection_api_key",
+                        return_value="vlt_named-keychain-canary",
+                    ) as resolve:
+                        with mock.patch.object(
+                            remem_memory.subprocess,
+                            "run",
+                        ) as run:
+                            with contextlib.redirect_stderr(stderr):
+                                result = remem_memory.run_command(
+                                    "checkpoint",
+                                    [
+                                        "--to",
+                                        "Secondary/private",
+                                        "--ingest",
+                                    ],
+                                )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: invalid Remem API URL\n",
+        )
+        resolve.assert_not_called()
+        run.assert_not_called()
+
+    def test_canonical_codex_transports_existing_home_primary_override(
+        self,
+    ) -> None:
+        canary = "vlt_existing-home-primary-canary"
+        observed = {}
+
+        def run_wrapper(_arguments, **kwargs):
+            environment = kwargs["env"]
+            observed["environment"] = dict(environment)
+            observed["pass_fds"] = tuple(kwargs.get("pass_fds", ()))
+            descriptor = int(environment["REMEM_API_KEY_FD"])
+            observed["credential"] = os.read(descriptor, 8192).decode()
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": directory,
+                    "PATH": "/test/bin",
+                    "REMEM_API_KEY": canary,
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    remem_memory.subprocess,
+                    "run",
+                    side_effect=run_wrapper,
+                ):
+                    result = remem_memory.run_command("codex", [])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(observed["credential"], canary)
+        self.assertNotIn("REMEM_API_KEY", observed["environment"])
+        self.assertIn(
+            int(observed["environment"]["REMEM_API_KEY_FD"]),
+            observed["pass_fds"],
+        )
+
+    def test_alias_fails_closed_on_malformed_inherited_descriptors(
+        self,
+    ) -> None:
+        config = self._routing_config()
+        valid = {
+            "schema_version": 1,
+            "client": "codex",
+            "behavior": "recall",
+            "route_revision": 7,
+            "connection_id": "primary",
+            "read_namespaces": None,
+            "write_namespace": None,
+        }
+        invalid_descriptors = (
+            (
+                "duplicate",
+                (
+                    b'{"schema_version":1,"schema_version":1,'
+                    b'"client":"codex","behavior":"recall",'
+                    b'"route_revision":7,"connection_id":"primary",'
+                    b'"read_namespaces":null,"write_namespace":null}'
+                ),
+            ),
+            ("oversize", b"{" + (b"x" * 4096) + b"}"),
+            (
+                "stale",
+                json.dumps(
+                    {**valid, "route_revision": 6}
+                ).encode("utf-8"),
+            ),
+        )
+        for case, raw in invalid_descriptors:
+            with self.subTest(case=case):
+                route_environment, route_fd = self._descriptor_pipe(raw)
+                key_fd, key_write = os.pipe()
+                os.write(key_write, b"vlt_inherited-canary")
+                os.close(key_write)
+                try:
+                    with tempfile.TemporaryDirectory() as directory:
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                **route_environment,
+                                "REMEM_API_KEY_FD": str(key_fd),
+                                "REMEM_MEMORY_DATA_DIR": directory,
+                            },
+                            clear=True,
+                        ):
+                            with mock.patch.object(
+                                remem_memory,
+                                "_load_or_initialize_routing",
+                                return_value=config,
+                            ):
+                                with mock.patch.object(
+                                    remem_memory.subprocess,
+                                    "run",
+                                    return_value=mock.Mock(returncode=0),
+                                ) as run:
+                                    with contextlib.redirect_stderr(
+                                        io.StringIO()
+                                    ):
+                                        result = remem_memory.main(
+                                            [
+                                                "--dry-run",
+                                                "--query",
+                                                "history",
+                                            ],
+                                            program="remem-memory-recall",
+                                        )
+                    self.assertEqual(result, 1)
+                    run.assert_not_called()
+                    with self.assertRaises(OSError):
+                        os.read(route_fd, 1)
+                    with self.assertRaises(OSError):
+                        os.read(key_fd, 1)
+                finally:
+                    for descriptor in (route_fd, key_fd):
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+
+    def test_recall_capture_kills_and_reaps_noisy_or_stalled_child(
+        self,
+    ) -> None:
+        descriptor = {
+            "schema_version": 1,
+            "client": "codex",
+            "behavior": "recall",
+            "route_revision": 7,
+            "connection_id": "primary",
+            "read_namespaces": None,
+            "write_namespace": None,
+        }
+        original_run = subprocess.run
+        scripts = (
+            (
+                "noisy.py",
+                (
+                    "import os\n"
+                    "while True:\n"
+                    " os.write(1, b'x' * 4096)\n"
+                    " os.write(2, b'y' * 4096)\n"
+                ),
+            ),
+            ("stalled.py", "import time\ntime.sleep(60)\n"),
+            (
+                "closed-pipes.py",
+                (
+                    "import os, time\n"
+                    "os.close(1)\n"
+                    "os.close(2)\n"
+                    "time.sleep(60)\n"
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for name, source in scripts:
+                with self.subTest(name=name):
+                    script = Path(directory) / name
+                    script.write_text(source, encoding="utf-8")
+
+                    def guarded_run(*args, **kwargs):
+                        kwargs["timeout"] = 0.6
+                        return original_run(*args, **kwargs)
+
+                    started = time.monotonic()
+                    with mock.patch.object(
+                        remem_memory,
+                        "_MAX_RECALL_CHILD_OUTPUT_BYTES",
+                        4096,
+                    ):
+                        with mock.patch.object(
+                            remem_memory,
+                            "_RECALL_CHILD_TIMEOUT_SECONDS",
+                            0.15,
+                            create=True,
+                        ):
+                            with mock.patch.object(
+                                remem_memory.subprocess,
+                                "run",
+                                side_effect=guarded_run,
+                            ):
+                                with self.assertRaises(RuntimeError):
+                                    remem_memory._run_routed_child(
+                                        script_path=script,
+                                        forwarded_args=[],
+                                        child_environment={},
+                                        route_descriptor=descriptor,
+                                        credential="vlt_selected-canary",
+                                        capture_output=True,
+                                    )
+                    self.assertLess(time.monotonic() - started, 0.5)
 
     def test_routed_checkpoint_log_never_persists_response_body(
         self,

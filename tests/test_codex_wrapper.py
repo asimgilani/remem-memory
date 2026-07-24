@@ -29,6 +29,7 @@ class CodexWrapperTests(unittest.TestCase):
         extra_environment=None,
         summary_enabled=False,
         ingest=False,
+        checkpoint_on_start=True,
     ):
         class FakeChild:
             def __init__(self, environment):
@@ -113,14 +114,18 @@ class CodexWrapperTests(unittest.TestCase):
                                                     return_value=mock.Mock(),
                                                 ):
                                                     arguments = [
-                                                        "--checkpoint-on-start",
                                                         "--always-checkpoint",
                                                         "--codex-bin",
                                                         "codex",
                                                     ]
+                                                    if checkpoint_on_start:
+                                                        arguments.insert(
+                                                            0,
+                                                            "--checkpoint-on-start",
+                                                        )
                                                     if not ingest:
                                                         arguments.insert(
-                                                            2,
+                                                            0,
                                                             "--no-ingest",
                                                         )
                                                     result = _MODULE.main(
@@ -394,6 +399,174 @@ class CodexWrapperTests(unittest.TestCase):
         for call in checkpoint.call_args_list:
             self.assertEqual(call.kwargs["credential"], canary)
         self.assertEqual(rollup.call_args.kwargs["credential"], canary)
+
+    def test_wrapper_retains_primary_override_only_in_local_route_state(
+        self,
+    ) -> None:
+        canary = "vlt_wrapper-primary-override-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            result, checkpoint, _rollup, popen = self._run_wrapper_main(
+                directory,
+                ingest=True,
+                extra_environment={
+                    "HOME": directory,
+                    "REMEM_API_KEY": canary,
+                },
+            )
+
+        self.assertEqual(result, 0)
+        popen.assert_called_once()
+        self.assertTrue(checkpoint.call_args_list)
+        for call in checkpoint.call_args_list:
+            self.assertEqual(call.kwargs["credential"], canary)
+        self.assertNotIn(
+            "REMEM_API_KEY",
+            popen.call_args.kwargs["env"],
+        )
+
+    def test_wrapper_rechecks_gate_after_blocking_route_resolution(
+        self,
+    ) -> None:
+        route = _MODULE.SessionsRouteSnapshot(
+            route_revision=3,
+            connection_id="primary",
+            write_namespace=None,
+            credential="vlt_selected-canary",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory, "settings.json")
+            settings_path.write_text(
+                '{"mode":"auto","sensitivity":"balanced"}',
+                encoding="utf-8",
+            )
+            calls = 0
+
+            def resolve_then_switch_off(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    settings_path.write_text(
+                        '{"mode":"off","sensitivity":"balanced"}',
+                        encoding="utf-8",
+                    )
+                return route
+
+            with mock.patch.object(
+                _MODULE,
+                "_resolve_live_sessions_route",
+                side_effect=resolve_then_switch_off,
+            ):
+                result, checkpoint, rollup, popen = (
+                    self._run_wrapper_main(
+                        directory,
+                        ingest=True,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        popen.assert_called_once()
+        checkpoint.assert_not_called()
+        rollup.assert_not_called()
+
+    def test_wrapper_rechecks_off_record_after_rollup_route_resolution(
+        self,
+    ) -> None:
+        route = _MODULE.SessionsRouteSnapshot(
+            route_revision=3,
+            connection_id="primary",
+            write_namespace=None,
+            credential="vlt_selected-canary",
+        )
+        private = False
+        route_calls = 0
+
+        def engineering_control(_session_id):
+            return _MODULE.EngineeringControl(
+                mode_auto=True,
+                off_record=private,
+                off_record_seen=private,
+                state_available=True,
+            )
+
+        def resolve_then_mark_private(*_args, **_kwargs):
+            nonlocal private
+            nonlocal route_calls
+            route_calls += 1
+            if route_calls == 4:
+                private = True
+            return route
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                _MODULE,
+                "_engineering_control",
+                side_effect=engineering_control,
+            ):
+                with mock.patch.object(
+                    _MODULE,
+                    "_resolve_live_sessions_route",
+                    side_effect=resolve_then_mark_private,
+                ):
+                    result, checkpoint, rollup, popen = (
+                        self._run_wrapper_main(
+                            directory,
+                            ingest=True,
+                            checkpoint_on_start=False,
+                        )
+                    )
+
+        self.assertEqual(result, 0)
+        popen.assert_called_once()
+        checkpoint.assert_called_once()
+        rollup.assert_not_called()
+
+    def test_wrapper_discards_same_route_with_changed_credential(
+        self,
+    ) -> None:
+        routes = [
+            _MODULE.SessionsRouteSnapshot(
+                route_revision=3,
+                connection_id="primary",
+                write_namespace=None,
+                credential="vlt_initial-canary",
+            ),
+            _MODULE.SessionsRouteSnapshot(
+                route_revision=3,
+                connection_id="primary",
+                write_namespace=None,
+                credential="vlt_changed-canary",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory, "settings.json")
+            settings_path.write_text(
+                '{"mode":"auto","sensitivity":"balanced"}',
+                encoding="utf-8",
+            )
+
+            def switch_off(_environment):
+                settings_path.write_text(
+                    '{"mode":"off","sensitivity":"balanced"}',
+                    encoding="utf-8",
+                )
+
+            with mock.patch.object(
+                _MODULE,
+                "_resolve_live_sessions_route",
+                side_effect=routes,
+            ):
+                result, checkpoint, rollup, popen = (
+                    self._run_wrapper_main(
+                        directory,
+                        ingest=True,
+                        on_wait=switch_off,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        popen.assert_called_once()
+        checkpoint.assert_not_called()
+        rollup.assert_not_called()
 
     def test_wrapper_startup_off_and_recall_only_skip_all_engineering(
         self,
