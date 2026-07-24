@@ -11,9 +11,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
+_PLUGIN_SCRIPTS = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "remem-memory"
+    / "scripts"
+)
+if str(_PLUGIN_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_SCRIPTS))
+
+import remem_api  # noqa: E402
 
 _MODE_CHOICES = ("fast", "rich")
+_DEFAULT_API_URL = "https://api.remem.io"
 
 
 def _utc_now_iso() -> str:
@@ -88,15 +98,15 @@ def build_query_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def query_remem(*, api_url: str, api_key: str, payload: dict[str, Any]) -> dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "X-API-Key": api_key,
-        "Content-Type": "application/json",
-    }
-    with httpx.Client(timeout=45.0) as client:
-        resp = client.post(f"{api_url.rstrip('/')}/v1/query", headers=headers, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+    api = remem_api.RememAPI(
+        api_url,
+        api_key,
+        allow_local_dev=True,
+    )
+    return api.query_payload(
+        payload,
+        timeout=45.0,
+    )
 
 
 def append_recall_log(path: str, record: dict[str, Any]) -> None:
@@ -107,7 +117,10 @@ def append_recall_log(path: str, record: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        allow_abbrev=False,
+    )
     parser.add_argument("--query", help="Query text.")
     parser.add_argument("--query-file", help="Read query text from file.")
     parser.add_argument("--mode", choices=_MODE_CHOICES, default=os.getenv("REMEM_DEFAULT_MODE", "fast"))
@@ -119,8 +132,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--filters-json", help="Additional filters as JSON object.")
     parser.add_argument("--include-facts", action="store_true", help="Include memory layer facts in results.")
     parser.add_argument("--entity", default=None, help="Scope facts to a specific entity name.")
-    parser.add_argument("--api-url", default=os.getenv("REMEM_API_URL", ""), help="Remem API base URL.")
-    parser.add_argument("--api-key", default=os.getenv("REMEM_API_KEY", ""), help="Remem API key.")
+    parser.add_argument(
+        "--api-url",
+        default=os.getenv("REMEM_API_URL", _DEFAULT_API_URL),
+        help="Remem API base URL.",
+    )
     parser.add_argument("--output", help="Write API response JSON to this file.")
     parser.add_argument("--log-file", default=".remem/session-recalls.ndjson", help="NDJSON recall log file.")
     parser.add_argument("--no-log", action="store_true", help="Skip writing local recall log entry.")
@@ -129,7 +145,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    arguments = list(argv or sys.argv[1:])
+    if any(
+        argument.split("=", 1)[0].startswith("--api-k")
+        for argument in arguments
+    ):
+        print(
+            "error: --api-key is not supported; use remem-memory auth",
+            file=sys.stderr,
+        )
+        return 2
+    args = parse_args(arguments)
     try:
         payload = build_query_payload(args)
     except ValueError as exc:
@@ -142,14 +168,23 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(output, indent=2, ensure_ascii=True))
         return 0
 
-    if not args.api_url or not args.api_key:
-        print("error: REMEM_API_URL and REMEM_API_KEY are required (or --api-url/--api-key)", file=sys.stderr)
+    try:
+        api_url, api_key = remem_api.resolve_api_access(args.api_url)
+    except Exception:
+        print("error: invalid Remem API URL", file=sys.stderr)
+        return 2
+    if not api_key:
+        print("error: Remem credential is not configured", file=sys.stderr)
         return 2
 
     try:
-        response = query_remem(api_url=args.api_url, api_key=args.api_key, payload=payload)
-    except httpx.HTTPError as exc:
-        print(f"error: query failed: {exc}", file=sys.stderr)
+        response = query_remem(
+            api_url=api_url,
+            api_key=api_key,
+            payload=payload,
+        )
+    except remem_api.RememAPIError:
+        print("error: query failed", file=sys.stderr)
         return 1
 
     record = {"timestamp": _utc_now_iso(), "payload": payload, "response": response}
@@ -160,17 +195,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         Path(args.output).write_text(json.dumps(output, indent=2, ensure_ascii=True), encoding="utf-8")
     print(json.dumps(output, indent=2, ensure_ascii=True))
-
-    if response and response.get("facts"):
-        facts = response["facts"]
-        print(f"\n--- Facts ({response.get('fact_count', len(facts))}) ---\n", file=sys.stderr)
-        for f in facts:
-            line = f"  [{f.get('fact_type', 'fact')}] {f.get('content', '')}"
-            if f.get("confidence"):
-                line += f" (confidence: {f['confidence']:.1f})"
-            if f.get("entities"):
-                line += f" | entities: {', '.join(f['entities'])}"
-            print(line, file=sys.stderr)
 
     return 0
 

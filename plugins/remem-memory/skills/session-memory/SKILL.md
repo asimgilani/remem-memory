@@ -1,87 +1,12 @@
 ---
 name: session-memory
-description: Use when coding sessions need periodic checkpoints and end-of-session rollups persisted to Remem with project/session metadata for later recall.
+description: Use when an older Claude workflow refers to the session-memory skill or its coding-session memory behavior.
 ---
 
-# Session Memory
+# Session Memory (compatibility alias)
 
-Use this skill to store progress snapshots in Remem so future sessions can recover context quickly.
+This legacy skill name is a compatibility redirect. Use the canonical
+`remem-memory` skill for automatic personal recall, durable capture, controls,
+MCP guidance, engineering checkpoints, and rollups.
 
-## Prerequisites
-
-- Set `REMEM_API_KEY` (and optionally `REMEM_API_URL`) in your shell environment.
-- MCP is optional. Automatic checkpoints and rollups run through direct API calls.
-
-## Automatic Mode (Claude Hooks)
-
-When this plugin is enabled, hooks automatically:
-
-1. Capture interval checkpoints from `Write`, `Edit`, `MultiEdit`, and `Bash` tool activity.
-2. Capture milestone checkpoints on `Stop`.
-3. Generate a final rollup on `SessionEnd`.
-
-Tune behavior with environment variables:
-
-- `REMEM_MEMORY_PROJECT`: override project key (default: current folder name).
-- `REMEM_MEMORY_INTERVAL_SECONDS`: minimum seconds between interval checkpoints (default: 1200).
-- `REMEM_MEMORY_MIN_EVENTS`: minimum tool events before interval checkpoint (default: 4).
-- `REMEM_MEMORY_ROLLUP_ON_SESSION_END`: `1`/`0` toggle for final rollup.
-- `REMEM_MEMORY_AUTO_ENABLED`: `1`/`0` global toggle.
-
-If `REMEM_API_KEY` is not set, hooks keep local logs but skip ingest calls.
-
-## Workflow
-
-1. During active coding, create a checkpoint every 20-30 minutes or after major decisions.
-2. Store each checkpoint with metadata keys:
-   - `project`
-   - `session_id`
-   - `checkpoint_kind` (`interval`, `milestone`, `final`, `manual`)
-3. At session end, create one rollup summary and ingest it as `checkpoint_kind: final`.
-
-## Checkpoint Content Template
-
-- What changed
-- Key decisions
-- Open questions
-- Next actions
-- Files touched
-
-## Recall Pattern
-
-If MCP `remem_query` is available, use checkpoint filters directly:
-
-```json
-{
-  "query": "What did we decide about query filters?",
-  "mode": "rich",
-  "synthesize": true,
-  "filters": {
-    "checkpoint_project": ["my-project"],
-    "checkpoint_session": ["2026-02-13-session-a"]
-  }
-}
-```
-
-Without MCP, use raw API query:
-
-```bash
-curl -X POST "${REMEM_API_URL:-https://api.remem.io}/v1/query" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${REMEM_API_KEY}" \
-  -d '{
-    "query": "What did we decide about query filters?",
-    "mode": "rich",
-    "synthesize": true,
-    "filters": {
-      "checkpoint_project": ["my-project"],
-      "checkpoint_session": ["2026-02-13-session-a"]
-    }
-  }'
-```
-
-## Common Mistakes
-
-- Missing `project` or `session_id` metadata.
-- Writing checkpoints without decisions and next actions.
-- Reusing session IDs across unrelated work.
+Do not create or run a second memory engine for this alias.

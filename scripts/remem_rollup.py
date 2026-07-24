@@ -12,6 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_PLUGIN_SCRIPTS = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "remem-memory"
+    / "scripts"
+)
+if str(_PLUGIN_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_SCRIPTS))
+
+import remem_api  # noqa: E402
+
 try:
     from scripts.remem_checkpoint import _slug, append_checkpoint_log, ingest_checkpoint
 except ModuleNotFoundError:
@@ -26,6 +37,8 @@ except ModuleNotFoundError:
     _slug = _MODULE._slug
     append_checkpoint_log = _MODULE.append_checkpoint_log
     ingest_checkpoint = _MODULE.ingest_checkpoint
+
+_DEFAULT_API_URL = "https://api.remem.io"
 
 
 def _utc_now_iso() -> str:
@@ -166,7 +179,10 @@ def build_rollup_payload(args: argparse.Namespace, records: list[dict[str, Any]]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        allow_abbrev=False,
+    )
     parser.add_argument("--log-file", default=".remem/session-checkpoints.ndjson", help="Checkpoint log file.")
     parser.add_argument("--project", required=True, help="Project identifier.")
     parser.add_argument("--session-id", required=True, help="Session identifier.")
@@ -178,15 +194,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--return-id", action="store_true", help="Request immediate document_id in ingest response.")
     parser.add_argument("--output", help="Optional file path to write rendered rollup markdown.")
     parser.add_argument("--ingest", action="store_true", help="Send rollup to Remem API.")
-    parser.add_argument("--api-url", default=os.getenv("REMEM_API_URL", ""), help="Remem API base URL.")
-    parser.add_argument("--api-key", default=os.getenv("REMEM_API_KEY", ""), help="Remem API key.")
+    parser.add_argument(
+        "--api-url",
+        default=os.getenv("REMEM_API_URL", _DEFAULT_API_URL),
+        help="Remem API base URL.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print payload only.")
     parser.add_argument("--no-log", action="store_true", help="Skip appending rollup event to checkpoint log.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    arguments = list(argv or sys.argv[1:])
+    if any(
+        argument.split("=", 1)[0].startswith("--api-k")
+        for argument in arguments
+    ):
+        print(
+            "error: --api-key is not supported; use remem-memory auth",
+            file=sys.stderr,
+        )
+        return 2
+    args = parse_args(arguments)
     records = filter_records(
         load_checkpoint_log(args.log_file),
         project=args.project,
@@ -199,10 +228,24 @@ def main(argv: list[str] | None = None) -> int:
 
     response: dict[str, Any] | None = None
     if args.ingest and not args.dry_run:
-        if not args.api_url or not args.api_key:
-            print("error: --ingest requires REMEM_API_URL and REMEM_API_KEY (or --api-url/--api-key)", file=sys.stderr)
+        try:
+            api_url, api_key = remem_api.resolve_api_access(
+                args.api_url
+            )
+        except Exception:
+            print("error: invalid Remem API URL", file=sys.stderr)
             return 2
-        response = ingest_checkpoint(api_url=args.api_url, api_key=args.api_key, payload=payload)
+        if not api_key:
+            print(
+                "error: Remem credential is not configured",
+                file=sys.stderr,
+            )
+            return 2
+        response = ingest_checkpoint(
+            api_url=api_url,
+            api_key=api_key,
+            payload=payload,
+        )
 
     if not args.no_log:
         append_checkpoint_log(

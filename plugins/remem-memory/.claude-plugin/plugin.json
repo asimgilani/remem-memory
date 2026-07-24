@@ -1,7 +1,7 @@
 {
-  "name": "remem-dev-sessions",
-  "description": "Automatic coding-session checkpoints and rollups for Remem",
-  "version": "0.2.1",
+  "name": "remem-memory",
+  "description": "Automatic personal recall, durable capture, and engineering memory",
+  "version": "0.3.0",
   "author": {
     "name": "Remem",
     "email": "support@remem.io"
@@ -9,5 +9,5 @@
   "homepage": "https://remem.io",
   "repository": "https://github.com/asimgilani/remem-memory",
   "license": "MIT",
-  "keywords": ["remem", "coding", "session", "checkpoints", "rollups", "skills"]
+  "keywords": ["remem", "memory", "recall", "durable", "checkpoints", "skills"]
 }

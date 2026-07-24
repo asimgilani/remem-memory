@@ -1,0 +1,24 @@
+{
+  "name": "remem-memory",
+  "description": "Automatic personal recall, durable capture, and engineering memory",
+  "version": "0.3.0",
+  "author": {
+    "name": "Remem",
+    "email": "support@remem.io"
+  },
+  "homepage": "https://remem.io",
+  "repository": "https://github.com/asimgilani/remem-memory",
+  "license": "MIT",
+  "keywords": ["remem", "memory", "recall", "durable", "skills"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Remem Memory",
+    "shortDescription": "Personal and engineering memory",
+    "longDescription": "Automatically recalls personal context, captures durable memory, and preserves engineering continuity.",
+    "developerName": "Remem",
+    "category": "Productivity",
+    "capabilities": ["Recall", "Memory", "Checkpoints"],
+    "defaultPrompt": ["Recall relevant context for this task."]
+  }
+}

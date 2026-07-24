@@ -1,14 +1,24 @@
 {
-  "description": "Automatic Remem checkpoints and session rollups",
+  "description": "Automatic Remem recall, durable memory, checkpoints, and rollups",
   "hooks": {
-    "PostToolUse": [
+    "UserPromptSubmit": [
       {
-        "matcher": "Write|Edit|MultiEdit|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode post_tool_use",
-            "async": true,
+            "command": "python3 -I -c 'import os,runpy,sys;root=sys.argv.pop(1);root=root if root and not root.startswith(\"$\") else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:]];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode user_prompt_submit",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I -c 'import os,runpy,sys;root=sys.argv.pop(1);root=root if root and not root.startswith(\"$\") else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:]];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode post_tool_use",
             "timeout": 30
           }
         ]
@@ -19,8 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode task_completed",
-            "async": true,
+            "command": "python3 -I -c 'import os,runpy,sys;root=sys.argv.pop(1);root=root if root and not root.startswith(\"$\") else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:]];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode stop",
             "timeout": 30
           }
         ]
@@ -31,8 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode pre_compact",
-            "async": true,
+            "command": "python3 -I -c 'import os,runpy,sys;root=sys.argv.pop(1);root=root if root and not root.startswith(\"$\") else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:]];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode pre_compact",
             "timeout": 60
           }
         ]
@@ -43,8 +51,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/auto_memory_hook.py\" --mode session_end",
-            "timeout": 60
+            "command": "python3 -I -c 'import os,runpy,sys;root=sys.argv.pop(1);root=root if root and not root.startswith(\"$\") else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:]];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode session_end",
+            "timeout": 3
           }
         ]
       }

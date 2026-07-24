@@ -1,109 +1,215 @@
-# Installing Remem Dev Sessions for Codex
+# Install Remem Memory
 
-Enable automatic Remem checkpoints in Codex using the `remem-codex` wrapper, with MCP configured automatically.
+Install one `remem-memory` plugin for the compatible clients present on this
+Mac. These instructions are for an agent operating the target host.
 
-## Prerequisites
+## Safety rules
 
-- OpenAI Codex CLI installed
-- Git
-- Python 3.10+
+- Work only in the Remem Memory checkout.
+- Preserve an existing checkout, virtual environment, `.remem/` logs, and
+  credential state.
+- If an existing checkout is dirty, stop and tell the user. Do not reset,
+  overwrite, or delete it.
+- Never request that the user paste an API key into chat, a command argument,
+  a configuration file, or a shell startup file.
+- Leave the Remem portal and every Remem API service unchanged.
 
-## Installation (macOS/Linux)
+## 1. Verify prerequisites
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/asimgilani/remem-memory.git ~/.codex/remem-dev-sessions
-   ```
+This release supports macOS because it stores the credential in macOS
+Keychain. Require Git, Python 3.10+, and `uv`. At least one of Codex or Claude
+Code should also be installed.
 
-2. **Install dependencies:**
-   ```bash
-   cd ~/.codex/remem-dev-sessions
-   python3 -m pip install -r requirements.txt
-   ```
-
-3. **Ensure command PATH includes `~/.local/bin`:**
-   ```bash
-   if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
-     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-     export PATH="$HOME/.local/bin:$PATH"
-   fi
-   ```
-
-4. **Set Remem API environment variables:**
-   ```bash
-   echo 'export REMEM_API_URL="https://api.remem.io"' >> ~/.zshrc
-   echo 'export REMEM_API_KEY="vlt_your_key_here"' >> ~/.zshrc
-   source ~/.zshrc
-   ```
-
-5. **Install skills/commands and MCP config:**
-   ```bash
-   cd ~/.codex/remem-dev-sessions
-   ./install-codex-skill.sh
-   ```
-
-6. **Restart Codex.**
-
-## Verify
+Run non-mutating version checks. If `uv` is missing, install it through the
+host's trusted package manager before continuing. For a Mac with Homebrew:
 
 ```bash
-which remem-codex
-rg -n "mcp_servers.remem" ~/.codex/config.toml
-remem-dev-sessions checkpoint --project smoke --session-id test --summary "ok" --dry-run --no-log
+brew install uv
 ```
 
-## Daily Usage
+Do not use an unreviewed network bootstrap script. The Remem installer itself
+must not run until `uv --version` succeeds; its preflight intentionally makes
+no changes otherwise.
 
-In your project directory, launch Codex via wrapper:
+## 2. Choose or update the checkout
+
+Prefer an existing checkout, including the older
+`~/.codex/remem-dev-sessions` directory name. The directory name does not
+change the installed product identity.
+
+Change into the selected checkout before inspecting or updating it. For
+example, use `cd ~/.codex/remem-memory` for the new path or
+`cd ~/.codex/remem-dev-sessions` for an existing older path. Then run:
 
 ```bash
-remem-codex
+git status --short
+git remote get-url origin
+git pull --ff-only
 ```
 
-This automatically:
+Continue only when status is clean, the remote is the expected
+`asimgilani/remem-memory` repository, and the fast-forward update succeeds.
 
-- Creates periodic interval checkpoints (default 20 min)
-- Writes milestone checkpoint on Codex exit when changes exist
-- Writes final rollup on exit
-- Generates structured checkpoint/rollup summaries from Codex session transcript using Codex CLI
-
-MCP (`remem_query`) is configured during install and available after restart.
-
-Optional summary tuning:
+For a new checkout:
 
 ```bash
-export REMEM_MEMORY_SUMMARY_ENABLED="1"
-export REMEM_MEMORY_SUMMARY_PROVIDER="codex_cli"
-export REMEM_MEMORY_SUMMARY_MODEL="gpt-5.3-codex-spark"
+git clone https://github.com/asimgilani/remem-memory.git ~/.codex/remem-memory
+cd ~/.codex/remem-memory
 ```
 
-## Update
+## 3. Run contained setup
+
+From the repository root:
 
 ```bash
-cd ~/.codex/remem-dev-sessions
-git pull
-python3 -m pip install -r requirements.txt
 ./install-codex-skill.sh
+command -v remem-memory
 ```
 
-## Uninstall
+The setup:
+
+- uses standard-library-only local helpers and prepares the private,
+  content-addressed MCP cache;
+- installs the canonical command and compatibility aliases;
+- installs and verifies `remem-memory` version `0.3.0` in available Codex and
+  Claude Code clients;
+- keeps the older Claude plugin active until the replacement is verified;
+- can bridge one narrowly recognized legacy Codex credential to Keychain; and
+- removes old Codex and Claude identities only after the Keychain copy, new
+  plugin, and bundled MCP runtime are verified.
+
+Setup does not migrate Remem data and makes no Remem portal or Remem API
+changes.
+
+The command is installed at `~/.local/bin/remem-memory`. If
+`command -v remem-memory` returns nothing, use that full path for every
+remaining Remem Memory control. Do not modify `PATH` or shell startup files
+automatically.
+
+## 4. Configure the credential
+
+Check the canonical Keychain source without allowing an old environment
+override to mask it:
 
 ```bash
-rm -f ~/.local/bin/remem-codex \
-      ~/.local/bin/remem-dev-sessions \
-      ~/.local/bin/remem-dev-sessions-codex \
-      ~/.local/bin/remem-dev-sessions-checkpoint \
-      ~/.local/bin/remem-dev-sessions-rollup \
-      ~/.local/bin/remem-dev-sessions-recall \
-      ~/.local/bin/remem-memory-codex \
-      ~/.local/bin/remem-memory-checkpoint \
-      ~/.local/bin/remem-memory-rollup \
-      ~/.local/bin/remem-memory-recall
-rm -f ~/.agents/skills/remem-dev-sessions ~/.agents/skills/remem-session-memory
+env -u REMEM_API_KEY ~/.local/bin/remem-memory status
 ```
 
-Optionally remove the clone:
+If it reports `credential: missing`, run:
 
 ```bash
-rm -rf ~/.codex/remem-dev-sessions
+~/.local/bin/remem-memory auth
+env -u REMEM_API_KEY ~/.local/bin/remem-memory status
 ```
+
+Let the user enter the API key into the hidden terminal prompt. Do not capture
+or repeat it. The canonical macOS Keychain item is the generic password
+`io.remem.memory` / `default`.
+
+Credential precedence is:
+
+1. a non-empty `REMEM_API_KEY` in the current process environment;
+2. the canonical Keychain item.
+
+The installer never edits shell startup files. If an existing startup file
+exports `REMEM_API_KEY`, it continues to override Keychain. After verifying
+Keychain, ask the user before removing that old export, then run
+`unset REMEM_API_KEY` in the current shell.
+
+## 5. Verify and restart
+
+Run:
+
+```bash
+remem-memory status
+codex plugin list --json
+claude plugin list --json
+```
+
+Skip a client-specific command if that client is not installed. Confirm that
+each installed client reports `remem-memory` enabled at `0.3.0`. Confirm the
+old Claude identity is absent or disabled and the old Codex Remem MCP block is
+absent only after the verified bridge.
+
+Restart each installed client. In a new Codex session, run `/hooks`, review the
+Remem Memory entry, and trust its exact hook hash. Codex skips those hooks until
+they are trusted, so automatic recall, durable capture, and engineering
+checkpoints do not run before approval. MCP tools, skills, and manual CLI
+commands can still work before hook trust. After any new or changed hook
+version, run `/hooks` and re-review it.
+
+The audited MCP snapshot is bundled at `plugins/remem-memory/mcp`; it is not
+fetched from a private repository. Its provenance records upstream commit
+`759a57af927908315a3a4f6e4c73a935faf8d56f`. Setup validates the exact source
+files and hashes, excludes generated `__pycache__` files, then uses
+`uv sync --no-config --locked --no-editable --no-install-project` with a dummy
+credential to prepare and probe a private, content-addressed cache. It does
+not build or install the local MCP project.
+`uv.lock` locks the full environment, including direct dependencies
+`httpx==0.28.1` and `mcp==1.26.0`. A fresh setup or first direct-plugin start
+may fetch the locked PyPI artifacts. A failed probe stops setup and preserves
+the legacy identities.
+
+The real API key reaches only the direct cached Python process through a one-use
+anonymous file descriptor; it is not placed in arguments or an environment
+value. The bundled server consumes and closes it before third-party imports.
+HTTP redirects and ambient proxies are disabled. MCP runs as a host-launched
+stdio child. There is no setup wizard, no local web server, and no daemon.
+
+## 6. Set behavior and namespaces
+
+Default behavior is `auto` with `balanced` personal capture:
+
+```bash
+remem-memory mode auto
+remem-memory mode recall-only
+remem-memory mode off
+remem-memory sensitivity conservative
+remem-memory sensitivity balanced
+remem-memory sensitivity aggressive
+```
+
+Optional namespace variables are:
+
+- `REMEM_DEFAULT_NAMESPACE` for MCP, defaulting to `default`;
+- `REMEM_MEMORY_PERSONAL_NAMESPACE` for automatic conversational writes; and
+- `REMEM_MEMORY_ENGINEERING_NAMESPACE` for checkpoints and rollups.
+
+Unset write namespaces retain the Remem account's default/catch-all behavior.
+No namespace migration is performed.
+
+## Surface boundary
+
+This local plugin works in Codex desktop/CLI and Claude Code on this Mac host.
+Codex Remote benefits when its task executes on this configured Mac host.
+Ordinary ChatGPT mobile chat and an IDE extension do not load the plugin.
+Codex Cloud or a different SSH host needs its own installation and credential.
+The installed plugin may appear in the desktop Plugins list.
+
+## Update and rollback
+
+For future updates, require a clean checkout, run `git pull --ff-only`, rerun
+`./install-codex-skill.sh`, and re-verify both clients. Never discard local
+changes to force an update.
+
+To pause without uninstalling:
+
+```bash
+remem-memory mode off
+```
+
+The verified rollback boundary in 0.3.0 is `remem-memory mode off`. Keep Remem
+cloud data, Keychain data, project `.remem/` logs, the current checkout, and
+both client registrations intact. Version downgrade is intentionally not
+automated: an older checkout's installer can update an existing canonical Git
+marketplace back to current remote head, and marketplace replacement is not
+transactional across both clients. Do not run an older installer or remove one
+registration. An older unified version requires a tested exact-source
+procedure that verifies both clients, MCP, commands, aliases, and matching
+skill identities before re-enabling it.
+
+The pre-unification `remem-dev-sessions` hooks do not honor the new persisted
+`mode off`. Treat restoration of that implementation as manual legacy
+recovery, keep its client process under
+`REMEM_MEMORY_AUTO_ENABLED=0`, and verify its old Codex MCP, Claude plugin, and
+aliases before removing the unified plugin.

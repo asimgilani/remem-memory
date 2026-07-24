@@ -1,17 +1,14 @@
 {
   "mcpServers": {
     "remem": {
-      "command": "uvx",
+      "command": "python3",
+      "cwd": ".",
       "args": [
-        "-q",
-        "--from",
-        "git+https://github.com/asimgilani/remem.git@master#subdirectory=packages/remem-mcp",
-        "remem-mcp"
-      ],
-      "env": {
-        "REMEM_API_URL": "${REMEM_API_URL:-https://api.remem.io}",
-        "REMEM_API_KEY": "${REMEM_API_KEY}"
-      }
+        "-I",
+        "-c",
+        "import os,runpy,sys;root=sys.argv[1];root=os.getcwd() if root.startswith('$') else root;scripts=os.path.join(root,'scripts');launcher=os.path.join(scripts,'remem_mcp_launcher.py');sys.path.insert(0,scripts);sys.argv=[launcher,*sys.argv[2:]];runpy.run_path(launcher,run_name='__main__')",
+        "${CLAUDE_PLUGIN_ROOT}"
+      ]
     }
   }
 }

@@ -1,78 +1,12 @@
 ---
 name: remem-dev-sessions
-description: Use when coding sessions need periodic checkpoints and end-of-session rollups persisted to Remem with project/session metadata for later recall.
+description: Use when an older Codex workflow refers to remem-dev-sessions or its coding-session memory behavior.
 ---
 
-# Remem Dev Sessions
+# Remem Dev Sessions (compatibility alias)
 
-Use this skill to persist coding-session progress into Remem so context survives memory resets across future sessions.
+This legacy skill name is a compatibility redirect. Use the canonical
+`remem-memory` skill for automatic personal recall, durable capture, controls,
+MCP guidance, engineering checkpoints, and rollups.
 
-## Prerequisites
-
-- `REMEM_API_URL` and `REMEM_API_KEY` must be set.
-- Run `./install-codex-skill.sh` from this repository first.
-- MCP is optional. This workflow works via raw API commands.
-
-## Recommended Launch
-
-Start Codex through the wrapper so checkpoints happen automatically:
-
-```bash
-remem-codex
-```
-
-This runs periodic interval checkpoints, emits a milestone checkpoint on exit when changes exist, and writes a final rollup.
-
-## Checkpoint Workflow
-
-Manual checkpoints are still available:
-
-```bash
-remem-dev-sessions checkpoint \
-  --project remem \
-  --session-id 2026-02-13-mcp-memory \
-  --kind interval \
-  --summary "Added metadata merge and checkpoint query filters." \
-  --decision "Store user metadata in encrypted document metadata." \
-  --next-action "Update docs-site and migration notes." \
-  --ingest
-```
-
-## Rollup Workflow
-
-At session end, run:
-
-```bash
-remem-dev-sessions rollup \
-  --project remem \
-  --session-id 2026-02-13-mcp-memory \
-  --summary "Implemented session-memory workflow and docs updates." \
-  --ingest
-```
-
-## Recall Workflow (Raw API)
-
-```bash
-remem-dev-sessions recall \
-  --query "What did we decide about checkpoint metadata?" \
-  --mode rich \
-  --synthesize \
-  --checkpoint-project remem \
-  --checkpoint-session 2026-02-13-mcp-memory
-```
-
-## MCP Recall (Optional)
-
-If `remem_query` is available via MCP, you can use the same filter keys:
-
-```json
-{
-  "query": "What did we decide about checkpoint metadata?",
-  "mode": "rich",
-  "synthesize": true,
-  "filters": {
-    "checkpoint_project": ["remem"],
-    "checkpoint_session": ["2026-02-13-mcp-memory"]
-  }
-}
-```
+Do not create or run a second memory engine for this alias.

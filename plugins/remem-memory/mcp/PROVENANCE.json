@@ -1,0 +1,18 @@
+{
+  "upstream_commit": "759a57af927908315a3a4f6e4c73a935faf8d56f",
+  "upstream_path": "packages/remem-mcp",
+  "upstream_sha256": {
+    "pyproject.toml": "06e3891c9a6af02c4de43efb8961c3149e55e9776df418ebaf6964c3706d0dfb",
+    "remem_mcp/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "remem_mcp/server.py": "f3e74617cc8ef3c11a2f9d944f99bdfb1cb245a581658023b30a9ac7244493df"
+  },
+  "local_changes": [
+    "Pin direct dependencies to httpx 0.28.1 and mcp 1.26.0.",
+    "Explicitly disable HTTP redirects so authorization never crosses origins.",
+    "Read and close the transient API-key descriptor before importing third-party modules.",
+    "Disable HTTP client environment trust so ambient proxies and CA overrides cannot receive authorization.",
+    "Remove the local build backend and project entrypoint; sync only locked dependencies with --no-install-project.",
+    "Prepare the locked environment without the user credential; the credential-bearing launch executes cached Python directly against the integrity-checked source.",
+    "Validate document and entity identifiers as canonical UUIDs before constructing API paths."
+  ]
+}

@@ -1,259 +1,291 @@
-# remem-dev-sessions
+# Remem Memory
 
-API-first coding-session memory workflows for Remem.
+Automatic personal and engineering memory for Claude Code and Codex.
 
-This repository is still hosted as `remem-memory`, but the toolkit name is now `remem-dev-sessions`.
+Remem Memory is one plugin with one secure credential path. On a configured
+Mac, its hooks recall useful personal or project context, selectively retain
+durable preferences and decisions, and preserve engineering checkpoints and
+session rollups.
 
-## Codex Quick Install
+```text
+Claude Code or Codex on your Mac
+        │
+        ├─ prompt ──> bounded, safe recall ──> answer context
+        └─ events ──> durable capture + engineering continuity
+                              │
+                         Remem cloud
+```
 
-Tell Codex:
+Setup and controls are CLI-based. There is no setup wizard, no local web
+server, and no daemon. The MCP server is a host-launched stdio child that runs
+only while a compatible client needs it.
+
+## Supported surfaces
+
+| Surface | Support |
+| --- | --- |
+| Claude Code on the configured Mac | Plugin skills, hooks, commands, and MCP |
+| Codex CLI and the Codex desktop app on the configured Mac | Plugin skills, hooks, commands, and MCP |
+| Codex Remote | Works when the remote task executes on that configured Mac host |
+| Ordinary ChatGPT mobile chat | Does not load this local plugin |
+| IDE extension | Not a supported plugin surface |
+| Codex Cloud or a different SSH host | Needs its own installation and credential |
+
+The plugin may appear in the Codex desktop Plugins list after installation.
+That list is for the host plugin; it does not make ordinary ChatGPT mobile
+conversations use Remem Memory.
+
+## Quick install
+
+Tell Codex on the target Mac:
 
 ```text
 Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/remem-memory/refs/heads/master/.codex/INSTALL.md
 ```
 
-Detailed Codex guide: `docs/README.codex.md`
+The installer detects Codex and Claude Code, installs the same
+`remem-memory` plugin into each available harness, and verifies version
+`0.3.0` before retiring an older active identity.
 
-## What this package contains
+## Requirements
 
-- Claude marketplace manifest: `.claude-plugin/marketplace.json`
-- Claude plugin source: `plugins/remem-memory`
-  - Skill: `session-memory`
-  - Hooks: `hooks/hooks.json`
-  - Hook runner: `scripts/auto_memory_hook.py`
-  - Optional bundled MCP config: `.mcp.json`
-- Codex skills:
-  - `codex/skills/remem-dev-sessions` (canonical)
-  - `codex/skills/remem-session-memory` (legacy alias)
-- Helper scripts:
-  - `scripts/remem_dev_sessions.py` (unified CLI)
-  - `scripts/remem_codex_wrapper.py` (Codex wrapper with auto checkpoints)
-  - `scripts/remem_checkpoint.py`
-  - `scripts/remem_rollup.py`
-  - `scripts/remem_recall.py`
-  - `scripts/install_codex_mcp.py` (writes Codex MCP config)
+- macOS, because the supported credential store is macOS Keychain
+- Git and Python 3.10+
+- `uv` on `PATH` before setup starts
+- Codex, Claude Code, or both
+- A Remem API key
 
-## Prerequisites
-
-- Python 3.10+
-- `httpx` installed
-- A Remem API key (`vlt_...`)
-- Environment variables:
+Install `uv` with the Mac's trusted package manager if it is missing. With
+Homebrew, use:
 
 ```bash
-export REMEM_API_URL="https://api.remem.io"
-export REMEM_API_KEY="vlt_your_key"
+brew install uv
 ```
 
-Install dependency:
+The installer does not bootstrap package managers and makes no changes when a
+required preflight fails. Manual checkpoint, rollup, and recall helpers use
+only Python's standard library. The bundled MCP environment stays in a private
+cache. Nothing is installed globally.
+
+## Manual setup
+
+For a new installation:
 
 ```bash
-python -m pip install -r requirements.txt
-```
-
-## Install in Claude Code (local marketplace)
-
-From this repository root:
-
-1. Add marketplace:
-
-```text
-/plugin marketplace add .
-```
-
-2. Install plugin:
-
-```text
-/plugin install remem-dev-sessions@remem-dev-sessions
-```
-
-3. Restart Claude Code.
-
-## Claude Auto Checkpoints
-
-When enabled, hooks automatically run:
-
-- `PostToolUse` (`Write|Edit|MultiEdit|Bash`) for interval checkpoints
-- `Stop` for milestone checkpoints
-- `PreCompact` for milestone checkpoints before context compaction
-- `SessionEnd` for final rollup
-
-If `REMEM_API_KEY` is unset, hooks still write local checkpoint logs and skip API ingest.
-
-Optional tuning env vars:
-
-```bash
-export REMEM_MEMORY_PROJECT="my-project"          # default: current folder name
-export REMEM_MEMORY_INTERVAL_SECONDS="1200"       # default: 20 minutes
-export REMEM_MEMORY_MIN_EVENTS="4"                # default: 4 tool events
-export REMEM_MEMORY_ROLLUP_ON_SESSION_END="1"     # default: enabled
-export REMEM_MEMORY_AUTO_ENABLED="1"              # default: enabled
-```
-
-Optional LLM-backed summaries (recommended):
-
-- Produces narrative summaries plus populated `decisions`, `open_questions`, and `next_actions`.
-- Default provider order: Claude CLI (`claude`) -> Codex CLI (`codex`) -> Anthropic API -> OpenAI API.
-
-```bash
-export REMEM_MEMORY_SUMMARY_ENABLED="1"           # default: enabled; requires claude/codex CLI or API key
-export REMEM_MEMORY_SUMMARY_PROVIDER="claude_cli" # claude_cli|codex_cli|anthropic|openai
-export REMEM_MEMORY_SUMMARY_MODEL="haiku"         # provider-specific model id/alias
-```
-
-## Install in Codex
-
-From this repository root:
-
-```bash
+git clone https://github.com/asimgilani/remem-memory.git ~/.codex/remem-memory
+cd ~/.codex/remem-memory
 ./install-codex-skill.sh
+command -v remem-memory
 ```
 
-This installs:
-
-- Skill symlink: `~/.agents/skills/remem-dev-sessions`
-- Legacy alias skill: `~/.agents/skills/remem-session-memory` (if present)
-- Helper commands:
-  - `~/.local/bin/remem-dev-sessions`
-  - `~/.local/bin/remem-dev-sessions-codex`
-  - `~/.local/bin/remem-codex`
-  - `~/.local/bin/remem-dev-sessions-checkpoint`
-  - `~/.local/bin/remem-dev-sessions-rollup`
-  - `~/.local/bin/remem-dev-sessions-recall`
-- Legacy aliases:
-  - `~/.local/bin/remem-memory-codex`
-  - `~/.local/bin/remem-memory-checkpoint`
-  - `~/.local/bin/remem-memory-rollup`
-  - `~/.local/bin/remem-memory-recall`
-- Codex MCP config block in `~/.codex/config.toml` (`mcp_servers.remem`)
-
-Restart Codex after installation.
-
-## API-First Commands
-
-Use these after running `./install-codex-skill.sh` (or otherwise placing scripts on your PATH).
-
-## Codex Automatic Mode (Wrapper)
-
-Launch Codex through the wrapper:
+The command is installed at `~/.local/bin/remem-memory`. If
+`command -v remem-memory` returns nothing, use that full path for the `auth`,
+`status`, `mode`, and `sensitivity` examples. Setup intentionally does not edit
+`PATH` or shell startup files.
 
 ```bash
-remem-dev-sessions codex --
+remem-memory auth
+remem-memory status
 ```
 
-Equivalent shortcut:
+`remem-memory auth` uses a hidden terminal prompt and stores the key as the
+macOS Keychain generic password `io.remem.memory` / `default`. The key is not
+placed in plugin manifests, shell startup files, or Codex configuration.
+To verify Keychain rather than an environment override, run
+`env -u REMEM_API_KEY ~/.local/bin/remem-memory status`.
+
+Restart the installed clients after setup. In a new Codex session, run
+`/hooks`, review the Remem Memory entry, and trust its exact hook hash. Codex
+skips those hooks until they are trusted, so automatic recall, durable capture,
+and engineering checkpoints do not run before approval. MCP tools, skills, and
+manual CLI commands can still work before hook trust. After any new or changed
+hook version, run `/hooks` and re-review it.
+
+The audited MCP snapshot is bundled at `plugins/remem-memory/mcp`; no private
+repository fetch is needed. Its provenance records upstream commit
+`759a57af927908315a3a4f6e4c73a935faf8d56f`. Setup validates the exact source
+files and prepares a locked, non-editable runtime from `uv.lock` with
+`uv sync --no-config --locked --no-editable --no-install-project`. The local
+MCP project is never built or installed. Generated
+`__pycache__` files are excluded from that runtime. The direct
+dependencies are `httpx==0.28.1` and `mcp==1.26.0`. Setup—or the first start
+after a direct plugin install—may fetch the locked PyPI artifacts.
+
+Runtime preparation uses a dummy credential. The real API key reaches only the
+direct cached Python process through a one-use anonymous file descriptor. The
+server consumes and closes it before third-party imports; HTTP redirects and
+ambient proxies are disabled.
+
+## Daily behavior and controls
+
+The default mode is `auto`:
+
+- relevant prompts can receive bounded automatic recall;
+- lasting preferences and decisions can receive selective durable capture;
+- meaningful engineering activity creates checkpoints and session rollups; and
+- “off the record” or `/remem off-record` suppresses memory for that turn.
+
+Use the CLI to change persistent behavior:
 
 ```bash
-remem-dev-sessions-codex
+remem-memory mode auto
+remem-memory mode recall-only
+remem-memory mode off
+
+remem-memory sensitivity conservative
+remem-memory sensitivity balanced
+remem-memory sensitivity aggressive
+
+remem-memory status
 ```
 
-Short alias:
+`recall-only` permits automatic reads but disables automatic personal and
+engineering writes. `off` disables automatic reads and writes. Sensitivity
+changes personal capture selectivity, not recall or checkpoint cadence.
+
+Explicit engineering helpers remain available for a boundary or a host
+without hooks:
 
 ```bash
-remem-codex
+remem-memory checkpoint --help
+remem-memory rollup --help
+remem-memory recall --help
 ```
 
-Behavior:
+Do not use explicit writes to duplicate a successful automatic hook. The
+checkpoint, rollup, and recall helpers do not mechanically enforce the
+automatic mode, so do not invoke them while memory is `off`, `recall-only`, or
+off the record.
 
-- Starts a new session ID (unless `REMEM_MEMORY_SESSION_ID` is set).
-- Runs interval checkpoints in the background (default every 20 minutes).
-- Captures a milestone checkpoint on Codex exit if git changes are detected.
-- Writes a final rollup after exit (unless `--no-rollup`).
-- Reads Codex session transcripts and generates structured checkpoint/rollup summaries
-  (`summary`, `decisions`, `open_questions`, `next_actions`) using Codex CLI.
+The optional `remem-memory codex` launcher is different: it is an automatic
+Codex lifecycle wrapper. It mechanically rechecks the persisted mode before
+every checkpoint and final rollup, including changes made while Codex is
+running. It also suppresses an off-record boundary and advances its file
+baseline so private-turn changes cannot leak into a later checkpoint. After
+any off-record marker, transcript/model summaries stay disabled for that
+wrapped session; deterministic checkpoints can resume after a normal prompt.
+Run `remem-memory codex --help` for its launch options.
 
-Codex summary tuning:
+Before any explicit MCP call or manual workflow, run `remem-memory status`.
+`auto` allows eligible read-only MCP tools and write MCP tools. `recall-only`
+allows read-only MCP tools or manual recall with `--no-log`, but never write
+MCP tools such as `remem_ingest` or `remem_extract_facts`; `off` allows neither.
+Use a write tool only for explicit user intent when automatic Stop capture is
+unavailable, and never duplicate a successful automatic write. Off-record
+overrides every mode for that turn.
+
+## Engineering continuity
+
+The installed hooks preserve the existing coding workflow: meaningful
+write/edit/shell activity feeds interval checkpoints, Stop and PreCompact
+create milestone boundaries, and Claude Code's SessionEnd creates the final
+rollup. Codex releases that do not emit SessionEnd still preserve every Stop
+milestone; PreCompact creates a versioned rolling rollup, and the optional
+`remem-memory codex` wrapper creates a final rollup when its Codex process
+exits. This avoids a duplicate rollup on every Codex turn. Defaults are four
+meaningful tool events and a 20-minute interval target.
+
+Optional engineering tuning remains available:
 
 ```bash
-export REMEM_MEMORY_SUMMARY_ENABLED="1"             # default: enabled
-export REMEM_MEMORY_SUMMARY_PROVIDER="codex_cli"    # wrapper supports codex_cli
-export REMEM_MEMORY_SUMMARY_MODEL="gpt-5.3-codex-spark"
-export REMEM_MEMORY_SUMMARY_TIMEOUT_SECONDS="15"    # default: 15
+export REMEM_MEMORY_PROJECT="my-project"
+export REMEM_MEMORY_INTERVAL_SECONDS="1200"
+export REMEM_MEMORY_MIN_EVENTS="4"
+export REMEM_MEMORY_ROLLUP_ON_SESSION_END="1"
+export REMEM_MEMORY_SUMMARY_ENABLED="1"
 ```
 
-Optional transcript discovery override:
+By default, optional summaries stay with the invoking harness: Claude Code uses
+its Claude CLI and Codex uses its Codex CLI. Cross-provider summarization occurs
+only when `REMEM_MEMORY_SUMMARY_PROVIDER` explicitly selects `claude_cli`,
+`codex_cli`, `anthropic`, or `openai`. See the security guide before sending
+transcript-derived material across that boundary.
+
+## Namespaces
+
+One API key can access the namespaces granted to its Remem account. Namespace
+settings are optional:
 
 ```bash
-export REMEM_MEMORY_CODEX_SESSIONS_DIR="$HOME/.codex/sessions"
+export REMEM_DEFAULT_NAMESPACE="default"
+export REMEM_MEMORY_PERSONAL_NAMESPACE="default"
+export REMEM_MEMORY_ENGINEERING_NAMESPACE="engineering"
 ```
 
-Useful flags:
+- `REMEM_DEFAULT_NAMESPACE` is the MCP server's default namespace.
+- `REMEM_MEMORY_PERSONAL_NAMESPACE` selects automatic conversational writes.
+- `REMEM_MEMORY_ENGINEERING_NAMESPACE` selects checkpoint and rollup writes.
+- Unset write namespaces use the Remem account's default/catch-all behavior.
+- Automatic recall searches the namespaces available to the configured key;
+  explicit MCP calls can narrow a query.
+
+Use separate least-privilege keys when people or hosts should not share the
+same memory scope.
+
+## Updating from remem-dev-sessions
+
+The repository and data stay in place; this is an update to one canonical
+product identity. Existing `remem-dev-sessions`, `remem-session-memory`, and
+`remem-codex` commands and skills remain compatibility aliases to
+`remem-memory`. They do not run a second memory engine.
+
+For an existing clean checkout:
 
 ```bash
-remem-dev-sessions codex --interval-seconds 900 --checkpoint-on-start -- --model gpt-5
+git status --short
+git pull --ff-only
+./install-codex-skill.sh
+remem-memory status
 ```
 
-- `--interval-seconds`: checkpoint cadence
-- `--checkpoint-on-start`: emit first checkpoint immediately
-- `--always-checkpoint`: emit even if git status has not changed
-- `--no-rollup`: disable final rollup
-- `--dry-run`: log payloads without ingesting
+If `git status --short` shows changes, stop and preserve them. Never reset or
+delete a dirty checkout to update this plugin.
 
-If `REMEM_API_KEY` is not set, wrapper still writes local logs and skips API ingest.
+During the one-time transition, setup accepts only one exact legacy Codex
+`REMEM_API_KEY` basic string from the old Remem MCP environment block. It
+copies that value to the canonical Keychain item, reads it back, and verifies
+it before the new Codex plugin can replace the legacy block. A mismatch fails
+closed and leaves the legacy configuration untouched. Claude's new plugin is
+also verified enabled before its older identity is disabled and removed.
 
-Checkpoint:
+The installer never edits shell startup files. A pre-existing
+`REMEM_API_KEY` environment variable continues to override macOS Keychain. Once
+Keychain setup is verified, remove any old startup-file export yourself and
+run `unset REMEM_API_KEY` in the current shell if you want Keychain to become
+the active source.
+
+No Remem data is migrated, copied, renamed, or deleted. There are no Remem API
+changes and no Remem portal changes.
+
+## Safe pause and rollback
+
+Pause all automatic memory immediately:
 
 ```bash
-remem-dev-sessions checkpoint \
-  --project my-project \
-  --session-id 2026-02-13-session-a \
-  --kind interval \
-  --summary "Implemented auth middleware refactor" \
-  --decision "Keep API key auth behavior unchanged" \
-  --next-action "Add regression tests" \
-  --ingest
+remem-memory mode off
 ```
 
-Rollup:
+The verified rollback boundary in this release is the immediate `mode off`
+pause. Keep the current checkout, Keychain item, cloud data, `.remem/` files,
+and both client registrations intact while investigating.
 
-```bash
-remem-dev-sessions rollup \
-  --project my-project \
-  --session-id 2026-02-13-session-a \
-  --summary "Completed middleware refactor and tests" \
-  --ingest
-```
+Version downgrade is intentionally not automated in 0.3.0. Running an older
+checkout's installer is not a pin: an existing canonical Git marketplace can
+update back to its current remote head. Replacing that marketplace source is
+client-specific and is not transactional across Codex and Claude Code. Do not
+run an older installer or manually remove only one client registration; either
+can create a mixed installation. Restore an older unified version only with a
+tested procedure that pins the exact local source in both clients and verifies
+MCP, commands, aliases, and matching skill identities before re-enabling it.
 
-Recall:
+Returning to the pre-unification `remem-dev-sessions` implementation is also a
+manual legacy recovery, not an automated rollback path. Its hooks do not read the new
+persisted `mode off` setting. Keep the unified plugin paused and do not enable
+legacy automation unless the legacy client process is explicitly started with
+`REMEM_MEMORY_AUTO_ENABLED=0`; restore its old Codex MCP, Claude plugin, and
+aliases from a known-good backup and verify all of them before removing the
+unified plugin. No rollback requires deleting cloud data, Keychain data, or
+project `.remem/` logs.
 
-```bash
-remem-dev-sessions recall \
-  --query "What did we decide about auth middleware?" \
-  --mode rich \
-  --synthesize \
-  --checkpoint-project my-project \
-  --checkpoint-session 2026-02-13-session-a
-```
-
-## MCP in Codex and Claude
-
-- Claude plugin bundles `.mcp.json` in `plugins/remem-memory`.
-- Codex install now writes `mcp_servers.remem` into `~/.codex/config.toml` via `scripts/install_codex_mcp.py`.
-
-For Codex, verify MCP config after install:
-
-```bash
-rg -n "mcp_servers.remem" ~/.codex/config.toml
-```
-
-If you change `REMEM_API_KEY` later, rerun `./install-codex-skill.sh` to refresh the Codex MCP env block.
-
-## Verify Setup
-
-Dry-run checkpoint:
-
-```bash
-remem-dev-sessions checkpoint --project smoke --session-id test --summary "ok" --dry-run --no-log
-```
-
-Dry-run rollup:
-
-```bash
-remem-dev-sessions rollup --project smoke --session-id test --dry-run --no-log
-```
-
-Dry-run recall:
-
-```bash
-remem-dev-sessions recall --query "smoke test" --dry-run --no-log
-```
+See [the Codex guide](docs/README.codex.md) for host-specific use and
+[the security guide](docs/SECURITY.md) for the data and trust boundary.

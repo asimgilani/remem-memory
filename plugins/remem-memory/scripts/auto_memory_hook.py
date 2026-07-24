@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,18 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+
+from memory_policy import (
+    contains_explicit_secret,
+    contains_secret,
+    is_off_record,
+)
+from remem_api import (
+    RememAPI,
+    _NoRedirectHandler,
+    _system_tls_context,
+    normalize_api_origin_for_environment,
+)
 
 try:
     import fcntl  # type: ignore
@@ -38,6 +51,51 @@ _DEFAULT_SUMMARY_MODEL_CLAUDE_CLI = "haiku"
 _DEFAULT_SUMMARY_MODEL_CODEX_CLI = "gpt-5.3-codex-spark"
 _DEFAULT_SUMMARY_MODEL_ANTHROPIC = "claude-3-5-haiku-20241022"
 _DEFAULT_SUMMARY_MODEL_OPENAI = "gpt-4.1-nano"
+_MAX_APPLY_PATCH_CHARS = 8_192
+_MAX_APPLY_PATCH_PATHS = 32
+_MAX_TOOL_PATH_CHARS = 2_000
+_APPLY_PATCH_PATH_PREFIXES = (
+    "*** Add File: ",
+    "*** Update File: ",
+    "*** Delete File: ",
+    "*** Move to: ",
+)
+_CODEX_DISABLED_SUMMARY_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "shell_snapshot",
+    "code_mode",
+    "code_mode_host",
+    "code_mode_only",
+    "workspace_dependencies",
+    "plugins",
+    "apps",
+    "multi_agent",
+    "multi_agent_v2",
+    "computer_use",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "skill_mcp_dependency_install",
+    "memories",
+    "hooks",
+)
+_BASE_CHILD_ENVIRONMENT_KEYS = (
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+)
+_CLAUDE_CHILD_ENVIRONMENT_KEYS = (
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +111,8 @@ class Config:
     log_path: Path
     enabled: bool
     rollup_on_session_end: bool
+    engineering_namespace: str | None = None
+    allow_local_dev: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,9 +182,101 @@ def _derive_session_id(payload: dict[str, Any]) -> str:
     return f"session-{_utc_now().strftime('%Y%m%dT%H%M%S')}"
 
 
-def _git_branch(cwd: Path) -> str | None:
+def _payload_contains_secret(
+    payload: object,
+    *,
+    trusted_fragments: tuple[str, ...] = (),
+) -> bool:
     try:
-        out = subprocess.check_output(["git", "-C", str(cwd), "branch", "--show-current"], stderr=subprocess.DEVNULL)
+        serialized = json.dumps(payload, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return True
+    for fragment in sorted(
+        (item for item in trusted_fragments if item),
+        key=len,
+        reverse=True,
+    ):
+        encoded_fragment = json.dumps(
+            fragment,
+            ensure_ascii=True,
+        )[1:-1]
+        serialized = serialized.replace(
+            encoded_fragment,
+            "[trusted-local-path]",
+        )
+    return contains_secret(serialized)
+
+
+def _safe_path(value: object, *, limit: int = 2000) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()[:limit]
+    if not cleaned or contains_secret(cleaned):
+        return ""
+    return cleaned
+
+
+def _safe_cwd_path(value: object, *, limit: int = 2000) -> str:
+    """Accept local path entropy but reject explicit credential-bearing paths."""
+
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()[:limit]
+    if (
+        not cleaned
+        or any(ord(character) < 32 for character in cleaned)
+        or contains_explicit_secret(cleaned)
+    ):
+        return ""
+    return cleaned
+
+
+def _safe_event_name(payload: dict[str, Any], default: str) -> str:
+    value = payload.get("hook_event_name")
+    if not isinstance(value, str):
+        return default
+    cleaned = value.strip()[:100]
+    return cleaned if cleaned and not contains_secret(cleaned) else default
+
+
+def _allowlisted_child_environment(
+    *extra_keys: str,
+) -> dict[str, str]:
+    """Build a fresh child environment from an explicit, narrow allowlist."""
+
+    allowed = (*_BASE_CHILD_ENVIRONMENT_KEYS, *extra_keys)
+    return {
+        name: os.environ[name]
+        for name in allowed
+        if isinstance(os.environ.get(name), str)
+    }
+
+
+def _resolved_executable(name: str) -> str | None:
+    """Resolve one executable before spawning so PATH is not re-evaluated."""
+
+    try:
+        candidate = shutil.which(name, path=os.environ.get("PATH"))
+        if not candidate:
+            return None
+        resolved = Path(candidate).resolve(strict=True)
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            return None
+        return str(resolved)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _git_branch(cwd: Path) -> str | None:
+    executable = _resolved_executable("git")
+    if executable is None:
+        return None
+    try:
+        out = subprocess.check_output(
+            [executable, "-C", str(cwd), "branch", "--show-current"],
+            stderr=subprocess.DEVNULL,
+            env=_allowlisted_child_environment(),
+        )
     except Exception:
         return None
     branch = out.decode("utf-8").strip()
@@ -133,11 +285,45 @@ def _git_branch(cwd: Path) -> str | None:
 
 def _load_config(payload: dict[str, Any]) -> Config:
     cwd_raw = payload.get("cwd")
-    cwd = Path(str(cwd_raw)).resolve() if isinstance(cwd_raw, str) and cwd_raw else Path.cwd().resolve()
-    project = os.getenv("REMEM_MEMORY_PROJECT") or cwd.name or "unknown"
-    session_id = os.getenv("REMEM_MEMORY_SESSION_ID") or _derive_session_id(payload)
-    api_url = os.getenv("REMEM_API_URL", _DEFAULT_API_URL).strip() or _DEFAULT_API_URL
+    safe_cwd = _safe_cwd_path(cwd_raw)
+    cwd_candidate = (
+        Path(safe_cwd).resolve() if safe_cwd else Path.cwd().resolve()
+    )
+    cwd = (
+        cwd_candidate
+        if not contains_explicit_secret(str(cwd_candidate))
+        else Path("/")
+    )
+    configured_project = os.getenv("REMEM_MEMORY_PROJECT", "").strip()
+    fallback_project = cwd.name or "unknown"
+    if contains_secret(fallback_project):
+        fallback_project = "unknown"
+    project = (
+        configured_project
+        if configured_project and not contains_secret(configured_project)
+        else fallback_project
+    )
+    configured_session = (
+        os.getenv("REMEM_MEMORY_SESSION_ID", "").strip()
+        or _derive_session_id(payload)
+    )
+    session_id = (
+        configured_session[:200]
+        if not contains_secret(configured_session)
+        else f"session-{_utc_now().strftime('%Y%m%dT%H%M%S')}"
+    )
+    raw_api_url = (
+        os.getenv("REMEM_API_URL", _DEFAULT_API_URL).strip()
+        or _DEFAULT_API_URL
+    )
+    api_url = normalize_api_origin_for_environment(
+        raw_api_url,
+        os.environ,
+    )
     api_key = os.getenv("REMEM_API_KEY", "").strip()
+    engineering_namespace = os.getenv(
+        "REMEM_MEMORY_ENGINEERING_NAMESPACE", ""
+    ).strip() or None
     state_path = _resolve_path(cwd, os.getenv("REMEM_MEMORY_STATE_FILE"), _DEFAULT_STATE_PATH)
     log_path = _resolve_path(cwd, os.getenv("REMEM_MEMORY_LOG_FILE"), _DEFAULT_LOG_PATH)
     return Config(
@@ -152,6 +338,8 @@ def _load_config(payload: dict[str, Any]) -> Config:
         log_path=log_path,
         enabled=_bool_env("REMEM_MEMORY_AUTO_ENABLED", True),
         rollup_on_session_end=_bool_env("REMEM_MEMORY_ROLLUP_ON_SESSION_END", True),
+        engineering_namespace=engineering_namespace,
+        allow_local_dev=api_url != _DEFAULT_API_URL,
     )
 
 
@@ -168,6 +356,51 @@ def _default_state(session_id: str) -> dict[str, Any]:
     }
 
 
+def _sanitize_state(
+    value: dict[str, Any],
+    fallback_session_id: str,
+) -> dict[str, Any]:
+    state = _default_state(fallback_session_id)
+    session_id = value.get("session_id")
+    if (
+        isinstance(session_id, str)
+        and session_id.strip()
+        and not contains_secret(session_id)
+    ):
+        state["session_id"] = session_id.strip()[:200]
+    project = value.get("project")
+    if (
+        isinstance(project, str)
+        and project.strip()
+        and not contains_secret(project)
+    ):
+        state["project"] = project.strip()[:200]
+    for name in (
+        "last_checkpoint_epoch",
+        "events_since_checkpoint",
+        "checkpoints_created",
+        "last_rollup_epoch",
+    ):
+        candidate = value.get(name)
+        if isinstance(candidate, (int, float)) and not isinstance(
+            candidate, bool
+        ):
+            state[name] = candidate
+    recent_events = value.get("recent_events")
+    state["recent_events"] = (
+        [
+            event
+            for event in recent_events
+            if isinstance(event, dict)
+            and not _payload_contains_secret(event)
+        ][-30:]
+        if isinstance(recent_events, list)
+        else []
+    )
+    state["transcript_path"] = _safe_path(value.get("transcript_path"))
+    return state
+
+
 def _load_state(path: Path, session_id: str) -> dict[str, Any]:
     if not path.exists():
         return _default_state(session_id)
@@ -181,28 +414,130 @@ def _load_state(path: Path, session_id: str) -> dict[str, Any]:
     state.update(parsed)
     if state.get("session_id") != session_id:
         state = _default_state(session_id)
-    if not isinstance(state.get("recent_events"), list):
-        state["recent_events"] = []
-    return state
+    return _sanitize_state(state, session_id)
+
+
+def _prepare_storage_parent(path: Path) -> None:
+    parent = path.parent
+    if parent.is_symlink():
+        raise OSError("unsafe memory storage path")
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        parent_status = os.lstat(parent)
+    except OSError:
+        raise OSError("unsafe memory storage path") from None
+    if not stat.S_ISDIR(parent_status.st_mode):
+        raise OSError("unsafe memory storage path")
+
+
+def _require_regular_or_absent(path: Path) -> None:
+    try:
+        target_status = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(target_status.st_mode):
+        raise OSError("unsafe memory storage path")
+
+
+def _open_regular_file(
+    path: Path,
+    flags: int,
+    mode: int = 0o600,
+) -> int:
+    _prepare_storage_parent(path)
+    _require_regular_or_absent(path)
+    protected_flags = flags | getattr(os, "O_CLOEXEC", 0)
+    protected_flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, protected_flags, mode)
+    try:
+        opened_status = os.fstat(descriptor)
+        current_status = os.lstat(path)
+        if (
+            not stat.S_ISREG(opened_status.st_mode)
+            or not stat.S_ISREG(current_status.st_mode)
+            or opened_status.st_dev != current_status.st_dev
+            or opened_status.st_ino != current_status.st_ino
+        ):
+            raise OSError("unsafe memory storage path")
+        os.fchmod(descriptor, mode)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    session_id = state.get("session_id")
+    fallback_session_id = (
+        session_id.strip()[:200]
+        if isinstance(session_id, str)
+        and session_id.strip()
+        and not contains_secret(session_id)
+        else "session-unknown"
+    )
+    safe_state = _sanitize_state(state, fallback_session_id)
+    _prepare_storage_parent(path)
+    _require_regular_or_absent(path)
+    descriptor = -1
+    temporary = ""
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(
+                safe_state,
+                stream,
+                ensure_ascii=True,
+                indent=2,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        _require_regular_or_absent(path)
+        os.replace(temporary, path)
+        temporary = ""
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
-def _append_ndjson(path: Path, record: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
+def _append_ndjson(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    trusted_fragments: tuple[str, ...] = (),
+) -> None:
+    if _payload_contains_secret(
+        record,
+        trusted_fragments=trusted_fragments,
+    ):
+        return
+    descriptor = _open_regular_file(
+        path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+    )
+    with os.fdopen(descriptor, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 @contextmanager
 def _state_lock(lock_path: Path):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+    descriptor = _open_regular_file(
+        lock_path,
+        os.O_RDWR | os.O_APPEND | os.O_CREAT,
+    )
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock_fh:
         if fcntl is not None:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
@@ -217,6 +552,8 @@ def _extract_tool_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(tool_name, str) or not tool_name.strip():
         return None
     tool_name = tool_name.strip()
+    if contains_secret(tool_name):
+        return None
     tool_input = payload.get("tool_input")
     tool_input = tool_input if isinstance(tool_input, dict) else {}
 
@@ -225,11 +562,25 @@ def _extract_tool_event(payload: dict[str, Any]) -> dict[str, Any] | None:
     if tool_name in {"Write", "Edit", "MultiEdit"}:
         file_path = tool_input.get("file_path") or tool_input.get("path")
         if isinstance(file_path, str) and file_path.strip():
+            if contains_secret(file_path):
+                return None
             files = [file_path.strip()]
             summary = f"{tool_name} {file_path.strip()}"
+    elif tool_name == "apply_patch":
+        patch = tool_input.get("patch") or tool_input.get("command")
+        if isinstance(patch, str):
+            extracted = _extract_apply_patch_paths(patch)
+            if extracted is None:
+                return None
+            files = extracted
+            if files:
+                label = "file" if len(files) == 1 else "files"
+                summary = f"apply_patch {len(files)} {label}"
     elif tool_name == "Bash":
         command = tool_input.get("command")
         if isinstance(command, str):
+            if contains_secret(command):
+                return None
             command = " ".join(command.strip().split())
             if len(command) > 180:
                 command = command[:177] + "..."
@@ -241,6 +592,47 @@ def _extract_tool_event(payload: dict[str, Any]) -> dict[str, Any] | None:
         "summary": summary,
         "files": files,
     }
+
+
+def _extract_apply_patch_paths(patch: str) -> list[str] | None:
+    files: list[str] = []
+    seen: set[str] = set()
+    bounded = patch[:_MAX_APPLY_PATCH_CHARS]
+    if len(patch) > len(bounded) and not bounded.endswith(("\n", "\r")):
+        bounded = bounded.rpartition("\n")[0]
+    in_envelope = False
+    for line in bounded.splitlines():
+        if line == "*** Begin Patch":
+            in_envelope = True
+            continue
+        if line == "*** End Patch":
+            break
+        if not in_envelope:
+            continue
+        prefix = next(
+            (
+                candidate
+                for candidate in _APPLY_PATCH_PATH_PREFIXES
+                if line.startswith(candidate)
+            ),
+            None,
+        )
+        if prefix is None:
+            continue
+        path = line[len(prefix) :].strip()
+        if (
+            not path
+            or len(path) > _MAX_TOOL_PATH_CHARS
+            or any(ord(character) < 32 for character in path)
+            or contains_secret(path)
+        ):
+            return None
+        if path not in seen:
+            seen.add(path)
+            files.append(path)
+        if len(files) >= _MAX_APPLY_PATCH_PATHS:
+            break
+    return files
 
 
 def _dedupe(items: list[str]) -> list[str]:
@@ -313,10 +705,14 @@ def _select_llm_provider() -> str | None:
     if forced is not None:
         return forced if _provider_available(forced) else None
 
-    for candidate in ("claude_cli", "codex_cli", "anthropic", "openai"):
-        if _provider_available(candidate):
-            return candidate
-    return None
+    harness = os.getenv("REMEM_MEMORY_HARNESS", "").strip().lower()
+    provider = {
+        "claude": "claude_cli",
+        "codex": "codex_cli",
+    }.get(harness)
+    if provider is None:
+        return None
+    return provider if _provider_available(provider) else None
 
 
 def _llm_model_for(provider: str) -> str:
@@ -340,13 +736,19 @@ def _extract_text_from_content(content: Any) -> str:
         for item in content:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") == "text" and isinstance(item.get("text"), str):
+            if (
+                item.get("type") in {"text", "input_text", "output_text"}
+                and isinstance(item.get("text"), str)
+            ):
                 text = item["text"].strip()
                 if text:
                     parts.append(text)
         return "\n".join(parts).strip()
     if isinstance(content, dict):
-        if content.get("type") == "text" and isinstance(content.get("text"), str):
+        if (
+            content.get("type") in {"text", "input_text", "output_text"}
+            and isinstance(content.get("text"), str)
+        ):
             return content["text"].strip()
     return ""
 
@@ -367,17 +769,139 @@ def _summarize_tool_use_items(items: Any) -> list[str]:
         if name == "Bash":
             cmd = tool_input.get("command")
             if isinstance(cmd, str) and cmd.strip():
+                if contains_secret(cmd):
+                    continue
                 cmd = " ".join(cmd.strip().split())
                 snippet = f"Bash {cmd[:180]}{'...' if len(cmd) > 180 else ''}"
         else:
             path = tool_input.get("file_path") or tool_input.get("path")
             if isinstance(path, str) and path.strip():
+                if contains_secret(path):
+                    continue
                 snippet = f"{name} {path.strip()}"
         out.append(snippet)
     return out
 
 
-def _read_transcript_excerpt(transcript_path: str) -> str:
+def _claude_transcript_turn(
+    row: dict[str, Any],
+) -> tuple[str, str] | None:
+    row_type = row.get("type")
+    if row_type not in {"user", "assistant"}:
+        return None
+    message = row.get("message")
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if row_type == "assistant" and role != "assistant":
+        return None
+    if row_type == "user" and role != "user":
+        return None
+
+    content = message.get("content")
+    text = _extract_text_from_content(content)
+
+    # Drop bulky tool_result payloads from user pseudo-messages.
+    if isinstance(content, list) and any(
+        isinstance(item, dict) and item.get("type") == "tool_result"
+        for item in content
+    ):
+        text = ""
+
+    if row_type == "assistant" and isinstance(content, list):
+        tool_summaries = _summarize_tool_use_items(content)
+        if tool_summaries:
+            tool_text = "\n".join(
+                f"[tool] {summary}"
+                for summary in tool_summaries[:3]
+            )
+            text = f"{text}\n{tool_text}".strip()
+
+    if not text:
+        return None
+    speaker = "User" if row_type == "user" else "Assistant"
+    return speaker, text
+
+
+def _codex_function_call_summary(
+    payload: dict[str, Any],
+) -> str | None:
+    name = payload.get("name")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or contains_secret(name)
+    ):
+        return None
+    name = name.strip()
+    arguments = payload.get("arguments")
+    if isinstance(arguments, str):
+        if contains_secret(arguments):
+            return None
+        try:
+            decoded = json.loads(arguments)
+        except json.JSONDecodeError:
+            decoded = (
+                {"command": arguments}
+                if name == "apply_patch"
+                else {}
+            )
+    else:
+        decoded = arguments
+    tool_input = decoded if isinstance(decoded, dict) else {}
+    if _payload_contains_secret(tool_input):
+        return None
+    event = _extract_tool_event(
+        {
+            "tool_name": name,
+            "tool_input": tool_input,
+        }
+    )
+    if event is None:
+        return None
+    summary = event.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    return f"[tool] {summary.strip()}"
+
+
+def _codex_transcript_turn(
+    row: dict[str, Any],
+) -> tuple[str, str] | None:
+    if row.get("type") != "response_item":
+        return None
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    if payload_type == "function_call":
+        summary = _codex_function_call_summary(payload)
+        return ("Assistant", summary) if summary else None
+    if payload_type != "message":
+        # In particular, never include function_call_output/tool-result rows.
+        return None
+    role = payload.get("role")
+    if role not in {"user", "assistant"}:
+        return None
+    content = payload.get("content")
+    if isinstance(content, list) and any(
+        isinstance(item, dict)
+        and item.get("type") in {"tool_result", "function_call_output"}
+        for item in content
+    ):
+        return None
+    text = _extract_text_from_content(content)
+    if not text:
+        return None
+    speaker = "User" if role == "user" else "Assistant"
+    return speaker, text
+
+
+def _read_transcript_excerpt(
+    transcript_path: str,
+    *,
+    source_harness: str | None = None,
+) -> str:
     path = Path(transcript_path)
     if not transcript_path or not path.exists():
         return ""
@@ -392,17 +916,82 @@ def _read_transcript_excerpt(transcript_path: str) -> str:
     max_messages = max(1, int(max_messages))
     max_chars = max(500, int(max_chars))
 
-    head: list[str] = []
-    tail: deque[str] = deque(maxlen=max(1, tail_lines or 1))
+    selected_harness = (
+        source_harness
+        if source_harness is not None
+        else os.getenv("REMEM_MEMORY_HARNESS", "")
+    ).strip().lower()
+    if selected_harness == "codex":
+        parsers = (_codex_transcript_turn,)
+    elif selected_harness == "claude":
+        parsers = (_claude_transcript_turn,)
+    else:
+        # Auto-detect only for legacy/manual callers without harness metadata.
+        parsers = (
+            _claude_transcript_turn,
+            _codex_transcript_turn,
+        )
+
+    suppress_turn = False
+
+    def filtered_turn(raw: str) -> str | None:
+        nonlocal suppress_turn
+        if not raw.strip():
+            return None
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(row, dict):
+            return None
+        turn = next(
+            (
+                parsed
+                for parser in parsers
+                if (parsed := parser(row)) is not None
+            ),
+            None,
+        )
+        if turn is None:
+            # Tool-result pseudo-messages do not start a new user turn.
+            return None
+        speaker, text = turn
+        lowered = text.lower()
+        if (
+            "<local-command-caveat>" in lowered
+            or "<local-command-stdout>" in lowered
+        ):
+            # Local command envelopes are not user-turn boundaries.
+            return None
+
+        if speaker == "User":
+            if is_off_record(text) or contains_secret(text):
+                # Suppress the complete turn, including later assistant and
+                # tool-call rows, until the next safe user message.
+                suppress_turn = True
+                return None
+            suppress_turn = False
+        elif suppress_turn:
+            return None
+
+        if contains_secret(text):
+            return None
+        return f"{speaker}: {text}"
+
+    head: list[tuple[int, str | None]] = []
+    tail: deque[tuple[int, str | None]] = deque(
+        maxlen=max(1, tail_lines or 1)
+    )
     total_lines = 0
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
             for total_lines, line in enumerate(fh, start=1):
-                line = line.rstrip("\n")
+                rendered = filtered_turn(line.rstrip("\n"))
+                record = (total_lines, rendered)
                 if head_lines and total_lines <= head_lines:
-                    head.append(line)
+                    head.append(record)
                 if tail_lines:
-                    tail.append(line)
+                    tail.append(record)
     except OSError:
         return ""
 
@@ -413,58 +1002,17 @@ def _read_transcript_excerpt(transcript_path: str) -> str:
     if not tail_list or total_lines <= head_lines:
         combined = head
     else:
-        tail_start_idx = max(0, total_lines - tail_lines)
-        overlap = max(0, head_lines - tail_start_idx)
-        combined = head + tail_list[overlap:]
+        combined = head + [
+            record
+            for record in tail_list
+            if record[0] > head_lines
+        ]
 
-    turns: list[str] = []
-    for raw in combined:
-        if not raw.strip():
-            continue
-        try:
-            row = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        row_type = row.get("type")
-        if row_type not in {"user", "assistant"}:
-            continue
-        message = row.get("message")
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if row_type == "assistant" and role != "assistant":
-            continue
-        if row_type == "user" and role != "user":
-            continue
-
-        content = message.get("content")
-        text = _extract_text_from_content(content)
-
-        # Drop bulky tool_result payloads from user pseudo-messages.
-        if isinstance(content, list) and any(isinstance(x, dict) and x.get("type") == "tool_result" for x in content):
-            text = ""
-
-        if row_type == "assistant" and isinstance(content, list):
-            if not text:
-                tool_summaries = _summarize_tool_use_items(content)
-                if tool_summaries:
-                    text = "\n".join(f"[tool] {s}" for s in tool_summaries[:3]).strip()
-            else:
-                tool_summaries = _summarize_tool_use_items(content)
-                if tool_summaries:
-                    text = f"{text}\n[tool] {tool_summaries[0]}".strip()
-
-        if not text:
-            continue
-
-        lowered = text.lower()
-        if "<local-command-caveat>" in lowered or "<local-command-stdout>" in lowered:
-            continue
-
-        speaker = "User" if row_type == "user" else "Assistant"
-        turns.append(f"{speaker}: {text}")
+    turns = [
+        rendered
+        for _, rendered in combined
+        if rendered is not None
+    ]
 
     turns = turns[-max_messages:]
     excerpt = "\n\n".join(turns).strip()
@@ -496,6 +1044,16 @@ def _extract_json_object(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _summary_https_opener():
+    return urllib_request.build_opener(
+        urllib_request.ProxyHandler({}),
+        urllib_request.HTTPSHandler(
+            context=_system_tls_context(),
+        ),
+        _NoRedirectHandler(),
+    )
+
+
 def _call_anthropic(prompt: str, *, model: str, max_tokens: int, timeout: int) -> str | None:
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -519,7 +1077,10 @@ def _call_anthropic(prompt: str, *, model: str, max_tokens: int, timeout: int) -
         },
     )
     try:
-        with urllib_request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        with _summary_https_opener().open(
+            req,
+            timeout=timeout,
+        ) as resp:
             data = json.loads(resp.read().decode("utf-8") or "{}")
         content = data.get("content")
         if isinstance(content, list) and content:
@@ -553,7 +1114,10 @@ def _call_openai(prompt: str, *, model: str, max_tokens: int, timeout: int) -> s
         },
     )
     try:
-        with urllib_request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        with _summary_https_opener().open(
+            req,
+            timeout=timeout,
+        ) as resp:
             data = json.loads(resp.read().decode("utf-8") or "{}")
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
@@ -567,17 +1131,20 @@ def _call_openai(prompt: str, *, model: str, max_tokens: int, timeout: int) -> s
 
 
 def _call_claude_cli(prompt: str, *, model: str, timeout: int) -> str | None:
-    if shutil.which("claude") is None:
+    executable = _resolved_executable("claude")
+    if executable is None:
         return None
 
     # Prevent nested Claude invocations from recursively triggering this plugin's hooks.
-    env = os.environ.copy()
+    env = _allowlisted_child_environment(
+        *_CLAUDE_CHILD_ENVIRONMENT_KEYS
+    )
     env["REMEM_MEMORY_AUTO_ENABLED"] = "0"
     env["REMEM_MEMORY_SUMMARY_ENABLED"] = "0"
     env.setdefault("NO_COLOR", "1")
 
     cmd = [
-        "claude",
+        executable,
         "-p",
         "--model",
         model,
@@ -587,23 +1154,26 @@ def _call_claude_cli(prompt: str, *, model: str, timeout: int) -> str | None:
         "--tools",
         "",
         "--disable-slash-commands",
-        "--setting-sources",
-        "user",
+        "--safe-mode",
         "--permission-mode",
         "bypassPermissions",
-        prompt,
     ]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-    except Exception:
-        return None
+    with tempfile.TemporaryDirectory(
+        prefix="remem-claude-summary-"
+    ) as workspace:
+        try:
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
+        except Exception:
+            return None
     if result.returncode != 0:
         return None
     return (result.stdout or "").strip() or None
@@ -624,7 +1194,8 @@ def _codex_summary_schema() -> dict[str, Any]:
 
 
 def _call_codex_cli(prompt: str, *, model: str, timeout: int) -> str | None:
-    if shutil.which("codex") is None:
+    executable = _resolved_executable("codex")
+    if executable is None:
         return None
 
     base_home = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
@@ -633,7 +1204,11 @@ def _call_codex_cli(prompt: str, *, model: str, timeout: int) -> str | None:
         return None
 
     with tempfile.TemporaryDirectory(prefix="remem-codex-summary-") as tmpdir:
-        codex_home = Path(tmpdir)
+        isolated_root = Path(tmpdir)
+        codex_home = isolated_root / "home"
+        workspace = isolated_root / "workspace"
+        codex_home.mkdir(mode=0o700)
+        workspace.mkdir(mode=0o700)
         try:
             shutil.copy2(auth_src, codex_home / "auth.json")
         except OSError:
@@ -651,31 +1226,59 @@ def _call_codex_cli(prompt: str, *, model: str, timeout: int) -> str | None:
         schema_path.write_text(json.dumps(_codex_summary_schema(), ensure_ascii=True), encoding="utf-8")
         out_path = codex_home / "last-message.txt"
 
-        env = os.environ.copy()
+        env = _allowlisted_child_environment()
         env["CODEX_HOME"] = str(codex_home)
         env.setdefault("NO_COLOR", "1")
 
         cmd = [
-            "codex",
+            executable,
             "exec",
+            "--strict-config",
             "--ephemeral",
             "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "-C",
+            str(workspace),
             "-s",
             "read-only",
+            "-c",
+            'web_search="disabled"',
+            "-c",
+            "skills.bundled.enabled=false",
+            "-c",
+            "skills.include_instructions=false",
+            "-c",
+            "project_doc_max_bytes=0",
+            "-c",
+            "include_environment_context=false",
+            "-c",
+            "include_apps_instructions=false",
+            "-c",
+            "include_collaboration_mode_instructions=false",
+            "-c",
+            "include_permissions_instructions=false",
             "-m",
             model,
-            "--color",
-            "never",
-            "--output-schema",
-            str(schema_path),
-            "--output-last-message",
-            str(out_path),
-            "-",
         ]
+        for feature in _CODEX_DISABLED_SUMMARY_FEATURES:
+            cmd.extend(("--disable", feature))
+        cmd.extend(
+            [
+                "--color",
+                "never",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(out_path),
+                "-",
+            ]
+        )
         try:
             subprocess.run(
                 cmd,
                 input=prompt,
+                cwd=workspace,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -718,7 +1321,10 @@ def _generate_checkpoint_structured_summary(
 ) -> StructuredSummary | None:
     if not _llm_enabled() or not transcript_path:
         return None
-    excerpt = _read_transcript_excerpt(transcript_path)
+    excerpt = _read_transcript_excerpt(
+        transcript_path,
+        source_harness=os.getenv("REMEM_MEMORY_HARNESS", ""),
+    )
     if not excerpt:
         return None
 
@@ -922,10 +1528,12 @@ def _build_checkpoint_payload(
     if next_actions:
         lines.extend(["## Next Actions", *[f"- {item}" for item in next_actions], ""])
 
-    source_id = f"auto-checkpoint:{project_slug}:{session_slug}:{kind}:{timestamp}".replace(":", "").replace("-", "")
+    source_id = (
+        f"auto-checkpoint:{project_slug}:{session_slug}:{kind}:{timestamp}"
+    )
     source_id = source_id[:200]
 
-    return {
+    result = {
         "title": f"{config.project} | {config.session_id} | {kind} checkpoint (auto)",
         "content": "\n".join(lines).strip(),
         "metadata": {
@@ -946,7 +1554,11 @@ def _build_checkpoint_payload(
                 f"session:{session_slug}",
                 f"checkpoint:{kind}",
             ],
-            "automation": "claude-hook",
+            "automation": "remem-memory-hook",
+            "source_harness": (
+                os.getenv("REMEM_MEMORY_HARNESS", "").strip()
+                or "unknown"
+            ),
             "hook_event": hook_event,
             **llm_meta,
         },
@@ -956,6 +1568,9 @@ def _build_checkpoint_payload(
         "mime_type": "text/markdown",
         "return_id": False,
     }
+    if config.engineering_namespace is not None:
+        result["namespace"] = config.engineering_namespace
+    return result
 
 
 def _load_checkpoint_rows(log_path: Path, *, project: str, session_id: str) -> list[dict[str, Any]]:
@@ -970,6 +1585,8 @@ def _load_checkpoint_rows(log_path: Path, *, project: str, session_id: str) -> l
         except json.JSONDecodeError:
             continue
         if not isinstance(row, dict):
+            continue
+        if row.get("event") != "auto_checkpoint":
             continue
         payload = row.get("payload")
         if not isinstance(payload, dict):
@@ -989,6 +1606,16 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     timestamp = _utc_now_iso()
     project_slug = _slug(config.project)
     session_slug = _slug(config.session_id)
+    rolling = (
+        os.getenv("REMEM_MEMORY_HARNESS", "").strip().lower()
+        == "codex"
+    )
+    rollup_trigger = os.getenv(
+        "REMEM_MEMORY_ROLLUP_TRIGGER",
+        "SessionEnd",
+    ).strip()
+    if rollup_trigger not in {"PreCompact", "SessionEnd"}:
+        rollup_trigger = "SessionEnd"
     files_touched: list[str] = []
     checkpoints: list[str] = []
     checkpoint_summaries: list[str] = []
@@ -1041,7 +1668,13 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     rollup_summary = (
         structured.summary
         if structured and structured.summary
-        else "Automatic final rollup generated from checkpoint activity captured during this session."
+        else (
+            "Automatic rolling rollup generated from checkpoint activity "
+            "captured during this session."
+            if rolling
+            else "Automatic final rollup generated from checkpoint activity "
+            "captured during this session."
+        )
     )
     if structured:
         decisions = structured.decisions or decisions
@@ -1049,7 +1682,11 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
         next_actions = structured.next_actions or next_actions
 
     lines = [
-        "# Coding Session Rollup (Auto)",
+        (
+            "# Coding Session Rolling Rollup (Auto)"
+            if rolling
+            else "# Coding Session Rollup (Auto)"
+        ),
         f"- Project: {config.project}",
         f"- Session: {config.session_id}",
         f"- Generated: {timestamp}",
@@ -1070,7 +1707,7 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     if next_actions:
         lines.extend(["## Next Actions", *[f"- {item}" for item in next_actions], ""])
 
-    source_id = f"auto-rollup:{project_slug}:{session_slug}:{timestamp}".replace(":", "").replace("-", "")
+    source_id = f"auto-rollup:{project_slug}:{session_slug}:{timestamp}"
     source_id = source_id[:200]
 
     llm_meta: dict[str, Any] = {}
@@ -1080,8 +1717,11 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
             "llm_summary_model": structured.model,
         }
 
-    return {
-        "title": f"{config.project} | {config.session_id} | final rollup (auto)",
+    result = {
+        "title": (
+            f"{config.project} | {config.session_id} | "
+            f"{'rolling' if rolling else 'final'} rollup (auto)"
+        ),
         "content": "\n".join(lines).strip(),
         "metadata": {
             "project": config.project,
@@ -1100,8 +1740,12 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
                 f"session:{session_slug}",
                 "checkpoint:final",
             ],
-            "automation": "claude-hook",
-            "hook_event": "SessionEnd",
+            "automation": "remem-memory-hook",
+            "source_harness": (
+                os.getenv("REMEM_MEMORY_HARNESS", "").strip()
+                or "unknown"
+            ),
+            "hook_event": rollup_trigger,
             **llm_meta,
         },
         "source": "quick_capture",
@@ -1110,30 +1754,29 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
         "mime_type": "text/markdown",
         "return_id": False,
     }
+    if config.engineering_namespace is not None:
+        result["namespace"] = config.engineering_namespace
+    return result
 
 
 def _ingest(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
-    if not config.api_key:
+    if (
+        _payload_contains_secret(
+            payload,
+            trusted_fragments=(str(config.cwd),),
+        )
+        or not config.api_key
+    ):
         return None
-    url = f"{config.api_url.rstrip('/')}/v1/documents/ingest"
-    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-    req = urllib_request.Request(
-        url=url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-        },
-    )
     try:
-        with urllib_request.urlopen(req, timeout=20) as resp:  # nosec B310
-            data = resp.read().decode("utf-8")
-            return json.loads(data) if data else {"ok": True}
-    except urllib_error.HTTPError as exc:
-        sys.stderr.write(f"[remem-memory] ingest HTTP {exc.code}\n")
-    except Exception as exc:  # pragma: no cover
-        sys.stderr.write(f"[remem-memory] ingest failed: {exc}\n")
+        api = RememAPI(
+            api_url=config.api_url,
+            api_key=config.api_key,
+            allow_local_dev=config.allow_local_dev,
+        )
+        return api.ingest(payload, None, timeout=20)
+    except Exception:  # pragma: no cover
+        sys.stderr.write("[remem-memory] ingest failed\n")
     return None
 
 
@@ -1161,6 +1804,7 @@ def _persist_checkpoint(
     _append_ndjson(
         config.log_path,
         {"timestamp": _utc_now_iso(), "event": "auto_checkpoint", "payload": payload, "response": response},
+        trusted_fragments=(str(config.cwd),),
     )
 
 
@@ -1173,6 +1817,7 @@ def _persist_rollup(config: Config) -> None:
     _append_ndjson(
         config.log_path,
         {"timestamp": _utc_now_iso(), "event": "auto_rollup", "payload": payload, "response": response},
+        trusted_fragments=(str(config.cwd),),
     )
 
 
@@ -1195,9 +1840,9 @@ def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
         state["project"] = config.project
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path.strip():
-            state["transcript_path"] = transcript_path.strip()
+        transcript_path = _safe_path(payload.get("transcript_path"))
+        if transcript_path:
+            state["transcript_path"] = transcript_path
         recent = state.get("recent_events")
         recent = recent if isinstance(recent, list) else []
         recent.append(event)
@@ -1208,7 +1853,7 @@ def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
             _persist_checkpoint(
                 config=config,
                 kind="interval",
-                hook_event=str(payload.get("hook_event_name") or "PostToolUse"),
+                hook_event=_safe_event_name(payload, "PostToolUse"),
                 state=state,
             )
             state["last_checkpoint_epoch"] = _utc_now().timestamp()
@@ -1223,9 +1868,9 @@ def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path.strip():
-            state["transcript_path"] = transcript_path.strip()
+        transcript_path = _safe_path(payload.get("transcript_path"))
+        if transcript_path:
+            state["transcript_path"] = transcript_path
         events_since = int(state.get("events_since_checkpoint") or 0)
         if events_since <= 0:
             _save_state(config.state_path, state)
@@ -1233,7 +1878,7 @@ def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
         _persist_checkpoint(
             config=config,
             kind="milestone",
-            hook_event=str(payload.get("hook_event_name") or "TaskCompleted"),
+            hook_event=_safe_event_name(payload, "TaskCompleted"),
             state=state,
         )
         state["last_checkpoint_epoch"] = _utc_now().timestamp()
@@ -1249,9 +1894,9 @@ def _handle_pre_compact(config: Config, payload: dict[str, Any]) -> int:
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
         state["project"] = config.project
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path.strip():
-            state["transcript_path"] = transcript_path.strip()
+        transcript_path = _safe_path(payload.get("transcript_path"))
+        if transcript_path:
+            state["transcript_path"] = transcript_path
 
         # Avoid spamming duplicate checkpoints if PreCompact fires repeatedly without new activity.
         last_epoch = float(state.get("last_checkpoint_epoch") or 0.0)
@@ -1263,7 +1908,7 @@ def _handle_pre_compact(config: Config, payload: dict[str, Any]) -> int:
         _persist_checkpoint(
             config=config,
             kind="milestone",
-            hook_event=str(payload.get("hook_event_name") or "PreCompact"),
+            hook_event=_safe_event_name(payload, "PreCompact"),
             state=state,
         )
         state["last_checkpoint_epoch"] = _utc_now().timestamp()
@@ -1278,15 +1923,15 @@ def _handle_session_end(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path.strip():
-            state["transcript_path"] = transcript_path.strip()
+        transcript_path = _safe_path(payload.get("transcript_path"))
+        if transcript_path:
+            state["transcript_path"] = transcript_path
         events_since = int(state.get("events_since_checkpoint") or 0)
         if events_since > 0:
             _persist_checkpoint(
                 config=config,
                 kind="milestone",
-                hook_event=str(payload.get("hook_event_name") or "SessionEnd"),
+                hook_event=_safe_event_name(payload, "SessionEnd"),
                 state=state,
             )
             state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
@@ -1311,19 +1956,27 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv or sys.argv[1:])
-    payload = _read_stdin_json()
+def handle_payload(mode: str, payload: dict[str, Any]) -> int:
+    """Run one existing engineering hook mode for an already-parsed payload."""
+
     config = _load_config(payload)
     if not config.enabled:
         return 0
-    if args.mode == "post_tool_use":
+    if mode == "post_tool_use":
         return _handle_post_tool_use(config, payload)
-    if args.mode == "task_completed":
+    if mode == "task_completed":
         return _handle_task_completed(config, payload)
-    if args.mode == "pre_compact":
+    if mode == "pre_compact":
         return _handle_pre_compact(config, payload)
-    return _handle_session_end(config, payload)
+    if mode == "session_end":
+        return _handle_session_end(config, payload)
+    raise ValueError(f"unsupported mode: {mode}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv or sys.argv[1:])
+    payload = _read_stdin_json()
+    return handle_payload(args.mode, payload)
 
 
 if __name__ == "__main__":

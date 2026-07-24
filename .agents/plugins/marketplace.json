@@ -1,0 +1,20 @@
+{
+  "name": "remem-memory",
+  "interface": {
+    "displayName": "Remem Memory"
+  },
+  "plugins": [
+    {
+      "name": "remem-memory",
+      "source": {
+        "source": "local",
+        "path": "./plugins/remem-memory"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

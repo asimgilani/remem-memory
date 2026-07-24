@@ -12,10 +12,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
+_PLUGIN_SCRIPTS = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "remem-memory"
+    / "scripts"
+)
+if str(_PLUGIN_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_SCRIPTS))
+
+import remem_api  # noqa: E402
 
 _SOURCE_CHOICES = ("api", "quick_capture", "folder_sync", "gmail")
 _KIND_CHOICES = ("interval", "milestone", "final", "manual")
+_DEFAULT_API_URL = "https://api.remem.io"
 
 
 def _slug(value: str) -> str:
@@ -30,9 +40,13 @@ def _utc_now_iso() -> str:
 
 def _git_branch(repo_root: str) -> str | None:
     try:
+        environment = os.environ.copy()
+        environment.pop("REMEM_API_KEY", None)
+        environment.pop("REMEM_API_KEY_FD", None)
         out = subprocess.check_output(
             ["git", "-C", repo_root, "branch", "--show-current"],
             stderr=subprocess.DEVNULL,
+            env=environment,
         )
         branch = out.decode("utf-8").strip()
         return branch or None
@@ -160,11 +174,16 @@ def ingest_checkpoint(
     api_key: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(f"{api_url.rstrip('/')}/v1/documents/ingest", headers=headers, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+    api = remem_api.RememAPI(
+        api_url,
+        api_key,
+        allow_local_dev=True,
+    )
+    return api.ingest(
+        payload,
+        None,
+        timeout=30.0,
+    )
 
 
 def append_checkpoint_log(log_file: str, record: dict[str, Any]) -> None:
@@ -175,7 +194,10 @@ def append_checkpoint_log(log_file: str, record: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        allow_abbrev=False,
+    )
     parser.add_argument("--project", required=True, help="Project identifier (for metadata and tags).")
     parser.add_argument("--session-id", required=True, help="Session identifier used to group checkpoints.")
     parser.add_argument("--kind", choices=_KIND_CHOICES, default="interval", help="Checkpoint type.")
@@ -192,8 +214,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--source-path", help="Optional source path/URI override.")
     parser.add_argument("--return-id", action="store_true", help="Request immediate document_id in ingest response.")
     parser.add_argument("--ingest", action="store_true", help="Send payload to Remem API after building.")
-    parser.add_argument("--api-url", default=os.getenv("REMEM_API_URL", ""), help="Remem API base URL.")
-    parser.add_argument("--api-key", default=os.getenv("REMEM_API_KEY", ""), help="Remem API key.")
+    parser.add_argument(
+        "--api-url",
+        default=os.getenv("REMEM_API_URL", _DEFAULT_API_URL),
+        help="Remem API base URL.",
+    )
     parser.add_argument("--log-file", default=".remem/session-checkpoints.ndjson", help="Local NDJSON log file.")
     parser.add_argument("--no-log", action="store_true", help="Skip writing local log entry.")
     parser.add_argument("--dry-run", action="store_true", help="Print payload and exit without ingest.")
@@ -201,17 +226,41 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    arguments = list(argv or sys.argv[1:])
+    if any(
+        argument.split("=", 1)[0].startswith("--api-k")
+        for argument in arguments
+    ):
+        print(
+            "error: --api-key is not supported; use remem-memory auth",
+            file=sys.stderr,
+        )
+        return 2
+    args = parse_args(arguments)
     payload = build_checkpoint_payload(args)
 
     record: dict[str, Any] = {"timestamp": _utc_now_iso(), "payload": payload}
     response: dict[str, Any] | None = None
 
     if args.ingest and not args.dry_run:
-        if not args.api_url or not args.api_key:
-            print("error: --ingest requires REMEM_API_URL and REMEM_API_KEY (or --api-url/--api-key)", file=sys.stderr)
+        try:
+            api_url, api_key = remem_api.resolve_api_access(
+                args.api_url
+            )
+        except Exception:
+            print("error: invalid Remem API URL", file=sys.stderr)
             return 2
-        response = ingest_checkpoint(api_url=args.api_url, api_key=args.api_key, payload=payload)
+        if not api_key:
+            print(
+                "error: Remem credential is not configured",
+                file=sys.stderr,
+            )
+            return 2
+        response = ingest_checkpoint(
+            api_url=api_url,
+            api_key=api_key,
+            payload=payload,
+        )
         record["response"] = response
 
     if not args.no_log:
