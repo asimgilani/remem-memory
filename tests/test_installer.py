@@ -559,10 +559,65 @@ class SecureInstallerTests(unittest.TestCase):
             self.assertFalse(fixture.home.exists())
             self.assertNotIn(("uv", "venv", str(fixture.repo_root / ".venv")), runner.commands)
 
+    def test_no_supported_client_fails_before_any_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InstallerFixture(directory)
+            keychain = FakeKeychain()
+            runner = FakeRunner()
+            before = sorted(
+                item.relative_to(fixture.repo_root)
+                for item in fixture.repo_root.rglob("*")
+            )
+
+            result, output = fixture.install(runner=runner, keychain=keychain)
+
+            after = sorted(
+                item.relative_to(fixture.repo_root)
+                for item in fixture.repo_root.rglob("*")
+            )
+            self.assertEqual(result, 1)
+            self.assertIn("install Codex or Claude Code first", output)
+            self.assertNotIn("installed successfully", output)
+            self.assertNotIn("Finish activation", output)
+            self.assertEqual(keychain.calls, [])
+            self.assertEqual(before, after)
+            self.assertFalse(fixture.home.exists())
+            self.assertFalse(
+                any(command[-1:] == ("--probe",) for command in runner.commands)
+            )
+
+    def test_success_output_matches_verified_clients(self) -> None:
+        cases = (
+            (True, False, ("Codex Desktop", "Codex CLI"), ("Claude Code:",)),
+            (False, True, ("Claude Code:", "/reload-plugins"), ("Codex Desktop", "Codex CLI")),
+            (True, True, ("Codex Desktop", "Codex CLI", "Claude Code:"), ()),
+        )
+        for codex, claude, included, excluded in cases:
+            with self.subTest(codex=codex, claude=claude), tempfile.TemporaryDirectory() as directory:
+                fixture = InstallerFixture(directory)
+                result, output = fixture.install(
+                    runner=FakeRunner(codex=codex, claude=claude)
+                )
+
+                self.assertEqual(result, 0, output)
+                self.assertIn("Remem Memory installed successfully.", output)
+                self.assertIn("Finish activation:", output)
+                self.assertIn(
+                    "env -u REMEM_API_KEY ~/.local/bin/remem-memory status",
+                    output,
+                )
+                self.assertIn("~/.local/bin/remem-memory auth", output)
+                for phrase in included:
+                    self.assertIn(phrase, output)
+                for phrase in excluded:
+                    self.assertNotIn(phrase, output)
+                _assert_secret_absent(self, _CANARY, output)
+                self.assertNotIn("dangerously-bypass-hook-trust", output)
+
     def test_installs_stdlib_command_aliases_and_skill_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = InstallerFixture(directory)
-            runner = FakeRunner()
+            runner = FakeRunner(codex=True)
 
             result, output = fixture.install(runner=runner)
 
@@ -602,7 +657,7 @@ class SecureInstallerTests(unittest.TestCase):
             fixture = InstallerFixture(directory)
             venv = fixture.repo_root / ".venv"
             venv.write_text("user-owned\n", encoding="utf-8")
-            runner = FakeRunner()
+            runner = FakeRunner(codex=True)
 
             result, output = fixture.install(runner=runner)
 
@@ -960,7 +1015,7 @@ class SecureInstallerTests(unittest.TestCase):
                     f'REMEM_API_KEY = "{credential}"\n'
                 ),
             )
-            runner = FakeRunner()
+            runner = FakeRunner(codex=True)
 
             result, output = fixture.install(
                 runner=runner,

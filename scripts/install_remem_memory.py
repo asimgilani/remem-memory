@@ -129,6 +129,12 @@ class _LegacyConfig:
 
 
 @dataclass(frozen=True)
+class _InstalledClients:
+    codex: bool
+    claude: bool
+
+
+@dataclass(frozen=True)
 class _CommandResult:
     returncode: int
     stdout: str
@@ -536,11 +542,13 @@ class Installer:
         path_entries.insert(0, local_bin)
         self.child_environment["PATH"] = os.pathsep.join(path_entries)
 
-    def run(self) -> None:
+    def run(self) -> _InstalledClients:
         self._preflight()
         self._validate_repository()
         codex_available = self._tool_available("codex")
         claude_available = self._tool_available("claude")
+        if not codex_available and not claude_available:
+            raise InstallerError("install Codex or Claude Code first")
         if codex_available:
             self._validate_harness_root(self.codex_home)
         if claude_available:
@@ -575,6 +583,11 @@ class Installer:
 
         if claude_available:
             self._cleanup_claude_legacy(*claude_cleanup)
+
+        return _InstalledClients(
+            codex=codex_ready,
+            claude=claude_available,
+        )
 
     def _preflight(self) -> None:
         for tool in ("uv",):
@@ -1132,6 +1145,53 @@ class Installer:
         )
 
 
+def _activation_guidance(installed: _InstalledClients) -> str:
+    lines = [
+        "Remem Memory installed successfully.",
+        "",
+        "Finish activation:",
+        (
+            "1. Verify Keychain: env -u REMEM_API_KEY "
+            "~/.local/bin/remem-memory status"
+        ),
+        (
+            "   If credential is missing: "
+            "~/.local/bin/remem-memory auth"
+        ),
+        "2. Reload or restart each installed client:",
+    ]
+    if installed.codex:
+        lines.extend(
+            (
+                (
+                    "   Codex Desktop: Plugins -> Remem Memory -> Hooks -> "
+                    "Review; inspect and trust all five hooks."
+                ),
+                (
+                    "   Codex CLI: start interactive Codex, enter /hooks, "
+                    "select Remem Memory, inspect and approve all five hooks."
+                ),
+            )
+        )
+    if installed.claude:
+        lines.extend(
+            (
+                (
+                    "   Claude Code: run /reload-plugins, or restart and "
+                    "start a new session."
+                ),
+                (
+                    "   Claude Code has no separate Codex hook approval; "
+                    "its /hooks view is read-only."
+                ),
+            )
+        )
+    lines.append(
+        "3. Confirm credential: configured, plugin enabled, and Codex hooks trusted."
+    )
+    return "\n".join(lines)
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
@@ -1149,17 +1209,18 @@ def main(
         )
         return 2
     try:
-        Installer(
+        installer = Installer(
             home=home,
             environment=environment,
             runner=runner,
             keychain=keychain,
             repo_root=repo_root,
-        ).run()
+        )
+        installed = installer.run()
     except InstallerError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    print("Remem Memory setup complete.")
+    print(_activation_guidance(installed))
     return 0
 
 
