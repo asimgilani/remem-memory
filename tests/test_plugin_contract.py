@@ -75,6 +75,7 @@ class PluginContractTests(unittest.TestCase):
                 self.assertIn("remem_memory_hook.py", command)
                 self.assertIn("${CLAUDE_PLUGIN_ROOT}", command)
                 self.assertIn(f"--mode {mode}", command)
+                self.assertIn("--harness", command)
 
         serialized = json.dumps(hooks)
         self.assertNotIn('"async"', serialized)
@@ -170,6 +171,46 @@ class PluginContractTests(unittest.TestCase):
                         observed = json.loads(completed.stdout)
                         self.assertEqual(observed["origin"], "plugin")
                         self.assertEqual(observed["argv"][0], "--mode")
+                        self.assertEqual(observed["argv"][-2:], [
+                            "--harness",
+                            harness,
+                        ])
+
+    def test_unresolved_claude_root_token_selects_codex_before_fallback(self):
+        hooks = load_json("plugins/remem-memory/hooks/hooks.json")["hooks"]
+        command = hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+        arguments = shlex.split(command)
+
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory) / "plugin"
+            scripts = plugin_root / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "remem_memory_hook.py").write_text(
+                (
+                    "import json,sys\n"
+                    "print(json.dumps({'argv': sys.argv[1:]}))\n"
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.pop("CLAUDE_PLUGIN_ROOT", None)
+            environment["PLUGIN_ROOT"] = str(plugin_root)
+
+            completed = subprocess.run(
+                arguments,
+                cwd=plugin_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        observed = json.loads(completed.stdout)
+        self.assertEqual(
+            observed["argv"][-2:],
+            ["--harness", "codex"],
+        )
 
 
 if __name__ == "__main__":

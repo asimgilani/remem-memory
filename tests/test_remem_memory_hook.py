@@ -4,10 +4,13 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+from dataclasses import fields
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +38,8 @@ _API = importlib.util.module_from_spec(_API_SPEC)
 assert _API_SPEC and _API_SPEC.loader
 sys.modules[_API_SPEC.name] = _API
 _API_SPEC.loader.exec_module(_API)
+
+import remem_routing as _ROUTING
 
 
 class FakeAPI:
@@ -73,6 +78,18 @@ class FailingAPI(FakeAPI):
 
     def query(self, prompt, namespaces, timeout):
         raise RuntimeError(self.message)
+
+
+class RoutedAPI(FakeAPI):
+    def __init__(self, connection_id, query_response=None, query_error=None):
+        super().__init__(query_response)
+        self.connection_id = connection_id
+        self.query_error = query_error
+
+    def query(self, prompt, namespaces, timeout):
+        if self.query_error is not None:
+            raise self.query_error
+        return super().query(prompt, namespaces, timeout)
 
 
 class FakeResponse:
@@ -265,8 +282,52 @@ def stop_payload(*, session_id="s1", turn_id="t1", assistant=None):
     }
 
 
+def routing_config(
+    *,
+    connections=None,
+    global_routes=None,
+    client_routes=None,
+    migration_write_blocked=False,
+):
+    selected_connections = connections or (
+        _ROUTING.Connection("primary", "Primary", "default", True),
+    )
+    return _ROUTING.RoutingConfig(
+        schema_version=1,
+        revision=1,
+        connections=tuple(selected_connections),
+        global_routes=_ROUTING.RouteLayer(global_routes or {}),
+        client_routes={
+            client: _ROUTING.RouteLayer(routes)
+            for client, routes in (client_routes or {}).items()
+        },
+        mcp_connections={},
+        legacy_namespace_migration_completed=True,
+        migration_write_blocked=migration_write_blocked,
+        deprecations=(),
+    )
+
+
+def routed(config, events=None):
+    def resolve(behavior, client):
+        if events is not None:
+            events.append(("route", behavior, client))
+        return (
+            config,
+            _ROUTING.resolve_routes(
+                config,
+                behavior=behavior,
+                client=client,
+            ),
+        )
+
+    return resolve
+
+
 class RememAPITests(unittest.TestCase):
-    def test_query_uses_fixed_endpoint_headers_and_bounded_request(self) -> None:
+    def test_readable_query_omits_namespaces_and_uses_fixed_transport(
+        self,
+    ) -> None:
         captured = {}
 
         def opener(request, timeout):
@@ -280,14 +341,14 @@ class RememAPITests(unittest.TestCase):
             opener=opener,
         )
 
-        response = api.query("history", ["*"], timeout=2.0)
+        response = api.query("history", None, timeout=2.0)
 
         request = captured["request"]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(response, {"results": []})
         self.assertEqual(request.full_url, "https://api.remem.io/v1/query")
         self.assertEqual(body["query"], "history")
-        self.assertEqual(body["namespaces"], ["*"])
+        self.assertNotIn("namespaces", body)
         self.assertEqual(body["mode"], "fast")
         self.assertEqual(body["max_results"], 4)
         self.assertIs(body["include_facts"], True)
@@ -299,6 +360,20 @@ class RememAPITests(unittest.TestCase):
         self.assertEqual(
             headers["x-api-key"], "vlt_test-credential-not-real"
         )
+
+    def test_explicit_query_sends_only_selected_namespaces(self) -> None:
+        bodies = []
+
+        def opener(request, timeout):
+            del timeout
+            bodies.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse({"results": []})
+
+        api = _API.RememAPI("https://api.remem.io", "test-key", opener=opener)
+
+        api.query("history", ["alpha", "beta"], timeout=2.0)
+
+        self.assertEqual(bodies[0]["namespaces"], ["alpha", "beta"])
 
     def test_ingest_adds_namespace_only_when_configured(self) -> None:
         bodies = []
@@ -325,6 +400,223 @@ class RememAPITests(unittest.TestCase):
 
         self.assertEqual(str(caught.exception), "Remem request failed")
         self.assertNotIn("secret-canary", str(caught.exception))
+
+    def test_http_error_kind_is_fixed_and_response_body_is_never_read(
+        self,
+    ) -> None:
+        class SecretBody:
+            def read(self, amount=None):
+                del amount
+                raise AssertionError("response body must not be read")
+
+            def close(self):
+                return None
+
+        cases = (
+            (401, "auth"),
+            (403, "permission"),
+            (404, "namespace"),
+            (400, "request"),
+            (422, "request"),
+        )
+        for status, expected_kind in cases:
+            with self.subTest(status=status):
+                def opener(request, timeout, selected=status):
+                    del request, timeout
+                    raise urllib.error.HTTPError(
+                        "https://api.remem.io/v1/query",
+                        selected,
+                        "vlt_secret-response-canary",
+                        {},
+                        SecretBody(),
+                    )
+
+                api = _API.RememAPI(
+                    "https://api.remem.io",
+                    "test-key",
+                    opener=opener,
+                )
+
+                with self.assertRaises(_API.RememAPIError) as caught:
+                    api.query("history", ["alpha"], timeout=2.0)
+
+                self.assertEqual(
+                    getattr(caught.exception, "kind", None),
+                    expected_kind,
+                )
+                self.assertEqual(
+                    str(caught.exception),
+                    "Remem request failed",
+                )
+                self.assertNotIn(
+                    "secret-response-canary",
+                    str(caught.exception),
+                )
+
+    def test_transient_requests_retry_exactly_twice_with_stable_request(
+        self,
+    ) -> None:
+        requests = []
+        sleeps = []
+
+        def opener(request, timeout):
+            requests.append(
+                {
+                    "body": request.data,
+                    "headers": {
+                        key.lower(): value
+                        for key, value in request.headers.items()
+                    },
+                    "timeout": timeout,
+                }
+            )
+            if len(requests) < 3:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    503,
+                    "unavailable",
+                    {},
+                    None,
+                )
+            return FakeResponse({"results": []})
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "test-key",
+            opener=opener,
+            sleep=sleeps.append,
+            idempotency_factory=lambda: "stable-idempotency",
+        )
+
+        response = api.query("history", ["alpha"], timeout=2.0)
+
+        self.assertEqual(response, {"results": []})
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual(
+            {request["body"] for request in requests},
+            {requests[0]["body"]},
+        )
+        self.assertEqual(
+            {
+                request["headers"].get("idempotency-key")
+                for request in requests
+            },
+            {"stable-idempotency"},
+        )
+
+    def test_non_transient_failure_never_retries(self) -> None:
+        attempts = []
+
+        def opener(request, timeout):
+            attempts.append((request.data, timeout))
+            raise urllib.error.HTTPError(
+                request.full_url,
+                403,
+                "forbidden",
+                {},
+                None,
+            )
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "test-key",
+            opener=opener,
+            sleep=lambda delay: self.fail(f"unexpected sleep {delay}"),
+        )
+
+        with self.assertRaises(_API.RememAPIError) as caught:
+            api.ingest(
+                {
+                    "title": "Durable conversation context",
+                    "source_id": "stable-source",
+                },
+                "explicit",
+                timeout=2.0,
+            )
+
+        self.assertEqual(getattr(caught.exception, "kind", None), "permission")
+        self.assertEqual(len(attempts), 1)
+
+    def test_transient_ingest_keeps_destination_source_and_idempotency(
+        self,
+    ) -> None:
+        attempts = []
+
+        def opener(request, timeout):
+            del timeout
+            attempts.append(
+                (
+                    json.loads(request.data.decode("utf-8")),
+                    {
+                        key.lower(): value
+                        for key, value in request.headers.items()
+                    },
+                )
+            )
+            if len(attempts) < 3:
+                raise urllib.error.URLError("temporary")
+            return FakeResponse({"ok": True})
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "test-key",
+            opener=opener,
+            sleep=lambda delay: None,
+            idempotency_factory=lambda: "stable-write-id",
+        )
+
+        api.ingest(
+            {
+                "title": "Durable conversation context",
+                "source_id": "stable-source-id",
+            },
+            "explicit-memory",
+            timeout=2.0,
+        )
+
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(
+            {attempt[0]["namespace"] for attempt in attempts},
+            {"explicit-memory"},
+        )
+        self.assertEqual(
+            {attempt[0]["source_id"] for attempt in attempts},
+            {"stable-source-id"},
+        )
+        self.assertEqual(
+            {
+                attempt[1].get("idempotency-key")
+                for attempt in attempts
+            },
+            {"stable-write-id"},
+        )
+
+    def test_network_timeout_is_transient_and_bounded_to_three_attempts(
+        self,
+    ) -> None:
+        attempts = []
+        sleeps = []
+
+        def opener(request, timeout):
+            attempts.append((request.data, timeout))
+            raise socket.timeout("vlt_network-canary")
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "test-key",
+            opener=opener,
+            sleep=sleeps.append,
+        )
+
+        with self.assertRaises(_API.RememAPIError) as caught:
+            api.query("history", None, timeout=2.0)
+
+        self.assertEqual(getattr(caught.exception, "kind", None), "transient")
+        self.assertEqual(str(caught.exception), "Remem request failed")
+        self.assertNotIn("network-canary", str(caught.exception))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
 
     def test_response_body_read_is_bounded(self) -> None:
         amounts = []
@@ -938,8 +1230,12 @@ class RememMemoryHookTests(unittest.TestCase):
         settings=None,
         credential_resolver=None,
         background_writes=False,
+        routing_resolver=None,
+        connection_credential_resolver=None,
+        api_factory=None,
+        health_recorder=None,
     ):
-        return _HOOK.Dependencies(
+        dependencies = _HOOK.Dependencies(
             api=api,
             state_dir=Path(directory),
             engineering_handler=engineering_handler,
@@ -947,8 +1243,40 @@ class RememMemoryHookTests(unittest.TestCase):
             credential_resolver=credential_resolver,
             background_writes=background_writes,
         )
+        for name, value in (
+            ("routing_resolver", routing_resolver),
+            (
+                "connection_credential_resolver",
+                connection_credential_resolver,
+            ),
+            ("api_factory", api_factory),
+            ("health_recorder", health_recorder),
+        ):
+            object.__setattr__(dependencies, name, value)
+        return dependencies
 
-    def test_user_prompt_submit_queries_all_namespaces_and_injects_context(
+    def _seed_durable_turn(self, directory, *, off_record=False) -> None:
+        _HOOK.StateStore(Path(directory)).save(
+            "s1",
+            {
+                "current_prompt": "Remember that I prefer concise answers.",
+                "turn_id": "t1",
+                "off_record": off_record,
+                "off_record_seen": off_record,
+                "completed_turn_ids": [],
+                "metrics": {"hits": 0, "misses": 0},
+            },
+        )
+
+    def test_hook_dependencies_expose_routing_and_connection_resolvers(
+        self,
+    ) -> None:
+        names = {field.name for field in fields(_HOOK.Dependencies)}
+
+        self.assertIn("routing_resolver", names)
+        self.assertIn("connection_credential_resolver", names)
+
+    def test_user_prompt_submit_uses_builtin_readable_route_and_injects_context(
         self,
     ) -> None:
         api = FakeAPI(
@@ -969,7 +1297,7 @@ class RememMemoryHookTests(unittest.TestCase):
                 dependencies=self._dependencies(directory, api),
             )
 
-        self.assertEqual(api.queries[0]["namespaces"], ["*"])
+        self.assertIsNone(api.queries[0]["namespaces"])
         self.assertEqual(
             output["hookSpecificOutput"]["hookEventName"],
             "UserPromptSubmit",
@@ -978,6 +1306,234 @@ class RememMemoryHookTests(unittest.TestCase):
             "BEGIN UNTRUSTED REMEM MEMORY",
             output["hookSpecificOutput"]["additionalContext"],
         )
+
+    def test_recall_resolves_before_credentials_and_groups_namespaces(
+        self,
+    ) -> None:
+        secondary = _ROUTING.Connection(
+            "conn_11111111111111111111111111111111",
+            "Secondary",
+            "connection:11111111111111111111111111111111",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection("primary", "Primary", "default", True),
+                secondary,
+            ),
+            global_routes={
+                "recall": (
+                    _ROUTING.RouteTarget("primary", "alpha"),
+                    _ROUTING.RouteTarget("primary", "beta"),
+                    _ROUTING.RouteTarget(secondary.id, "gamma"),
+                )
+            },
+        )
+        events = []
+        apis = {
+            "primary": RoutedAPI(
+                "primary",
+                {"results": [{"title": "Primary", "content": "primary"}]},
+            ),
+            secondary.id: RoutedAPI(
+                secondary.id,
+                {"results": [{"title": "Secondary", "content": "secondary"}]},
+            ),
+        }
+
+        def credentials(connection):
+            events.append(("credential", connection.id))
+            return f"key-for-{connection.id}"
+
+        def api_factory(connection, credential):
+            events.append(("api", connection.id, credential))
+            return apis[connection.id]
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = _HOOK.handle_event(
+                prompt_payload("What did we decide last time?"),
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=self._dependencies(
+                    directory,
+                    None,
+                    routing_resolver=routed(config, events),
+                    connection_credential_resolver=credentials,
+                    api_factory=api_factory,
+                ),
+            )
+
+        self.assertEqual(events[0], ("route", "recall", "codex"))
+        self.assertEqual(
+            [event for event in events if event[0] == "credential"],
+            [("credential", "primary"), ("credential", secondary.id)],
+        )
+        self.assertEqual(
+            apis["primary"].queries[0]["namespaces"],
+            ["alpha", "beta"],
+        )
+        self.assertEqual(
+            apis[secondary.id].queries[0]["namespaces"],
+            ["gamma"],
+        )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("primary", context)
+        self.assertIn("secondary", context)
+
+    def test_recall_uses_one_credential_per_connection_without_fallback(
+        self,
+    ) -> None:
+        secondary = _ROUTING.Connection(
+            "conn_22222222222222222222222222222222",
+            "Secondary",
+            "connection:22222222222222222222222222222222",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection("primary", "Primary", "default", True),
+                secondary,
+            ),
+            global_routes={
+                "recall": (
+                    _ROUTING.RouteTarget(secondary.id, "only-secondary"),
+                )
+            },
+        )
+        credential_calls = []
+        factory_calls = []
+        selected_api = RoutedAPI(
+            secondary.id,
+            query_error=RuntimeError("explicit source failed"),
+        )
+
+        def credentials(connection):
+            credential_calls.append(connection.id)
+            return "secondary-key"
+
+        def api_factory(connection, credential):
+            factory_calls.append((connection.id, credential))
+            return selected_api
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = _HOOK.handle_event(
+                prompt_payload("What did we decide last time?"),
+                harness="claude",
+                mode="user_prompt_submit",
+                dependencies=self._dependencies(
+                    directory,
+                    None,
+                    routing_resolver=routed(config),
+                    connection_credential_resolver=credentials,
+                    api_factory=api_factory,
+                ),
+            )
+
+        self.assertEqual(output, {})
+        self.assertEqual(credential_calls, [secondary.id])
+        self.assertEqual(factory_calls, [(secondary.id, "secondary-key")])
+
+    def test_recall_partial_connection_failure_keeps_other_results_and_health(
+        self,
+    ) -> None:
+        secondary = _ROUTING.Connection(
+            "conn_33333333333333333333333333333333",
+            "Secondary",
+            "connection:33333333333333333333333333333333",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection("primary", "Primary", "default", True),
+                secondary,
+            ),
+            global_routes={
+                "recall": (
+                    _ROUTING.RouteTarget("primary", "alpha"),
+                    _ROUTING.RouteTarget(secondary.id, "beta"),
+                )
+            },
+        )
+        apis = {
+            "primary": RoutedAPI(
+                "primary",
+                query_error=RuntimeError("vlt_failed-source-canary"),
+            ),
+            secondary.id: RoutedAPI(
+                secondary.id,
+                {
+                    "results": [
+                        {
+                            "title": "Available source",
+                            "content": "usable routed result",
+                            "score": 0.8,
+                        }
+                    ]
+                },
+            ),
+        }
+        health = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = _HOOK.handle_event(
+                prompt_payload("What did we decide last time?"),
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=self._dependencies(
+                    directory,
+                    None,
+                    routing_resolver=routed(config),
+                    connection_credential_resolver=lambda connection: (
+                        f"key-{connection.id}"
+                    ),
+                    api_factory=lambda connection, credential: apis[
+                        connection.id
+                    ],
+                    health_recorder=health.append,
+                ),
+            )
+
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("usable routed result", context)
+        self.assertNotIn("failed-source-canary", context)
+        self.assertEqual(
+            [(record.connection_id, record.status) for record in health],
+            [
+                ("primary", "transient_error"),
+                (secondary.id, "ok"),
+            ],
+        )
+
+    def test_client_override_selects_only_its_recall_route(self) -> None:
+        config = routing_config(
+            global_routes={
+                "recall": (_ROUTING.RouteTarget("primary", "global"),)
+            },
+            client_routes={
+                "codex": {
+                    "recall": (
+                        _ROUTING.RouteTarget("primary", "codex-only"),
+                    )
+                }
+            },
+        )
+        api = FakeAPI(
+            {"results": [{"title": "Decision", "content": "selected"}]}
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            _HOOK.handle_event(
+                prompt_payload("What did we decide last time?"),
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=self._dependencies(
+                    directory,
+                    api,
+                    routing_resolver=routed(config),
+                ),
+            )
+
+        self.assertEqual(api.queries[0]["namespaces"], ["codex-only"])
 
     def test_production_query_shape_injects_safe_chunks_and_facts(self) -> None:
         api = FakeAPI(
@@ -1144,29 +1700,130 @@ class RememMemoryHookTests(unittest.TestCase):
             "conversation_turn",
         )
 
-    def test_stop_uses_explicit_personal_namespace(self) -> None:
+    def test_stop_uses_explicit_memory_route_namespace(self) -> None:
         api = FakeAPI()
+        config = routing_config(
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "explicit-memory"),
+                )
+            }
+        )
         with tempfile.TemporaryDirectory() as directory:
-            dependencies = self._dependencies(directory, api)
-            with mock.patch.dict(
-                os.environ,
-                {"REMEM_MEMORY_PERSONAL_NAMESPACE": "personal"},
-                clear=False,
-            ):
-                _HOOK.handle_event(
-                    prompt_payload("Remember that I prefer concise answers."),
-                    harness="codex",
-                    mode="user_prompt_submit",
-                    dependencies=dependencies,
-                )
-                _HOOK.handle_event(
-                    stop_payload(),
-                    harness="codex",
-                    mode="stop",
-                    dependencies=dependencies,
-                )
+            self._seed_durable_turn(directory)
+            dependencies = self._dependencies(
+                directory,
+                api,
+                routing_resolver=routed(config),
+            )
+            _HOOK.handle_event(
+                stop_payload(),
+                harness="codex",
+                mode="stop",
+                dependencies=dependencies,
+            )
 
-        self.assertEqual(api.ingests[0]["namespace"], "personal")
+        self.assertEqual(api.ingests[0]["namespace"], "explicit-memory")
+
+    def test_stop_resolves_only_memory_and_default_omits_namespace(self) -> None:
+        api = FakeAPI()
+        config = routing_config(
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "@default"),
+                ),
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-destination"),
+                ),
+            }
+        )
+        route_events = []
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            _HOOK.handle_event(
+                stop_payload(),
+                harness="codex",
+                mode="stop",
+                dependencies=self._dependencies(
+                    directory,
+                    api,
+                    routing_resolver=routed(config, route_events),
+                ),
+            )
+
+        self.assertEqual(route_events, [("route", "memory", "codex")])
+        self.assertIsNone(api.ingests[0]["namespace"])
+
+    def test_memory_off_and_migration_block_suppress_capture_before_credentials(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "global off",
+                routing_config(global_routes={"memory": ()}),
+            ),
+            (
+                "client off",
+                routing_config(
+                    global_routes={
+                        "memory": (
+                            _ROUTING.RouteTarget("primary", "@default"),
+                        )
+                    },
+                    client_routes={"codex": {"memory": ()}},
+                ),
+            ),
+            (
+                "migration block",
+                routing_config(migration_write_blocked=True),
+            ),
+        )
+        for label, config in cases:
+            with self.subTest(label=label):
+                api = FakeAPI()
+                credential_calls = []
+                with tempfile.TemporaryDirectory() as directory:
+                    self._seed_durable_turn(directory)
+                    output = _HOOK.handle_event(
+                        stop_payload(),
+                        harness="codex",
+                        mode="stop",
+                        dependencies=self._dependencies(
+                            directory,
+                            api,
+                            routing_resolver=routed(config),
+                            connection_credential_resolver=(
+                                lambda connection: credential_calls.append(
+                                    connection.id
+                                )
+                            ),
+                        ),
+                    )
+
+                self.assertEqual(output, {"continue": True})
+                self.assertEqual(api.ingests, [])
+                self.assertEqual(credential_calls, [])
+
+    def test_off_record_suppresses_memory_route_resolution(self) -> None:
+        route_events = []
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory, off_record=True)
+            output = _HOOK.handle_event(
+                stop_payload(),
+                harness="codex",
+                mode="stop",
+                dependencies=self._dependencies(
+                    directory,
+                    FakeAPI(),
+                    routing_resolver=routed(
+                        routing_config(),
+                        route_events,
+                    ),
+                ),
+            )
+
+        self.assertEqual(output, {"continue": True})
+        self.assertEqual(route_events, [])
 
     def test_stop_is_idempotent_by_session_and_turn(self) -> None:
         api = FakeAPI()
@@ -2109,22 +2766,28 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertEqual(read.call_count, 3)
         close.assert_called_once_with(17)
 
-    def test_harness_detection_uses_codex_plugin_root(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"CLAUDE_PLUGIN_ROOT": "/plugin"},
-            clear=True,
-        ):
-            self.assertEqual(_HOOK._detect_harness(), "claude")
-        with mock.patch.dict(
-            os.environ,
-            {
-                "PLUGIN_ROOT": "/plugin",
-                "CLAUDE_PLUGIN_ROOT": "/plugin",
-            },
-            clear=True,
-        ):
-            self.assertEqual(_HOOK._detect_harness(), "codex")
+    def test_hook_parser_requires_a_known_explicit_harness(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                _HOOK._parse_args(["--mode", "user_prompt_submit"])
+            with self.assertRaises(SystemExit):
+                _HOOK._parse_args(
+                    [
+                        "--mode",
+                        "user_prompt_submit",
+                        "--harness",
+                        "unknown",
+                    ]
+                )
+        parsed = _HOOK._parse_args(
+            [
+                "--mode",
+                "user_prompt_submit",
+                "--harness",
+                "codex",
+            ]
+        )
+        self.assertEqual(parsed.harness, "codex")
 
     def test_claude_user_prompt_cli_emits_one_json_object(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

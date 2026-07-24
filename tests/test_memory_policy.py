@@ -19,6 +19,22 @@ _SPEC.loader.exec_module(_MODULE)
 
 
 class MemoryPolicyTests(unittest.TestCase):
+    def _recall_source(
+        self,
+        response,
+        *,
+        connection_order,
+        namespace_order,
+    ):
+        source_type = getattr(_MODULE, "RecallSource", None)
+        self.assertIsNotNone(source_type)
+        assert source_type is not None
+        return source_type(
+            response=response,
+            connection_order=connection_order,
+            namespace_order=tuple(namespace_order.items()),
+        )
+
     def test_explicit_secret_detection_excludes_entropy_only_identifiers(
         self,
     ) -> None:
@@ -117,6 +133,154 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertIn("Use the blue theme.", rendered)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", rendered)
         self.assertLessEqual(len(rendered), 6000)
+
+    def test_recall_merge_deduplicates_by_identity_then_normalized_content(
+        self,
+    ) -> None:
+        merge = getattr(_MODULE, "merge_recall_items", None)
+        self.assertIsNotNone(merge)
+        assert merge is not None
+        sources = [
+            self._recall_source(
+                {
+                    "results": [
+                        {
+                            "document_id": "doc-shared",
+                            "title": "Older duplicate",
+                            "namespace": "alpha",
+                            "content": "older identity content",
+                            "score": 0.4,
+                        },
+                        {
+                            "title": "Whitespace duplicate",
+                            "namespace": "alpha",
+                            "content": "same   normalized\ncontent",
+                            "score": 0.8,
+                        },
+                    ]
+                },
+                connection_order=0,
+                namespace_order={"alpha": 0},
+            ),
+            self._recall_source(
+                {
+                    "results": [
+                        {
+                            "document_id": "doc-shared",
+                            "title": "Newer duplicate",
+                            "namespace": "beta",
+                            "content": "higher scored identity content",
+                            "score": 0.9,
+                        },
+                        {
+                            "title": "Normalized duplicate",
+                            "namespace": "beta",
+                            "content": "same normalized content",
+                            "score": 0.7,
+                        },
+                    ]
+                },
+                connection_order=1,
+                namespace_order={"beta": 0},
+            ),
+        ]
+
+        merged = merge(sources)
+
+        self.assertEqual(
+            [item["title"] for item in merged],
+            ["Newer duplicate", "Whitespace duplicate"],
+        )
+
+    def test_recall_merge_orders_globally_and_caps_four(self) -> None:
+        merge = getattr(_MODULE, "merge_recall_items", None)
+        self.assertIsNotNone(merge)
+        assert merge is not None
+        sources = [
+            self._recall_source(
+                {
+                    "results": [
+                        {
+                            "title": "connection-one",
+                            "namespace": "beta",
+                            "content": "one",
+                            "score": 0.5,
+                        },
+                        {
+                            "title": "namespace-first",
+                            "namespace": "alpha",
+                            "content": "two",
+                            "score": 0.5,
+                        },
+                        {
+                            "title": "namespace-first-second-result",
+                            "namespace": "alpha",
+                            "content": "three",
+                            "score": 0.5,
+                        },
+                    ]
+                },
+                connection_order=1,
+                namespace_order={"alpha": 0, "beta": 1},
+            ),
+            self._recall_source(
+                {
+                    "results": [
+                        {
+                            "title": "highest",
+                            "namespace": "gamma",
+                            "content": "four",
+                            "score": 0.99,
+                        },
+                        {
+                            "title": "connection-zero",
+                            "namespace": "gamma",
+                            "content": "five",
+                            "score": 0.5,
+                        },
+                    ]
+                },
+                connection_order=0,
+                namespace_order={"gamma": 0},
+            ),
+        ]
+
+        merged = merge(sources)
+
+        self.assertEqual(
+            [item["title"] for item in merged],
+            [
+                "highest",
+                "connection-zero",
+                "namespace-first",
+                "namespace-first-second-result",
+            ],
+        )
+        self.assertEqual(len(merged), 4)
+
+    def test_recall_normalization_preserves_grouped_fact_rendering(self) -> None:
+        normalized = _MODULE.normalize_recall_items(
+            {
+                "facts": [
+                    {
+                        "fact_type": "preference",
+                        "content": "Prefers concise answers.",
+                    },
+                    {
+                        "fact_type": "decision",
+                        "content": "Uses the stable deployment path.",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0]["title"], "Relevant facts")
+        self.assertIn("Prefers concise answers.", normalized[0]["content"])
+        self.assertIn(
+            "Uses the stable deployment path.",
+            normalized[0]["content"],
+        )
 
     def test_capture_levels_are_predictable(self) -> None:
         explicit = "Remember that I prefer concise answers."

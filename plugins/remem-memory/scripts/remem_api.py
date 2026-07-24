@@ -7,14 +7,18 @@ import ctypes
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping, MutableMapping
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Protocol, Tuple
 from urllib import parse as urllib_parse
+from urllib import error as urllib_error
 from urllib import request as urllib_request
+from uuid import uuid4
 
 from remem_routing import Connection
 
@@ -29,10 +33,19 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 16 * 1024
 _KEYCHAIN_INTERACTION_LOCK = threading.RLock()
 _CONNECTION_ACCOUNT = re.compile(r"connection:[0-9a-f]{32}\Z")
+_ERROR_KINDS = frozenset(
+    ("auth", "permission", "namespace", "request", "transient")
+)
+_TRANSIENT_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
+_RETRY_DELAYS = (0.25, 0.5)
 
 
 class RememAPIError(RuntimeError):
     """Fixed, non-secret API failure safe for fail-open hook handling."""
+
+    def __init__(self, message: str, *, kind: str = "request") -> None:
+        super().__init__(message)
+        self.kind = kind if kind in _ERROR_KINDS else "request"
 
 
 class RememCredentialUnavailable(RememAPIError):
@@ -799,6 +812,8 @@ class RememAPI:
         *,
         opener: Optional[Callable[..., Any]] = None,
         allow_local_dev: bool = False,
+        sleep: Callable[[float], None] = time.sleep,
+        idempotency_factory: Callable[[], str] = lambda: uuid4().hex,
     ) -> None:
         selected_url = (
             api_url if isinstance(api_url, str) else os.getenv("REMEM_API_URL")
@@ -809,6 +824,8 @@ class RememAPI:
             allow_local_dev=bool(allow_local_dev and explicit_key),
         )
         self.api_key = explicit_key or resolve_api_key()
+        self._sleep = sleep
+        self._idempotency_factory = idempotency_factory
         self._opener = (
             opener
             if opener is not None
@@ -824,21 +841,20 @@ class RememAPI:
     def query(
         self,
         prompt: str,
-        namespaces: list[str],
+        namespaces: Optional[list[str]],
         timeout: float,
     ) -> dict[str, Any]:
         """Query up to four fast results from the explicitly selected scope."""
 
-        return self.query_payload(
-            {
-                "query": prompt[:_MAX_QUERY],
-                "mode": "fast",
-                "max_results": 4,
-                "include_facts": True,
-                "namespaces": list(namespaces),
-            },
-            timeout,
-        )
+        payload: dict[str, Any] = {
+            "query": prompt[:_MAX_QUERY],
+            "mode": "fast",
+            "max_results": 4,
+            "include_facts": True,
+        }
+        if namespaces is not None:
+            payload["namespaces"] = list(namespaces)
+        return self.query_payload(payload, timeout)
 
     def query_payload(
         self,
@@ -874,6 +890,12 @@ class RememAPI:
     ) -> dict[str, Any]:
         if not self.api_key:
             raise RememCredentialUnavailable("Remem credential unavailable")
+        try:
+            idempotency_key = self._idempotency_factory()
+        except Exception:
+            raise RememAPIError("Remem request failed", kind="request") from None
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise RememAPIError("Remem request failed", kind="request")
         request = urllib_request.Request(
             url=f"{self.api_url}{path}",
             data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
@@ -882,21 +904,53 @@ class RememAPI:
                 "Authorization": f"Bearer {self.api_key}",
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json",
+                "Idempotency-Key": idempotency_key,
             },
         )
-        try:
-            with self._opener(request, timeout=timeout) as response:  # nosec B310
-                raw = response.read(_MAX_RESPONSE_BYTES + 1)
-            if len(raw) > _MAX_RESPONSE_BYTES:
-                raise ValueError("response was too large")
-            decoded = json.loads(raw.decode("utf-8") or "{}")
-            if not isinstance(decoded, dict):
-                raise ValueError("response was not an object")
-            return decoded
-        except RememAPIError:
-            raise
-        except Exception:
-            raise RememAPIError("Remem request failed") from None
+        for attempt in range(3):
+            try:
+                with self._opener(  # nosec B310
+                    request,
+                    timeout=timeout,
+                ) as response:
+                    raw = response.read(_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > _MAX_RESPONSE_BYTES:
+                    raise ValueError("response was too large")
+                decoded = json.loads(raw.decode("utf-8") or "{}")
+                if not isinstance(decoded, dict):
+                    raise ValueError("response was not an object")
+                return decoded
+            except urllib_error.HTTPError as error:
+                kind = _http_error_kind(error.code)
+                try:
+                    error.close()
+                except Exception:
+                    pass
+            except (urllib_error.URLError, TimeoutError, socket.timeout, OSError):
+                kind = "transient"
+            except RememAPIError as error:
+                kind = error.kind
+            except Exception:
+                kind = "request"
+            if kind != "transient" or attempt == 2:
+                raise RememAPIError(
+                    "Remem request failed",
+                    kind=kind,
+                ) from None
+            self._sleep(_RETRY_DELAYS[attempt])
+        raise RememAPIError("Remem request failed", kind="transient")
+
+
+def _http_error_kind(status: object) -> str:
+    if status == 401:
+        return "auth"
+    if status == 403:
+        return "permission"
+    if status == 404:
+        return "namespace"
+    if status in _TRANSIENT_HTTP_STATUSES:
+        return "transient"
+    return "request"
 
 
 __all__ = [

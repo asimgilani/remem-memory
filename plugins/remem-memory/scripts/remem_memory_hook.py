@@ -15,14 +15,16 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
 from memory_policy import (
+    RecallSource,
     contains_secret,
     is_off_record,
-    normalize_recall_items,
+    merge_recall_items,
     render_untrusted_context,
     sanitize_query,
     should_capture,
@@ -30,8 +32,19 @@ from memory_policy import (
 )
 from remem_api import (
     RememAPI,
+    RememAPIError,
     normalize_api_origin_for_environment,
     resolve_api_key,
+    resolve_connection_api_key,
+)
+from remem_routing import (
+    Connection,
+    RouteHealthRecord,
+    RouteTarget,
+    RoutingConfig,
+    load_or_initialize_routing,
+    record_route_health,
+    resolve_routes,
 )
 
 try:
@@ -136,6 +149,18 @@ class Dependencies:
     settings: Settings | None = None
     credential_resolver: Callable[[], str | None] | None = None
     background_writes: bool = False
+    routing_resolver: (
+        Callable[
+            [str, str],
+            tuple[RoutingConfig, tuple[RouteTarget, ...]],
+        ]
+        | None
+    ) = None
+    connection_credential_resolver: (
+        Callable[[Connection], str | None] | None
+    ) = None
+    api_factory: Callable[[Connection, str], object] | None = None
+    health_recorder: Callable[[RouteHealthRecord], None] | None = None
 
 
 def default_data_dir() -> Path:
@@ -461,6 +486,189 @@ def _api(dependencies: Dependencies) -> object:
     return dependencies.api if dependencies.api is not None else RememAPI()
 
 
+def _resolved_route(
+    dependencies: Dependencies,
+    *,
+    behavior: str,
+    harness: str,
+) -> tuple[RoutingConfig, tuple[RouteTarget, ...]]:
+    resolver = dependencies.routing_resolver
+    if resolver is not None:
+        return resolver(behavior, harness)
+    config = load_or_initialize_routing(dependencies.state_dir)
+    return (
+        config,
+        resolve_routes(
+            config,
+            behavior=behavior,  # type: ignore[arg-type]
+            client=harness,  # type: ignore[arg-type]
+        ),
+    )
+
+
+def _connection_for(
+    config: RoutingConfig,
+    connection_id: str,
+) -> Connection | None:
+    return next(
+        (
+            connection
+            for connection in config.connections
+            if connection.id == connection_id
+        ),
+        None,
+    )
+
+
+def _connection_credential(
+    dependencies: Dependencies,
+    connection: Connection,
+) -> str | None:
+    resolver = (
+        dependencies.connection_credential_resolver
+        or resolve_connection_api_key
+    )
+    try:
+        credential = resolver(connection)
+    except Exception:
+        return None
+    return (
+        credential.strip()
+        if isinstance(credential, str) and credential.strip()
+        else None
+    )
+
+
+def _default_routed_api(
+    connection: Connection,
+    credential: str,
+) -> object:
+    del connection
+    raw_url = os.environ.get("REMEM_API_URL", _DEFAULT_API_URL)
+    policy_environment = {"REMEM_API_KEY": credential}
+    allow_local = os.environ.get("REMEM_MEMORY_ALLOW_LOCAL_DEV")
+    if allow_local is not None:
+        policy_environment["REMEM_MEMORY_ALLOW_LOCAL_DEV"] = allow_local
+    normalized_url = normalize_api_origin_for_environment(
+        raw_url,
+        policy_environment,
+    )
+    return RememAPI(
+        normalized_url,
+        credential,
+        allow_local_dev=normalized_url != _DEFAULT_API_URL,
+    )
+
+
+def _routed_api(
+    dependencies: Dependencies,
+    connection: Connection,
+) -> object | None:
+    injected_without_credentials = (
+        dependencies.api is not None
+        and dependencies.connection_credential_resolver is None
+        and dependencies.api_factory is None
+    )
+    if injected_without_credentials:
+        return dependencies.api
+    credential = _connection_credential(dependencies, connection)
+    if credential is None:
+        return None
+    if dependencies.api_factory is not None:
+        return dependencies.api_factory(connection, credential)
+    if dependencies.api is not None:
+        return dependencies.api
+    return _default_routed_api(connection, credential)
+
+
+def _health_failure(error: Exception) -> tuple[str, str]:
+    kind = error.kind if isinstance(error, RememAPIError) else "transient"
+    return {
+        "auth": ("auth_error", "request_auth"),
+        "permission": ("permission_error", "request_permission"),
+        "namespace": ("namespace_error", "request_namespace"),
+        "request": ("transient_error", "request_invalid"),
+        "transient": ("transient_error", "request_transient"),
+    }.get(kind, ("transient_error", "request_transient"))
+
+
+def _record_health(
+    dependencies: Dependencies,
+    *,
+    harness: str,
+    behavior: str,
+    target: RouteTarget,
+    status: str,
+    detail_code: str,
+) -> None:
+    observed_at = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    record = RouteHealthRecord(
+        client=harness,
+        behavior=behavior,
+        connection_id=target.connection_id,
+        namespace=target.namespace,
+        status=status,
+        detail_code=detail_code,
+        observed_at=observed_at,
+    )
+    try:
+        if dependencies.health_recorder is not None:
+            dependencies.health_recorder(record)
+        else:
+            record_route_health(record, dependencies.state_dir)
+    except Exception:
+        pass
+
+
+def _record_target_failure(
+    dependencies: Dependencies,
+    *,
+    harness: str,
+    behavior: str,
+    targets: list[RouteTarget] | tuple[RouteTarget, ...],
+    error: Exception | None,
+) -> None:
+    if error is None:
+        status, detail_code = (
+            "credential_error",
+            "credential_unavailable",
+        )
+    else:
+        status, detail_code = _health_failure(error)
+    for target in targets:
+        _record_health(
+            dependencies,
+            harness=harness,
+            behavior=behavior,
+            target=target,
+            status=status,
+            detail_code=detail_code,
+        )
+
+
+def _record_target_success(
+    dependencies: Dependencies,
+    *,
+    harness: str,
+    behavior: str,
+    targets: list[RouteTarget] | tuple[RouteTarget, ...],
+) -> None:
+    detail_code = "read_ok" if behavior == "recall" else "write_ok"
+    for target in targets:
+        _record_health(
+            dependencies,
+            harness=harness,
+            behavior=behavior,
+            target=target,
+            status="ok",
+            detail_code=detail_code,
+        )
+
+
 def _default_engineering_handler(
     mode: str, payload: dict[str, Any]
 ) -> int:
@@ -549,6 +757,7 @@ def _read_current_state(
 
 def _handle_user_prompt(
     payload: dict[str, Any],
+    harness: str,
     dependencies: Dependencies,
     settings: Settings,
 ) -> dict[str, Any]:
@@ -586,25 +795,97 @@ def _handle_user_prompt(
         return {}
 
     try:
-        response = _api(dependencies).query(
-            safe_prompt,
-            ["*"],
-            timeout=_RECALL_TIMEOUT,
+        config, targets = _resolved_route(
+            dependencies,
+            behavior="recall",
+            harness=harness,
         )
     except Exception:
-        if settings.mode == "auto":
-            with store.locked(session_id):
-                latest = store.load(session_id)
-                if latest["turn_id"] == state["turn_id"]:
-                    metrics = latest["metrics"]
-                    metrics["misses"] = min(
-                        1_000_000_000,
-                        _counter(metrics.get("misses")) + 1,
-                    )
-                    store.save(session_id, latest)
+        return {}
+    if not targets:
         return {}
 
-    context = render_untrusted_context(normalize_recall_items(response))
+    connection_order = {
+        connection.id: position
+        for position, connection in enumerate(config.connections)
+    }
+    grouped: dict[str, list[tuple[int, RouteTarget]]] = {}
+    for namespace_order, target in enumerate(targets):
+        grouped.setdefault(target.connection_id, []).append(
+            (namespace_order, target)
+        )
+
+    sources: list[RecallSource] = []
+    for connection_id, selected in sorted(
+        grouped.items(),
+        key=lambda item: connection_order.get(item[0], len(connection_order)),
+    ):
+        connection = _connection_for(config, connection_id)
+        selected_targets = [target for _order, target in selected]
+        if connection is None:
+            continue
+        try:
+            api = _routed_api(dependencies, connection)
+        except Exception as error:
+            _record_target_failure(
+                dependencies,
+                harness=harness,
+                behavior="recall",
+                targets=selected_targets,
+                error=error,
+            )
+            continue
+        if api is None:
+            _record_target_failure(
+                dependencies,
+                harness=harness,
+                behavior="recall",
+                targets=selected_targets,
+                error=None,
+            )
+            continue
+        if any(target.namespace == "@readable" for target in selected_targets):
+            namespaces = None
+        else:
+            namespaces = list(
+                dict.fromkeys(target.namespace for target in selected_targets)
+            )
+        try:
+            response = api.query(
+                safe_prompt,
+                namespaces,
+                timeout=_RECALL_TIMEOUT,
+            )
+        except Exception as error:
+            _record_target_failure(
+                dependencies,
+                harness=harness,
+                behavior="recall",
+                targets=selected_targets,
+                error=error,
+            )
+            continue
+        _record_target_success(
+            dependencies,
+            harness=harness,
+            behavior="recall",
+            targets=selected_targets,
+        )
+        sources.append(
+            RecallSource(
+                response=response,
+                connection_order=connection_order.get(
+                    connection_id,
+                    len(connection_order),
+                ),
+                namespace_order=tuple(
+                    (target.namespace, order)
+                    for order, target in selected
+                ),
+            )
+        )
+
+    context = render_untrusted_context(merge_recall_items(sources))
     if settings.mode == "auto":
         with store.locked(session_id):
             latest = store.load(session_id)
@@ -703,6 +984,42 @@ def _handle_stop(
         return output
 
     try:
+        config, targets = _resolved_route(
+            dependencies,
+            behavior="memory",
+            harness=harness,
+        )
+    except Exception:
+        return output
+    if len(targets) != 1:
+        return output
+    target = targets[0]
+    connection = _connection_for(config, target.connection_id)
+    if connection is None:
+        return output
+    try:
+        api = _routed_api(dependencies, connection)
+    except Exception as error:
+        _record_target_failure(
+            dependencies,
+            harness=harness,
+            behavior="memory",
+            targets=targets,
+            error=error,
+        )
+        return output
+    if api is None:
+        _record_target_failure(
+            dependencies,
+            harness=harness,
+            behavior="memory",
+            targets=targets,
+            error=None,
+        )
+        return output
+    namespace = None if target.namespace == "@default" else target.namespace
+
+    try:
         with store.locked(session_id):
             state = store.load(session_id)
             completed = state["completed_turn_ids"]
@@ -716,10 +1033,7 @@ def _handle_stop(
                 str(payload.get("cwd") or ""),
                 harness,
             )
-            namespace = os.getenv(
-                "REMEM_MEMORY_PERSONAL_NAMESPACE", ""
-            ).strip() or None
-            _api(dependencies).ingest(
+            api.ingest(
                 memory,
                 namespace,
                 timeout=_INGEST_TIMEOUT,
@@ -727,8 +1041,21 @@ def _handle_stop(
             completed.append(payload_turn_id)
             state["completed_turn_ids"] = completed[-_MAX_COMPLETED_TURNS:]
             store.save(session_id, state)
-    except Exception:
-        pass
+    except Exception as error:
+        _record_target_failure(
+            dependencies,
+            harness=harness,
+            behavior="memory",
+            targets=targets,
+            error=error,
+        )
+        return output
+    _record_target_success(
+        dependencies,
+        harness=harness,
+        behavior="memory",
+        targets=targets,
+    )
     return output
 
 
@@ -1344,7 +1671,12 @@ def handle_event(
     try:
         settings = _settings(selected_dependencies)
         if mode == "user_prompt_submit":
-            return _handle_user_prompt(payload, selected_dependencies, settings)
+            return _handle_user_prompt(
+                payload,
+                selected_harness,
+                selected_dependencies,
+                settings,
+            )
         original_mode = _WRITE_MODE_ORIGINS.get(mode)
         if original_mode is not None:
             safe_payload = _background_payload(payload, original_mode)
@@ -1462,12 +1794,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "engineering_session_end",
         ),
     )
-    parser.add_argument("--harness", choices=("codex", "claude"))
+    parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("codex", "claude"),
+    )
     return parser.parse_args(argv)
-
-
-def _detect_harness() -> str:
-    return "codex" if "PLUGIN_ROOT" in os.environ else "claude"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1475,7 +1807,7 @@ def main(argv: list[str] | None = None) -> int:
     with _worker_credential_scope(args.mode):
         result = handle_event(
             _read_stdin_json(),
-            harness=args.harness or _detect_harness(),
+            harness=args.harness,
             mode=args.mode,
         )
     sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")

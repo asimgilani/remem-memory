@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from collections.abc import Mapping
@@ -95,6 +96,26 @@ class RecallDecision:
     reason: str
     score: int
     threshold: int
+
+
+@dataclass(frozen=True)
+class RecallSource:
+    """One routed response plus deterministic configured-order metadata."""
+
+    response: object
+    connection_order: int
+    namespace_order: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class _RecallCandidate:
+    item: dict[str, str]
+    identity: tuple[str, ...] | None
+    content_digest: str
+    score: float
+    connection_order: int
+    namespace_order: int
+    result_order: int
 
 
 def _entropy(value: str) -> float:
@@ -287,82 +308,251 @@ def render_untrusted_context(items: list[object] | tuple[object, ...]) -> str:
     return opening + "".join(chunks)[:available] + closing
 
 
-def normalize_recall_items(response: object) -> list[dict[str, str]]:
-    """Extract only safe, bounded text from the production query response."""
+def _normalized_text(value: object) -> str:
+    if not isinstance(value, str) or contains_secret(value):
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
 
-    if not isinstance(response, Mapping):
-        return []
 
-    normalized: list[dict[str, str]] = []
-    facts = response.get("facts")
-    safe_facts: list[str] = []
-    if isinstance(facts, list):
-        for fact in facts[:8]:
-            if not isinstance(fact, Mapping):
+def _stable_value(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()[:500]
+    if type(value) is int:
+        return str(value)
+    return ""
+
+
+def _score(value: object) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if numeric == numeric and numeric not in {float("inf"), float("-inf")}:
+            return numeric
+    return 0.0
+
+
+def _namespace_position(
+    value: object,
+    positions: Mapping[str, int],
+) -> int:
+    if isinstance(value, str) and value in positions:
+        return positions[value]
+    return min(positions.values(), default=0)
+
+
+def _document_candidate(
+    document: Mapping[str, object],
+    *,
+    connection_order: int,
+    namespace_positions: Mapping[str, int],
+    result_order: int,
+) -> _RecallCandidate | None:
+    title_value = document.get("title") or "Untitled"
+    title = _normalized_text(title_value)
+    if not title:
+        return None
+
+    chunks = document.get("chunks")
+    safe_chunks: list[str] = []
+    chunk_ids: list[str] = []
+    scores = [_score(document.get("score"))]
+    namespace = document.get("namespace")
+    if isinstance(chunks, list):
+        for chunk in chunks[:6]:
+            if not isinstance(chunk, Mapping):
                 continue
-            fact_type = fact.get("fact_type", "fact")
-            content = fact.get("content")
-            if not isinstance(fact_type, str) or not isinstance(content, str):
+            content = _normalized_text(chunk.get("content"))
+            if not content:
                 continue
-            if contains_secret(fact_type) or contains_secret(content):
-                continue
-            cleaned = re.sub(r"\s+", " ", content).strip()
-            if cleaned:
-                safe_facts.append(f"[{fact_type}] {cleaned}"[:1000])
-            if len(safe_facts) >= 4:
-                break
-    if safe_facts:
-        normalized.append(
-            {
-                "title": "Relevant facts",
-                "content": "\n".join(safe_facts)[:2000],
-            }
-        )
+            safe_chunks.append(content)
+            scores.append(_score(chunk.get("score")))
+            chunk_id = _stable_value(
+                chunk.get("chunk_id", chunk.get("id"))
+            )
+            if chunk_id:
+                chunk_ids.append(chunk_id)
+            if not isinstance(namespace, str):
+                namespace = chunk.get("namespace")
+    else:
+        flat = document.get("content", document.get("text"))
+        content = _normalized_text(flat)
+        if content:
+            safe_chunks.append(content)
 
-    results = response.get("results")
-    if not isinstance(results, list):
-        return normalized
-    document_limit = 3 if safe_facts else 4
-    for document in results[:4]:
-        if not isinstance(document, Mapping):
-            continue
-        title = document.get("title") or "Untitled"
-        if not isinstance(title, str) or contains_secret(title):
-            continue
+    content = "\n\n".join(safe_chunks)[:2000]
+    if not content:
+        return None
+    document_id = _stable_value(
+        document.get("document_id", document.get("id"))
+    )
+    chunk_id = _stable_value(document.get("chunk_id"))
+    identity: tuple[str, ...] | None
+    if document_id:
+        identity = ("document", document_id)
+    elif chunk_id:
+        identity = ("chunk", chunk_id)
+    elif chunk_ids:
+        identity = ("chunks", *chunk_ids)
+    else:
+        identity = None
+    normalized_content = re.sub(r"\s+", " ", content).strip()
+    return _RecallCandidate(
+        item={"title": title[:500], "content": content},
+        identity=identity,
+        content_digest=hashlib.sha256(
+            normalized_content.encode("utf-8")
+        ).hexdigest(),
+        score=max(scores),
+        connection_order=connection_order,
+        namespace_order=_namespace_position(
+            namespace,
+            namespace_positions,
+        ),
+        result_order=result_order,
+    )
 
-        safe_chunks: list[str] = []
-        chunks = document.get("chunks")
-        if isinstance(chunks, list):
-            for chunk in chunks[:6]:
-                if not isinstance(chunk, Mapping):
-                    continue
-                content = chunk.get("content")
-                if not isinstance(content, str) or contains_secret(content):
-                    continue
-                cleaned = re.sub(r"\s+", " ", content).strip()
-                if cleaned:
-                    safe_chunks.append(cleaned)
-        else:
-            flat = document.get("content", document.get("text"))
-            if isinstance(flat, str) and not contains_secret(flat):
-                cleaned = re.sub(r"\s+", " ", flat).strip()
-                if cleaned:
-                    safe_chunks.append(cleaned)
 
-        content = "\n\n".join(safe_chunks)[:2000]
-        if not content:
+def _facts_candidate(
+    facts: list[object],
+    *,
+    connection_order: int,
+    namespace_positions: Mapping[str, int],
+    result_order: int,
+) -> _RecallCandidate | None:
+    rendered_facts: list[str] = []
+    fact_ids: list[str] = []
+    scores: list[float] = []
+    namespace: object = None
+    for fact in facts[:8]:
+        if not isinstance(fact, Mapping):
             continue
-        normalized.append({"title": title[:500], "content": content})
-        if len(normalized) >= document_limit + (1 if safe_facts else 0):
+        fact_type = _normalized_text(fact.get("fact_type", "fact"))
+        content = _normalized_text(fact.get("content"))
+        if not fact_type or not content:
+            continue
+        rendered_facts.append(f"[{fact_type}] {content}"[:1000])
+        fact_id = _stable_value(fact.get("fact_id", fact.get("id")))
+        if fact_id:
+            fact_ids.append(fact_id)
+        scores.append(_score(fact.get("score")))
+        if not isinstance(namespace, str):
+            namespace = fact.get("namespace")
+        if len(rendered_facts) >= 4:
             break
-    return normalized
+    if not rendered_facts:
+        return None
+    rendered = "\n".join(rendered_facts)[:2000]
+    identity = (
+        ("facts", *fact_ids)
+        if len(fact_ids) == len(rendered_facts)
+        else None
+    )
+    return _RecallCandidate(
+        item={"title": "Relevant facts", "content": rendered},
+        identity=identity,
+        content_digest=hashlib.sha256(
+            rendered.encode("utf-8")
+        ).hexdigest(),
+        score=max(scores, default=0.0),
+        connection_order=connection_order,
+        namespace_order=_namespace_position(
+            namespace,
+            namespace_positions,
+        ),
+        result_order=result_order,
+    )
+
+
+def merge_recall_items(
+    sources: list[RecallSource] | tuple[RecallSource, ...],
+) -> list[dict[str, str]]:
+    """Globally order, deduplicate, and cap safe routed recall results."""
+
+    candidates: list[_RecallCandidate] = []
+    for source in sources:
+        if not isinstance(source, RecallSource) or not isinstance(
+            source.response,
+            Mapping,
+        ):
+            continue
+        positions = {
+            namespace: position
+            for namespace, position in source.namespace_order
+            if isinstance(namespace, str)
+            and type(position) is int
+            and position >= 0
+        }
+        original_order = 0
+        results = source.response.get("results")
+        if isinstance(results, list):
+            for document in results:
+                if isinstance(document, Mapping):
+                    candidate = _document_candidate(
+                        document,
+                        connection_order=source.connection_order,
+                        namespace_positions=positions,
+                        result_order=original_order,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
+                original_order += 1
+        facts = source.response.get("facts")
+        if isinstance(facts, list):
+            candidate = _facts_candidate(
+                facts,
+                connection_order=source.connection_order,
+                namespace_positions=positions,
+                result_order=original_order,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            candidate.connection_order,
+            candidate.namespace_order,
+            candidate.result_order,
+        )
+    )
+    selected: list[dict[str, str]] = []
+    seen_identities: set[tuple[str, ...]] = set()
+    seen_content: set[str] = set()
+    for candidate in candidates:
+        if candidate.identity is not None:
+            if candidate.identity in seen_identities:
+                continue
+            seen_identities.add(candidate.identity)
+        else:
+            if candidate.content_digest in seen_content:
+                continue
+            seen_content.add(candidate.content_digest)
+        selected.append(candidate.item)
+        if len(selected) >= _MAX_RESULTS:
+            break
+    return selected
+
+
+def normalize_recall_items(response: object) -> list[dict[str, str]]:
+    """Extract one response through the shared global recall normalizer."""
+
+    return merge_recall_items(
+        [
+            RecallSource(
+                response=response,
+                connection_order=0,
+                namespace_order=(),
+            )
+        ]
+    )
 
 
 __all__ = [
     "RecallDecision",
+    "RecallSource",
     "contains_explicit_secret",
     "contains_secret",
     "is_off_record",
+    "merge_recall_items",
     "normalize_recall_items",
     "render_untrusted_context",
     "sanitize_query",
