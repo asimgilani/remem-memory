@@ -3,7 +3,9 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts import (
@@ -264,6 +266,101 @@ class CanonicalDispatchSecurityTests(unittest.TestCase):
                         "use remem-memory auth"
                     ),
                 )
+
+
+class RoutingCliSecurityTests(unittest.TestCase):
+    def test_named_key_never_enters_arguments_environment_routes_or_output(
+        self,
+    ) -> None:
+        canary = "vlt-routing-cli-secret-canary"
+        captured = {}
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def store(account, value):
+            captured["account"] = account
+            captured["value"] = value
+            captured["argv"] = list(os.sys.argv)
+            captured["environment"] = dict(os.environ)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_MEMORY_DATA_DIR": directory,
+                    "REMEM_API_KEY": "primary-only",
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    remem_memory.getpass,
+                    "getpass",
+                    return_value=canary,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "store_keychain_api_key",
+                        side_effect=store,
+                    ):
+                        with mock.patch.object(
+                            remem_memory.remem_api,
+                            "resolve_keychain_api_key",
+                            return_value=canary,
+                        ):
+                            with contextlib.redirect_stdout(stdout):
+                                with contextlib.redirect_stderr(stderr):
+                                    result = remem_memory.main(
+                                        ["connections", "add", "Private"]
+                                    )
+            routes = (
+                Path(directory) / "routes.json"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["value"], canary)
+        self.assertNotIn(canary, json.dumps(captured["argv"]))
+        self.assertNotIn(canary, json.dumps(captured["environment"]))
+        self.assertEqual(
+            captured["environment"]["REMEM_API_KEY"],
+            "primary-only",
+        )
+        self.assertNotIn(canary, routes)
+        self.assertNotIn(canary, stdout.getvalue())
+        self.assertNotIn(canary, stderr.getvalue())
+
+    def test_connection_add_suppresses_secret_bearing_exception(self) -> None:
+        canary = "vlt-routing-cli-error-canary"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"REMEM_MEMORY_DATA_DIR": directory},
+                clear=True,
+            ):
+                with mock.patch.object(
+                    remem_memory.getpass,
+                    "getpass",
+                    return_value=canary,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "store_keychain_api_key",
+                        side_effect=RuntimeError(canary),
+                    ):
+                        with contextlib.redirect_stdout(stdout):
+                            with contextlib.redirect_stderr(stderr):
+                                result = remem_memory.main(
+                                    ["connections", "add", "Private"]
+                                )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: unable to configure Remem connection\n",
+        )
+        self.assertNotIn(canary, stderr.getvalue())
 
 
 class DirectHelperSecurityTests(unittest.TestCase):

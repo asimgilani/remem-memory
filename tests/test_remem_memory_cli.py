@@ -513,6 +513,580 @@ class CanonicalCliTests(unittest.TestCase):
         )
 
 
+class RoutingCliTests(unittest.TestCase):
+    def _run(self, arguments, *, environment=None):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        selected = environment or {}
+        with mock.patch.dict(os.environ, selected, clear=False):
+            with contextlib.redirect_stdout(stdout):
+                with contextlib.redirect_stderr(stderr):
+                    result = remem_memory.main(arguments)
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_routes_show_has_stable_fully_qualified_default_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, stdout, stderr = self._run(
+                ["routes", "show"],
+                environment={"REMEM_MEMORY_DATA_DIR": directory},
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            stdout,
+            (
+                "mode: auto\n"
+                "migration write block: off\n"
+                "Global routes\n"
+                "  recall: primary/@readable\n"
+                "  memory: primary/@default\n"
+                "  sessions: primary/@default\n"
+                "Codex routes\n"
+                "  recall: inherit -> primary/@readable\n"
+                "  memory: inherit -> primary/@default\n"
+                "  sessions: inherit -> primary/@default\n"
+                "Claude routes\n"
+                "  recall: inherit -> primary/@readable\n"
+                "  memory: inherit -> primary/@default\n"
+                "  sessions: inherit -> primary/@default\n"
+                "Connections\n"
+                "  Primary: configured; credential missing\n"
+                "Last API results\n"
+                "  none\n"
+            ),
+        )
+
+    def test_routes_show_json_is_deterministic_and_client_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = [
+                "routes",
+                "show",
+                "--client",
+                "codex",
+                "--json",
+            ]
+            first = self._run(
+                arguments,
+                environment={"REMEM_MEMORY_DATA_DIR": directory},
+            )
+            second = self._run(
+                arguments,
+                environment={"REMEM_MEMORY_DATA_DIR": directory},
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], 0)
+        payload = json.loads(first[1])
+        self.assertEqual(list(payload["clients"]), ["codex"])
+        self.assertEqual(
+            payload["global_routes"]["recall"],
+            ["primary/@readable"],
+        )
+        self.assertEqual(payload["clients"]["codex"]["memory"]["source"], "inherit")
+        self.assertNotIn("keychain_account", first[1])
+
+    def test_route_summaries_apply_global_mode_without_changing_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            self._run(
+                ["routes", "set", "recall", "--from", "history"],
+                environment=environment,
+            )
+            self._run(
+                ["routes", "set", "memory", "--to", "personal"],
+                environment=environment,
+            )
+            self._run(
+                ["mode", "off"],
+                environment=environment,
+            )
+            shown = self._run(
+                ["routes", "show", "--json"],
+                environment=environment,
+            )
+            status = self._run(["status"], environment=environment)
+            stored = remem_memory.remem_routing.load_routing(
+                Path(directory)
+            )
+
+        payload = json.loads(shown[1])
+        self.assertEqual(
+            payload["global_routes"],
+            {"memory": [], "recall": [], "sessions": []},
+        )
+        for client in ("codex", "claude"):
+            for behavior in ("recall", "memory", "sessions"):
+                self.assertEqual(
+                    payload["clients"][client][behavior]["routes"],
+                    [],
+                )
+        self.assertIn(
+            "routes: recall=off memory=off sessions=off",
+            status[1],
+        )
+        self.assertEqual(
+            stored.global_routes.routes["recall"][0].namespace,
+            "history",
+        )
+
+    def test_routes_show_reports_credential_health_and_fixed_migration_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "REMEM_MEMORY_DATA_DIR": directory,
+                "REMEM_DEFAULT_NAMESPACE": "must-not-be-routed",
+            }
+            config = remem_memory.remem_routing.load_or_initialize_routing(
+                Path(directory),
+                environment,
+            )
+            remem_memory.remem_routing.record_route_health(
+                remem_memory.remem_routing.RouteHealthRecord(
+                    "codex",
+                    "recall",
+                    "primary",
+                    "@readable",
+                    "permission_error",
+                    "read_denied",
+                    "2026-07-24T12:34:56Z",
+                ),
+                Path(directory),
+            )
+            with mock.patch.object(
+                remem_memory.remem_api,
+                "resolve_connection_api_key",
+                return_value=None,
+            ):
+                result, stdout, stderr = self._run(
+                    [
+                        "routes",
+                        "show",
+                        "--client",
+                        "codex",
+                        "--json",
+                    ],
+                    environment=environment,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(
+            payload["connections"],
+            [
+                {
+                    "configured": True,
+                    "credential": "missing",
+                    "name": "Primary",
+                }
+            ],
+        )
+        self.assertEqual(
+            payload["deprecations"],
+            ["REMEM_DEFAULT_NAMESPACE is deprecated"],
+        )
+        self.assertEqual(
+            payload["last_api_results"],
+            [
+                {
+                    "behavior": "recall",
+                    "client": "codex",
+                    "detail_code": "read_denied",
+                    "observed_at": "2026-07-24T12:34:56Z",
+                    "route": "primary/@readable",
+                    "status": "permission_error",
+                }
+            ],
+        )
+        self.assertNotIn("must-not-be-routed", stdout)
+        self.assertTrue(config.legacy_namespace_migration_completed)
+
+    def test_route_set_forms_validate_targets_and_apply_client_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            accepted = (
+                ["routes", "set", "recall", "--from", "team-a", "team-b"],
+                ["routes", "set", "memory", "--to", "personal"],
+                ["routes", "set", "sessions", "--to", "off"],
+                [
+                    "routes",
+                    "set",
+                    "recall",
+                    "--off",
+                    "--client",
+                    "codex",
+                ],
+                [
+                    "routes",
+                    "set",
+                    "memory",
+                    "--to",
+                    "codex-memory",
+                    "--client",
+                    "codex",
+                ],
+                [
+                    "routes",
+                    "set",
+                    "sessions",
+                    "--to",
+                    "off",
+                    "--client",
+                    "claude",
+                ],
+            )
+            for arguments in accepted:
+                with self.subTest(arguments=arguments):
+                    result, _stdout, stderr = self._run(
+                        arguments,
+                        environment=environment,
+                    )
+                    self.assertEqual(result, 0)
+                    self.assertEqual(stderr, "")
+
+            result, stdout, stderr = self._run(
+                ["routes", "show", "--json"],
+                environment=environment,
+            )
+            invalid = (
+                ["routes", "set", "recall", "--from"],
+                ["routes", "set", "recall", "--to", "primary/x"],
+                ["routes", "set", "memory", "--from", "primary/x"],
+                ["routes", "set", "memory", "--to", "unknown/x"],
+                ["routes", "set", "sessions", "--to", "primary/@readable"],
+                ["routes", "set", "recall", "--off", "--client", "other"],
+                ["routes", "set", "memory", "--to", "x", "--json"],
+            )
+            invalid_results = [
+                self._run(arguments, environment=environment)
+                for arguments in invalid
+            ]
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(
+            payload["global_routes"],
+            {
+                "memory": ["primary/personal"],
+                "recall": ["primary/team-a", "primary/team-b"],
+                "sessions": [],
+            },
+        )
+        self.assertEqual(
+            payload["clients"]["codex"]["recall"],
+            {"routes": [], "source": "override"},
+        )
+        self.assertEqual(
+            payload["clients"]["codex"]["memory"],
+            {
+                "routes": ["primary/codex-memory"],
+                "source": "override",
+            },
+        )
+        self.assertEqual(
+            payload["clients"]["claude"]["memory"],
+            {
+                "routes": ["primary/personal"],
+                "source": "inherit",
+            },
+        )
+        for invalid_result, _stdout, invalid_stderr in invalid_results:
+            self.assertEqual(invalid_result, 2)
+            self.assertEqual(
+                invalid_stderr,
+                "error: invalid routes command\n",
+            )
+
+    def test_global_write_choices_release_migration_block_only_when_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "REMEM_MEMORY_DATA_DIR": directory,
+                "REMEM_MEMORY_PERSONAL_NAMESPACE": "personal",
+            }
+            routing = remem_memory.remem_routing
+            routing.initialize_routing(
+                Path(directory),
+                environment,
+                routing.LegacyDiscovery(
+                    2,
+                    {"memory": ("personal",)},
+                ),
+            )
+
+            client_result = self._run(
+                [
+                    "routes",
+                    "set",
+                    "memory",
+                    "--to",
+                    "client-only",
+                    "--client",
+                    "codex",
+                ],
+                environment=environment,
+            )
+            after_client = routing.load_routing(Path(directory))
+            memory_result = self._run(
+                ["routes", "set", "memory", "--to", "chosen"],
+                environment=environment,
+            )
+            after_memory = routing.load_routing(Path(directory))
+            sessions_result = self._run(
+                ["routes", "set", "sessions", "--to", "off"],
+                environment=environment,
+            )
+            after_sessions = routing.load_routing(Path(directory))
+
+        self.assertEqual(client_result[0], 0)
+        self.assertTrue(after_client.migration_write_blocked)
+        self.assertEqual(memory_result[0], 0)
+        self.assertTrue(after_memory.migration_write_blocked)
+        self.assertEqual(sessions_result[0], 0)
+        self.assertFalse(after_sessions.migration_write_blocked)
+
+    def test_connections_add_recovers_unconfigured_record_then_use_is_client_only(self):
+        canary = "vlt-named-connection-secret"
+        keychain = {}
+
+        def store(account, value):
+            keychain[account] = value
+
+        def resolve(account):
+            return keychain.get(account)
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            with mock.patch.object(
+                remem_memory.getpass,
+                "getpass",
+                return_value=canary,
+            ):
+                with mock.patch.object(
+                    remem_memory.remem_api,
+                    "store_keychain_api_key",
+                    side_effect=RuntimeError(canary),
+                ):
+                    interrupted = self._run(
+                        ["connections", "add", "Work"],
+                        environment=environment,
+                    )
+                pending = remem_memory.remem_routing.load_routing(
+                    Path(directory)
+                )
+                with mock.patch.object(
+                    remem_memory.remem_api,
+                    "store_keychain_api_key",
+                    side_effect=store,
+                ):
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_keychain_api_key",
+                        side_effect=resolve,
+                    ):
+                        resumed = self._run(
+                            ["connections", "add", "Work"],
+                            environment=environment,
+                        )
+            used = self._run(
+                ["connections", "use", "Work", "--client", "codex"],
+                environment=environment,
+            )
+            config = remem_memory.remem_routing.load_routing(Path(directory))
+            listed = self._run(
+                ["connections", "list", "--json"],
+                environment=environment,
+            )
+
+        self.assertEqual(interrupted[0], 1)
+        self.assertEqual(len(pending.connections), 2)
+        self.assertFalse(pending.connections[1].configured)
+        self.assertEqual(resumed, (0, "connection: Work configured\n", ""))
+        self.assertEqual(used, (0, "codex MCP connection: Work\n", ""))
+        self.assertEqual(
+            config.mcp_connections,
+            {"codex": config.connections[1].id},
+        )
+        self.assertEqual(
+            json.loads(listed[1]),
+            {
+                "connections": [
+                    {
+                        "configured": True,
+                        "mcp_clients": ["claude"],
+                        "name": "Primary",
+                    },
+                    {
+                        "configured": True,
+                        "mcp_clients": ["codex"],
+                        "name": "Work",
+                    },
+                ]
+            },
+        )
+        for rendered in (
+            interrupted[1],
+            interrupted[2],
+            resumed[1],
+            resumed[2],
+            used[1],
+            used[2],
+            listed[1],
+            listed[2],
+        ):
+            self.assertNotIn(canary, rendered)
+            self.assertNotIn(
+                pending.connections[1].keychain_account,
+                rendered,
+            )
+
+    def test_routing_rejects_pending_connection_and_default_reset_preserves_it(self):
+        canary = "vlt-pending-secret"
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            with mock.patch.object(
+                remem_memory.getpass,
+                "getpass",
+                return_value=canary,
+            ):
+                with mock.patch.object(
+                    remem_memory.remem_api,
+                    "store_keychain_api_key",
+                    side_effect=RuntimeError(canary),
+                ):
+                    self._run(
+                        ["connections", "add", "Pending"],
+                        environment=environment,
+                    )
+            rejected = self._run(
+                ["routes", "set", "memory", "--to", "Pending/private"],
+                environment=environment,
+            )
+            reset = self._run(
+                ["routes", "use-default"],
+                environment=environment,
+            )
+            config = remem_memory.remem_routing.load_routing(Path(directory))
+
+        self.assertEqual(
+            rejected,
+            (2, "", "error: invalid routes command\n"),
+        )
+        self.assertEqual(reset, (0, "routes: default\n", ""))
+        self.assertEqual(len(config.connections), 2)
+        self.assertTrue(config.legacy_namespace_migration_completed)
+
+    def test_status_extends_legacy_controls_with_compact_secret_free_routing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, stdout, stderr = self._run(
+                ["status"],
+                environment={"REMEM_MEMORY_DATA_DIR": directory},
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("mode: auto\n", stdout)
+        self.assertIn("sensitivity: balanced\n", stdout)
+        self.assertIn("routing: valid\n", stdout)
+        self.assertIn("routes: recall=primary/@readable", stdout)
+        self.assertIn(
+            "codex routes: recall=primary/@readable "
+            "memory=primary/@default sessions=primary/@default\n",
+            stdout,
+        )
+        self.assertIn(
+            "claude routes: recall=primary/@readable "
+            "memory=primary/@default sessions=primary/@default\n",
+            stdout,
+        )
+        self.assertIn("connections: 1 configured, 0 missing\n", stdout)
+        self.assertNotIn("keychain_account", stdout)
+
+    def test_doctor_is_deterministic_read_only_and_emits_no_query_content(self):
+        canary = "vlt-doctor-recalled-content"
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "REMEM_MEMORY_DATA_DIR": directory,
+                "REMEM_DEFAULT_NAMESPACE": "must-not-be-routed",
+            }
+            remem_memory.remem_routing.load_or_initialize_routing(
+                Path(directory),
+                environment,
+            )
+            before = {
+                path.name: path.read_bytes()
+                for path in Path(directory).iterdir()
+                if path.is_file()
+            }
+            with mock.patch.object(
+                remem_memory.remem_api.RememAPI,
+                "query",
+                return_value={"results": [{"content": canary}]},
+            ) as query:
+                with mock.patch.object(
+                    remem_memory.remem_api.RememAPI,
+                    "ingest",
+                ) as ingest:
+                    first = self._run(
+                        ["doctor", "--json"],
+                        environment=environment,
+                    )
+                    second = self._run(
+                        ["doctor", "--json"],
+                        environment=environment,
+                    )
+            after = {
+                path.name: path.read_bytes()
+                for path in Path(directory).iterdir()
+                if path.is_file()
+            }
+
+        self.assertEqual(first, second)
+        self.assertIn(first[0], (0, 1))
+        self.assertEqual(before, after)
+        query.assert_not_called()
+        ingest.assert_not_called()
+        self.assertNotIn(canary, first[1])
+        payload = json.loads(first[1])
+        self.assertEqual(payload["read_only"], True)
+        self.assertEqual(
+            payload["migration_diagnostics"],
+            ["REMEM_DEFAULT_NAMESPACE is deprecated"],
+        )
+        self.assertNotIn("must-not-be-routed", first[1])
+        self.assertEqual(
+            [item["name"] for item in payload["checks"]],
+            sorted(item["name"] for item in payload["checks"]),
+        )
+
+    def test_new_command_families_reject_unlisted_argument_shapes(self):
+        invalid = (
+            ["routes"],
+            ["routes", "show", "--client"],
+            ["routes", "show", "--client", "codex", "--client", "claude"],
+            ["routes", "use-default", "--json"],
+            ["connections"],
+            ["connections", "list", "--client", "codex"],
+            ["connections", "add", "Name", "credential"],
+            ["connections", "add", "bad/name"],
+            ["connections", "add", "--api-key"],
+            ["connections", "use", "primary"],
+            ["doctor", "--client", "codex"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            results = [
+                self._run(
+                    arguments,
+                    environment={"REMEM_MEMORY_DATA_DIR": directory},
+                )
+                for arguments in invalid
+            ]
+
+        for result, _stdout, stderr in results:
+            self.assertEqual(result, 2)
+            self.assertTrue(stderr.startswith("error:"))
+
+
 class MCPLauncherTests(unittest.TestCase):
     def setUp(self):
         self._real_cache_environment = launcher._cache_environment

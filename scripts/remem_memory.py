@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import getpass
+import hmac
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import uuid
+from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 
 _SCRIPT_PATH = Path(__file__).resolve()
@@ -23,6 +26,7 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
 
 import remem_api  # noqa: E402
 import remem_mcp_launcher  # noqa: E402
+import remem_routing  # noqa: E402
 
 
 _COMMAND_TO_SCRIPT = {
@@ -83,6 +87,8 @@ _VALID_SENSITIVITIES = {
     "balanced",
     "aggressive",
 }
+_CLIENTS = ("codex", "claude")
+_BEHAVIORS = ("recall", "memory", "sessions")
 _DEFAULT_DATA_DIR = ".config/remem-memory"
 
 
@@ -415,6 +421,659 @@ def _authenticate() -> int:
     return 0
 
 
+def _load_or_initialize_routing() -> remem_routing.RoutingConfig:
+    return remem_routing.load_or_initialize_routing(
+        default_data_dir(),
+        os.environ,
+    )
+
+
+def _connection_name(
+    config: remem_routing.RoutingConfig,
+    connection_id: str,
+) -> str:
+    for connection in config.connections:
+        if connection.id == connection_id:
+            return (
+                "primary"
+                if connection.id == "primary"
+                else connection.label
+            )
+    raise ValueError("Unknown routing connection")
+
+
+def _find_connection(
+    config: remem_routing.RoutingConfig,
+    name: str,
+) -> remem_routing.Connection:
+    if name == "primary":
+        return config.connections[0]
+    matches = [
+        connection
+        for connection in config.connections
+        if connection.label == name or connection.id == name
+    ]
+    if len(matches) != 1:
+        raise ValueError("Unknown routing connection")
+    return matches[0]
+
+
+def _format_targets(
+    config: remem_routing.RoutingConfig,
+    targets: tuple[remem_routing.RouteTarget, ...],
+) -> list[str]:
+    return [
+        (
+            f"{_connection_name(config, target.connection_id)}"
+            f"/{target.namespace}"
+        )
+        for target in targets
+    ]
+
+
+def _global_routes(
+    config: remem_routing.RoutingConfig,
+    mode: str,
+) -> dict[str, tuple[remem_routing.RouteTarget, ...]]:
+    defaults = remem_routing.built_in_routes()
+    routes: dict[str, tuple[remem_routing.RouteTarget, ...]] = {}
+    for behavior in _BEHAVIORS:
+        suppressed = (
+            mode == "off"
+            or (
+                mode == "recall-only"
+                and behavior in {"memory", "sessions"}
+            )
+            or (
+                config.migration_write_blocked
+                and behavior in {"memory", "sessions"}
+            )
+        )
+        if suppressed:
+            routes[behavior] = ()
+        else:
+            routes[behavior] = config.global_routes.routes.get(
+                behavior,
+                defaults[behavior],
+            )
+    return routes
+
+
+def _latest_health(
+    config: remem_routing.RoutingConfig,
+    clients: tuple[str, ...],
+    mode: str,
+) -> list[dict[str, str]]:
+    selected: dict[
+        tuple[str, str, str, str],
+        remem_routing.RouteHealthRecord,
+    ] = {}
+    try:
+        records = remem_routing.load_route_health(default_data_dir())
+    except Exception:
+        return []
+    affected = {
+        (
+            client,
+            behavior,
+            target.connection_id,
+            target.namespace,
+        )
+        for client in clients
+        for behavior in _BEHAVIORS
+        for target in (
+            ()
+            if mode == "off"
+            or mode == "recall-only"
+            and behavior in {"memory", "sessions"}
+            else remem_routing.resolve_routes(
+                config,
+                behavior=behavior,
+                client=client,
+            )
+        )
+    }
+    for record in records:
+        key = (
+            record.client,
+            record.behavior,
+            record.connection_id,
+            record.namespace,
+        )
+        if key in affected:
+            selected[key] = record
+    return [
+        {
+            "behavior": record.behavior,
+            "client": record.client,
+            "detail_code": record.detail_code,
+            "observed_at": record.observed_at,
+            "route": (
+                f"{_connection_name(config, record.connection_id)}"
+                f"/{record.namespace}"
+            ),
+            "status": record.status,
+        }
+        for _key, record in sorted(selected.items())
+    ]
+
+
+def _routes_payload(
+    config: remem_routing.RoutingConfig,
+    clients: tuple[str, ...],
+) -> dict[str, Any]:
+    mode = load_settings()["mode"]
+    global_routes = _global_routes(config, mode)
+    client_routes: dict[str, dict[str, dict[str, Any]]] = {}
+    for client in clients:
+        layer = config.client_routes.get(client)
+        client_routes[client] = {}
+        for behavior in _BEHAVIORS:
+            source = (
+                "override"
+                if layer is not None and behavior in layer.routes
+                else "inherit"
+            )
+            client_routes[client][behavior] = {
+                "routes": _format_targets(
+                    config,
+                    (
+                        ()
+                        if mode == "off"
+                        or mode == "recall-only"
+                        and behavior in {"memory", "sessions"}
+                        else remem_routing.resolve_routes(
+                            config,
+                            behavior=behavior,
+                            client=client,
+                        )
+                    ),
+                ),
+                "source": source,
+            }
+    return {
+        "clients": client_routes,
+        "connections": [
+            {
+                "configured": connection.configured,
+                "credential": (
+                    "available"
+                    if remem_api.resolve_connection_api_key(
+                        connection,
+                        environment=os.environ,
+                    )
+                    else "missing"
+                ),
+                "name": connection.label,
+            }
+            for connection in config.connections
+        ],
+        "deprecations": list(config.deprecations),
+        "global_routes": {
+            behavior: _format_targets(config, global_routes[behavior])
+            for behavior in _BEHAVIORS
+        },
+        "last_api_results": _latest_health(config, clients, mode),
+        "migration_write_blocked": config.migration_write_blocked,
+        "mode": mode,
+    }
+
+
+def _render_route_values(values: list[str]) -> str:
+    return ", ".join(values) if values else "off"
+
+
+def _show_routes(clients: tuple[str, ...], as_json: bool) -> int:
+    try:
+        config = _load_or_initialize_routing()
+        payload = _routes_payload(config, clients)
+    except Exception:
+        print("error: unable to read Remem routing", file=sys.stderr)
+        return 1
+    if as_json:
+        print(
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    print(f"mode: {payload['mode']}")
+    print(
+        "migration write block: "
+        + ("on" if payload["migration_write_blocked"] else "off")
+    )
+    print("Global routes")
+    for behavior in _BEHAVIORS:
+        print(
+            f"  {behavior}: "
+            f"{_render_route_values(payload['global_routes'][behavior])}"
+        )
+    for client in clients:
+        print(f"{client.title()} routes")
+        for behavior in _BEHAVIORS:
+            route = payload["clients"][client][behavior]
+            print(
+                f"  {behavior}: {route['source']} -> "
+                f"{_render_route_values(route['routes'])}"
+            )
+    print("Connections")
+    for connection in payload["connections"]:
+        state = "configured" if connection["configured"] else "missing"
+        print(
+            f"  {connection['name']}: {state}; "
+            f"credential {connection['credential']}"
+        )
+    print("Last API results")
+    if not payload["last_api_results"]:
+        print("  none")
+    else:
+        for record in payload["last_api_results"]:
+            print(
+                f"  {record['route']} {record['behavior']} "
+                f"({record['client']}): {record['status']} "
+                f"[{record['detail_code']}]"
+            )
+    if payload["deprecations"]:
+        print("Migration diagnostics")
+        for diagnostic in payload["deprecations"]:
+            print(f"  {diagnostic}")
+    return 0
+
+
+def _parse_show_options(
+    arguments: List[str],
+) -> Optional[tuple[tuple[str, ...], bool]]:
+    clients: tuple[str, ...] = _CLIENTS
+    as_json = False
+    index = 0
+    client_seen = False
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--json" and not as_json:
+            as_json = True
+            index += 1
+            continue
+        if (
+            argument == "--client"
+            and not client_seen
+            and index + 1 < len(arguments)
+            and arguments[index + 1] in _CLIENTS
+        ):
+            clients = (arguments[index + 1],)
+            client_seen = True
+            index += 2
+            continue
+        return None
+    return clients, as_json
+
+
+def _parse_target(
+    config: remem_routing.RoutingConfig,
+    value: str,
+    *,
+    behavior: str,
+) -> remem_routing.RouteTarget:
+    if not isinstance(value, str) or not value or value == "off":
+        raise ValueError("Invalid route target")
+    if "/" in value:
+        connection_name, separator, namespace = value.partition("/")
+        if not separator or not namespace:
+            raise ValueError("Invalid route target")
+        connection = _find_connection(config, connection_name)
+    else:
+        if len(config.connections) != 1:
+            raise ValueError("A connection name is required")
+        connection = config.connections[0]
+        namespace = value
+    if not connection.configured:
+        raise ValueError("Routing connection is not configured")
+    direction = "read" if behavior == "recall" else "write"
+    return remem_routing.parse_target(
+        f"{connection.id}/{namespace}",
+        direction=direction,
+    )
+
+
+def _set_routes(arguments: List[str]) -> int:
+    if len(arguments) < 2 or arguments[0] not in _BEHAVIORS:
+        print("error: invalid routes command", file=sys.stderr)
+        return 2
+    behavior = arguments[0]
+    remaining = arguments[1:]
+    client: Optional[str] = None
+    if (
+        len(remaining) >= 2
+        and remaining[-2] == "--client"
+        and remaining[-1] in _CLIENTS
+    ):
+        client = remaining[-1]
+        remaining = remaining[:-2]
+    try:
+        config = _load_or_initialize_routing()
+        if behavior == "recall":
+            if remaining == ["--off"]:
+                targets: tuple[remem_routing.RouteTarget, ...] = ()
+            elif (
+                len(remaining) >= 2
+                and remaining[0] == "--from"
+                and all(not item.startswith("--") for item in remaining[1:])
+            ):
+                targets = tuple(
+                    _parse_target(config, item, behavior=behavior)
+                    for item in remaining[1:]
+                )
+            else:
+                raise ValueError("Invalid recall route")
+        else:
+            if len(remaining) != 2 or remaining[0] != "--to":
+                raise ValueError("Invalid write route")
+            targets = (
+                ()
+                if remaining[1] == "off"
+                else (
+                    _parse_target(
+                        config,
+                        remaining[1],
+                        behavior=behavior,
+                    ),
+                )
+            )
+
+        def mutate(
+            current: remem_routing.RoutingConfig,
+        ) -> remem_routing.RoutingConfig:
+            if client is None:
+                routes = dict(current.global_routes.routes)
+                routes[behavior] = targets
+                return replace(
+                    current,
+                    global_routes=remem_routing.RouteLayer(routes),
+                )
+            client_routes = dict(current.client_routes)
+            layer_routes = dict(
+                client_routes.get(
+                    client,
+                    remem_routing.RouteLayer({}),
+                ).routes
+            )
+            layer_routes[behavior] = targets
+            client_routes[client] = remem_routing.RouteLayer(layer_routes)
+            return replace(current, client_routes=client_routes)
+
+        resolve_block = (
+            client is None
+            and behavior in {"memory", "sessions"}
+            and all(
+                item == behavior or item in config.global_routes.routes
+                for item in ("memory", "sessions")
+            )
+        )
+        remem_routing.update_routing(
+            mutate,
+            default_data_dir(),
+            resolve_migration_write_block=resolve_block,
+        )
+    except Exception:
+        print("error: invalid routes command", file=sys.stderr)
+        return 2
+    scope = client or "global"
+    print(
+        f"{scope} {behavior}: "
+        f"{_render_route_values(_format_targets(config, targets))}"
+    )
+    return 0
+
+
+def _use_default_routes() -> int:
+    try:
+        current = _load_or_initialize_routing()
+        if current.migration_write_blocked:
+            defaults = remem_routing.built_in_routes()
+
+            def resolve_block(
+                config: remem_routing.RoutingConfig,
+            ) -> remem_routing.RoutingConfig:
+                routes = dict(config.global_routes.routes)
+                routes["memory"] = defaults["memory"]
+                routes["sessions"] = defaults["sessions"]
+                return replace(
+                    config,
+                    global_routes=remem_routing.RouteLayer(routes),
+                )
+
+            remem_routing.update_routing(
+                resolve_block,
+                default_data_dir(),
+                resolve_migration_write_block=True,
+            )
+        remem_routing.update_routing(
+            remem_routing.use_default_routes,
+            default_data_dir(),
+        )
+    except Exception:
+        print("error: unable to reset Remem routing", file=sys.stderr)
+        return 1
+    print("routes: default")
+    return 0
+
+
+def _routes_command(arguments: List[str]) -> int:
+    if arguments == ["use-default"]:
+        return _use_default_routes()
+    if arguments and arguments[0] == "show":
+        parsed = _parse_show_options(arguments[1:])
+        if parsed is None:
+            print("error: invalid routes command", file=sys.stderr)
+            return 2
+        return _show_routes(*parsed)
+    if arguments and arguments[0] == "set":
+        return _set_routes(arguments[1:])
+    print("error: invalid routes command", file=sys.stderr)
+    return 2
+
+
+def _connection_clients(
+    config: remem_routing.RoutingConfig,
+    connection_id: str,
+) -> list[str]:
+    return [
+        client
+        for client in _CLIENTS
+        if config.mcp_connections.get(client, "primary") == connection_id
+    ]
+
+
+def _connections_list(as_json: bool) -> int:
+    try:
+        config = _load_or_initialize_routing()
+    except Exception:
+        print("error: unable to read Remem connections", file=sys.stderr)
+        return 1
+    connections = [
+        {
+            "configured": connection.configured,
+            "mcp_clients": _connection_clients(config, connection.id),
+            "name": connection.label,
+        }
+        for connection in config.connections
+    ]
+    if as_json:
+        print(
+            json.dumps(
+                {"connections": connections},
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    else:
+        for connection in connections:
+            clients = ", ".join(connection["mcp_clients"]) or "none"
+            state = "configured" if connection["configured"] else "missing"
+            print(
+                f"{connection['name']}: {state}; "
+                f"MCP clients: {clients}"
+            )
+    return 0
+
+
+def _add_connection(name: str) -> int:
+    try:
+        value = getpass.getpass("Remem API key: ")
+    except Exception:
+        print("error: unable to read Remem credential", file=sys.stderr)
+        return 1
+    normalized = value.strip() if isinstance(value, str) else ""
+    if not normalized:
+        print("error: Remem credential cannot be empty", file=sys.stderr)
+        return 2
+    try:
+        config = _load_or_initialize_routing()
+        matches = [
+            connection
+            for connection in config.connections
+            if connection.label == name
+        ]
+        if matches:
+            connection = matches[0]
+            if connection.configured:
+                raise ValueError("Connection already configured")
+        else:
+            if name.lower() == "primary":
+                raise ValueError("Reserved connection name")
+            token = uuid.uuid4().hex
+            connection = remem_routing.Connection(
+                f"conn_{token}",
+                name,
+                f"connection:{token}",
+                False,
+            )
+
+            def add_pending(
+                current: remem_routing.RoutingConfig,
+            ) -> remem_routing.RoutingConfig:
+                if any(
+                    item.label == name for item in current.connections
+                ):
+                    raise ValueError("Duplicate connection")
+                return replace(
+                    current,
+                    connections=(*current.connections, connection),
+                )
+
+            config = remem_routing.update_routing(
+                add_pending,
+                default_data_dir(),
+            )
+            connection = _find_connection(config, name)
+        remem_api.store_keychain_api_key(
+            connection.keychain_account,
+            normalized,
+        )
+        verified = remem_api.resolve_keychain_api_key(
+            connection.keychain_account,
+        )
+        if not isinstance(verified, str) or not hmac.compare_digest(
+            normalized,
+            verified,
+        ):
+            raise ValueError("Credential verification failed")
+
+        def mark_configured(
+            current: remem_routing.RoutingConfig,
+        ) -> remem_routing.RoutingConfig:
+            updated = tuple(
+                replace(item, configured=True)
+                if item.id == connection.id
+                else item
+                for item in current.connections
+            )
+            return replace(current, connections=updated)
+
+        remem_routing.update_routing(
+            mark_configured,
+            default_data_dir(),
+        )
+    except Exception:
+        print(
+            "error: unable to configure Remem connection",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"connection: {name} configured")
+    return 0
+
+
+def _use_connection(name: str, client: str) -> int:
+    try:
+        config = _load_or_initialize_routing()
+        selected = _find_connection(config, name)
+        if not selected.configured:
+            raise ValueError("Connection is not configured")
+
+        def mutate(
+            current: remem_routing.RoutingConfig,
+        ) -> remem_routing.RoutingConfig:
+            mcp_connections = dict(current.mcp_connections)
+            mcp_connections[client] = selected.id
+            return replace(
+                current,
+                mcp_connections=mcp_connections,
+            )
+
+        remem_routing.update_routing(mutate, default_data_dir())
+    except Exception:
+        print("error: invalid connections command", file=sys.stderr)
+        return 2
+    print(f"{client} MCP connection: {selected.label}")
+    return 0
+
+
+def _connections_command(arguments: List[str]) -> int:
+    if arguments == ["list"]:
+        return _connections_list(False)
+    if arguments == ["list", "--json"]:
+        return _connections_list(True)
+    if (
+        len(arguments) == 2
+        and arguments[0] == "add"
+        and _valid_connection_name(arguments[1])
+    ):
+        return _add_connection(arguments[1])
+    if (
+        len(arguments) == 4
+        and arguments[0] == "use"
+        and arguments[2] == "--client"
+        and arguments[3] in _CLIENTS
+    ):
+        return _use_connection(arguments[1], arguments[3])
+    print("error: invalid connections command", file=sys.stderr)
+    return 2
+
+
+def _valid_connection_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and name == name.strip()
+        and 1 <= len(name) <= 64
+        and name.isprintable()
+        and "/" not in name
+        and not name.startswith("-")
+        and name.lower() not in {"primary", "off"}
+    )
+
+
+def _uv_available() -> bool:
+    try:
+        remem_mcp_launcher._find_uv(os.environ, None)
+    except Exception:
+        return False
+    return True
+
+
 def _status() -> int:
     settings = load_settings()
     try:
@@ -429,22 +1088,207 @@ def _status() -> int:
         else "credential: missing"
     )
     try:
-        remem_mcp_launcher._find_uv(os.environ, None)
+        config = _load_or_initialize_routing()
     except Exception:
-        uv_available = False
+        config = None
+        print("routing: invalid")
     else:
-        uv_available = True
-    if uv_available:
+        print("routing: valid")
+        global_routes = _global_routes(config, settings["mode"])
+        print(
+            "routes: "
+            + " ".join(
+                (
+                    f"{behavior}="
+                    f"{_render_route_values(_format_targets(config, global_routes[behavior]))}"
+                )
+                for behavior in _BEHAVIORS
+            )
+        )
+        for client in _CLIENTS:
+            print(
+                f"{client} routes: "
+                + " ".join(
+                    (
+                        f"{behavior}="
+                        + _render_route_values(
+                            _format_targets(
+                                config,
+                                (
+                                    ()
+                                    if settings["mode"] == "off"
+                                    or settings["mode"] == "recall-only"
+                                    and behavior
+                                    in {"memory", "sessions"}
+                                    else remem_routing.resolve_routes(
+                                        config,
+                                        behavior=behavior,
+                                        client=client,
+                                    )
+                                ),
+                            )
+                        )
+                    )
+                    for behavior in _BEHAVIORS
+                )
+            )
+        print(
+            "migration write block: "
+            + ("on" if config.migration_write_blocked else "off")
+        )
+        configured = sum(
+            1 for connection in config.connections if connection.configured
+        )
+        missing = len(config.connections) - configured
+        print(
+            f"connections: {configured} configured, {missing} missing"
+        )
+        for diagnostic in config.deprecations:
+            print(f"migration: {diagnostic}")
+    if _uv_available():
         print("uv: available")
     else:
         print("uv: missing (required for MCP)")
     return 0
 
 
+def _doctor_checks() -> list[dict[str, str]]:
+    checks: dict[str, tuple[str, str]] = {}
+    try:
+        config = remem_routing.load_routing(default_data_dir())
+    except FileNotFoundError:
+        config = None
+        checks["routing_storage"] = ("failed", "missing")
+    except Exception:
+        config = None
+        checks["routing_storage"] = ("failed", "invalid")
+    else:
+        checks["routing_storage"] = ("ok", "valid")
+
+    if config is None:
+        checks["credentials"] = ("failed", "routing_unavailable")
+        checks["namespace_readability"] = (
+            "info",
+            "routing_unavailable",
+        )
+    else:
+        missing = 0
+        for connection in config.connections:
+            if not connection.configured or not remem_api.resolve_connection_api_key(
+                connection,
+                environment=os.environ,
+            ):
+                missing += 1
+        checks["credentials"] = (
+            ("ok", "available")
+            if missing == 0
+            else ("failed", "credential_unavailable")
+        )
+        health = _latest_health(config, _CLIENTS, load_settings()["mode"])
+        if not health:
+            checks["namespace_readability"] = (
+                "info",
+                "no_prior_result",
+            )
+        elif all(record["status"] == "ok" for record in health):
+            checks["namespace_readability"] = ("ok", "authorized")
+        else:
+            checks["namespace_readability"] = (
+                "failed",
+                "authorization_error",
+            )
+        if config.deprecations or config.migration_write_blocked:
+            checks["migration"] = ("info", "attention_required")
+        else:
+            checks["migration"] = ("ok", "complete")
+
+    uv = _uv_available()
+    checks["runtime"] = (
+        ("ok", "uv_available")
+        if uv
+        else ("failed", "uv_missing")
+    )
+    codex_home = Path(
+        os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+    )
+    claude_home = Path(
+        os.environ.get(
+            "CLAUDE_CONFIG_DIR",
+            str(Path.home() / ".claude"),
+        )
+    )
+    if codex_home.is_dir() or claude_home.is_dir():
+        checks["client_registrations"] = ("ok", "client_home_present")
+    else:
+        checks["client_registrations"] = ("failed", "client_home_missing")
+    launcher = _PLUGIN_SCRIPTS / "remem_mcp_launcher.py"
+    checks["mcp_startup"] = (
+        ("ok", "launcher_available")
+        if uv and launcher.is_file()
+        else ("failed", "launcher_unavailable")
+    )
+    hook_manifest = (
+        _REPOSITORY_ROOT
+        / "plugins"
+        / "remem-memory"
+        / "hooks"
+        / "hooks.json"
+    )
+    checks["hook_presence"] = (
+        ("ok", "manifest_available")
+        if hook_manifest.is_file()
+        else ("failed", "manifest_missing")
+    )
+    return [
+        {
+            "detail_code": checks[name][1],
+            "name": name,
+            "status": checks[name][0],
+        }
+        for name in sorted(checks)
+    ]
+
+
+def _doctor(as_json: bool) -> int:
+    checks = _doctor_checks()
+    healthy = all(check["status"] != "failed" for check in checks)
+    try:
+        migration_diagnostics = list(
+            remem_routing.load_routing(default_data_dir()).deprecations
+        )
+    except Exception:
+        migration_diagnostics = []
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "checks": checks,
+                    "healthy": healthy,
+                    "migration_diagnostics": migration_diagnostics,
+                    "read_only": True,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+    else:
+        print("doctor: healthy" if healthy else "doctor: attention required")
+        for check in checks:
+            print(
+                f"{check['name']}: {check['status']} "
+                f"[{check['detail_code']}]"
+            )
+        for diagnostic in migration_diagnostics:
+            print(f"migration: {diagnostic}")
+    return 0 if healthy else 1
+
+
 def _usage(program: str) -> str:
     return (
         f"usage: {program} "
-        "{checkpoint|rollup|recall|codex|mode|sensitivity|auth|status}"
+        "{checkpoint|rollup|recall|codex|mode|sensitivity|auth|status|"
+        "routes|connections|doctor}"
     )
 
 
@@ -504,6 +1348,17 @@ def main(
         return _authenticate()
     if command == "status" and not arguments:
         return _status()
+    if command == "routes":
+        return _routes_command(arguments)
+    if command == "connections":
+        return _connections_command(arguments)
+    if command == "doctor":
+        if not arguments:
+            return _doctor(False)
+        if arguments == ["--json"]:
+            return _doctor(True)
+        print("error: invalid doctor command", file=sys.stderr)
+        return 2
 
     print(_usage(basename), file=sys.stderr)
     return 2
