@@ -371,6 +371,7 @@ remem-memory routes set recall --from CONNECTION/NAMESPACE [CONNECTION/NAMESPACE
 remem-memory routes set recall --off
 remem-memory routes set memory --to CONNECTION/NAMESPACE|off
 remem-memory routes set sessions --to CONNECTION/NAMESPACE|off
+remem-memory routes set recall --from CONNECTION/NAMESPACE [CONNECTION/NAMESPACE ...] --client codex|claude
 remem-memory routes set recall --off --client codex|claude
 remem-memory routes set memory --to CONNECTION/NAMESPACE|off --client codex|claude
 remem-memory routes set sessions --to CONNECTION/NAMESPACE|off --client codex|claude
