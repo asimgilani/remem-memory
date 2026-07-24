@@ -14,10 +14,10 @@ from typing import Dict, List, Optional
 from urllib import parse as urllib_parse
 
 import remem_api
+import remem_routing
 
 
 _DEFAULT_API_URL = "https://api.remem.io"
-_DEFAULT_NAMESPACE = "default"
 _PROBE_CREDENTIAL = "remem-mcp-runtime-probe"
 _PROBE_CODE = (
     "import os,sys;sys.path.insert(0,sys.argv[1]);"
@@ -33,10 +33,10 @@ _SERVER_CODE = (
 )
 _MAX_CREDENTIAL_BYTES = 8192
 _BUNDLE_HASHES = {
-    "PROVENANCE.json": "06b5e5ffed51cb2c9c705daadd89f701d4e99ce2eb281692555cc3e95f7d074c",
+    "PROVENANCE.json": "68c6d783edb2fedb3afd022ae675b6c72485a7bc8540ea277c0dafd071800374",
     "pyproject.toml": "35d557173f5c2659517ab902e432f60f2068924751c859cf7e2a2c743b767ae7",
     "remem_mcp/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "remem_mcp/server.py": "f1e538da401172d007d39a83d99a7291696f1928362533f4d492e9b6f2a500e1",
+    "remem_mcp/server.py": "490d2d3bfaa7bec5e08f3e379b0d1c9f6700e143a033471895840b16cd5fa072",
     "uv.lock": "2932996e6841f0430290443549a4073083a202fe676dd5d372074a0178a7ee24",
 }
 _CHILD_ENVIRONMENT_KEYS = (
@@ -49,12 +49,33 @@ _CHILD_ENVIRONMENT_KEYS = (
     "LC_ALL",
     "LC_CTYPE",
     "REMEM_API_URL",
-    "REMEM_DEFAULT_NAMESPACE",
 )
 
 
 class _LauncherError(RuntimeError):
     pass
+
+
+def _parse_arguments(argv: Sequence[str]) -> tuple[str, bool]:
+    client: Optional[str] = None
+    probe = False
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--probe" and not probe:
+            probe = True
+            index += 1
+            continue
+        if argument == "--client" and client is None and index + 1 < len(argv):
+            candidate = argv[index + 1]
+            if candidate in {"codex", "claude"}:
+                client = candidate
+                index += 2
+                continue
+        raise _LauncherError("error: invalid Remem MCP client")
+    if client is None:
+        raise _LauncherError("error: invalid Remem MCP client")
+    return client, probe
 
 
 def _is_generated_python_cache(root: Path, path: Path) -> bool:
@@ -243,7 +264,6 @@ def _child_environment(
     }
     child["UV_PROJECT_ENVIRONMENT"] = cache_environment
     child["PYTHONDONTWRITEBYTECODE"] = "1"
-    child.setdefault("REMEM_DEFAULT_NAMESPACE", _DEFAULT_NAMESPACE)
     return child
 
 
@@ -368,6 +388,7 @@ def main(
 ) -> int:
     selected = dict(os.environ if environment is None else environment)
     try:
+        client, probe = _parse_arguments(list(argv or ()))
         bundle, content_digest = _validate_bundle(
             bundle_root or _default_bundle_root()
         )
@@ -378,11 +399,7 @@ def main(
         return 2
 
     child = _child_environment(selected, cache)
-    selected_argv = list(argv or ())
-    if selected_argv:
-        if selected_argv != ["--probe"]:
-            print("error: unsupported Remem MCP launcher argument", file=sys.stderr)
-            return 2
+    if probe:
         return _run_probe(uv, bundle, child, runner=runner)
 
     if _run_probe(uv, bundle, child, runner=runner) != 0:
@@ -411,17 +428,41 @@ def main(
     hostname = urllib_parse.urlsplit(
         child["REMEM_API_URL"]
     ).hostname
-    if hostname in {"localhost", "127.0.0.1", "::1"}:
-        candidate = selected.get("REMEM_API_KEY")
-        credential = (
-            candidate.strip()
-            if isinstance(candidate, str) and candidate.strip()
+    try:
+        data_dir = selected.get("REMEM_MEMORY_DATA_DIR")
+        config = remem_routing.load_routing(
+            Path(data_dir).expanduser()
+            if isinstance(data_dir, str) and data_dir.strip()
             else None
         )
+        connection = remem_routing.resolve_mcp_connection(
+            config,
+            client=client,
+        )
+    except Exception:
+        connection = None
+
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        if connection is not None and connection.id == "primary":
+            candidate = selected.get("REMEM_API_KEY")
+            credential = (
+                candidate.strip()
+                if isinstance(candidate, str) and candidate.strip()
+                else None
+            )
+        else:
+            credential = None
     else:
-        selected_resolver = resolver or remem_api.resolve_api_key
+        selected_resolver = resolver or remem_api.resolve_connection_api_key
         try:
-            credential = selected_resolver(environment=selected)
+            credential = (
+                selected_resolver(
+                    connection=connection,
+                    environment=selected,
+                )
+                if connection is not None
+                else None
+            )
         except Exception:
             credential = None
     if not credential:

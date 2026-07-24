@@ -509,6 +509,14 @@ class PackagingDocsTests(unittest.TestCase):
         ):
             self.assertIn(phrase, normalized)
 
+    def test_mcp_runtime_has_no_plugin_default_namespace_override(self) -> None:
+        for path in (
+            "plugins/remem-memory/.mcp.json",
+            "plugins/remem-memory/scripts/remem_mcp_launcher.py",
+            "plugins/remem-memory/mcp/remem_mcp/server.py",
+        ):
+            self.assertNotIn("REMEM_DEFAULT_NAMESPACE", read(path), path)
+
 
 if __name__ == "__main__":
     unittest.main()

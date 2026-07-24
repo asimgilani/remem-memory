@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -258,6 +259,73 @@ class PluginContractTests(unittest.TestCase):
                     "invalid plugin root",
                 )
                 self.assertNotIn("secret", completed.stderr)
+
+    def test_mcp_bootstrap_uses_original_root_token_for_client_identity(self):
+        server = load_json(
+            "plugins/remem-memory/.mcp.json"
+        )["mcpServers"]["remem"]
+        bootstrap = server["args"][2]
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory) / "plugin"
+            scripts = plugin_root / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "remem_mcp_launcher.py").write_text(
+                (
+                    "import json,sys\n"
+                    "print(json.dumps({'argv': sys.argv[1:]}))\n"
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PLUGIN_ROOT"] = str(plugin_root)
+            cases = (
+                (str(plugin_root), "claude"),
+                ("${CLAUDE_PLUGIN_ROOT}", "codex"),
+                ("$UNRESOLVED_ROOT", "codex"),
+            )
+            for token, expected in cases:
+                with self.subTest(token=token):
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-c",
+                            bootstrap,
+                            token,
+                        ],
+                        cwd=plugin_root,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(
+                        json.loads(completed.stdout)["argv"],
+                        ["--client", expected],
+                    )
+
+            malformed = subprocess.run(
+                [sys.executable, "-I", "-c", bootstrap, "$"],
+                cwd=plugin_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertEqual(malformed.stderr.strip(), "invalid plugin root")
+            missing = subprocess.run(
+                [sys.executable, "-I", "-c", bootstrap],
+                cwd=plugin_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertEqual(missing.stderr.strip(), "invalid plugin root")
 
 
 if __name__ == "__main__":

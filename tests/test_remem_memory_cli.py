@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import importlib.util
 import io
@@ -18,7 +19,11 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PLUGIN_SCRIPTS = _ROOT / "plugins" / "remem-memory" / "scripts"
 sys.path.insert(0, str(_PLUGIN_SCRIPTS))
 
+import remem_routing  # noqa: E402
 from scripts import remem_dev_sessions, remem_memory  # noqa: E402
+from tests.test_mcp_identifier_security import (  # noqa: E402
+    _SERVER as bundled_mcp_server,
+)
 
 
 def load_script(name, path):
@@ -1943,6 +1948,19 @@ class MCPLauncherTests(unittest.TestCase):
         )
         self._probe = probe_patcher.start()
         self.addCleanup(probe_patcher.stop)
+        self._routing = tempfile.TemporaryDirectory()
+        self.addCleanup(self._routing.cleanup)
+        self._routing_config = remem_routing.load_or_initialize_routing(
+            Path(self._routing.name),
+            {},
+        )
+        routing_patcher = mock.patch.object(
+            remem_routing,
+            "load_routing",
+            return_value=self._routing_config,
+        )
+        routing_patcher.start()
+        self.addCleanup(routing_patcher.stop)
 
     def _mcp_server(self):
         config = json.loads(
@@ -1955,7 +1973,13 @@ class MCPLauncherTests(unittest.TestCase):
     def _run_mcp_bootstrap(self, plugin_root, cwd):
         server = self._mcp_server()
         bootstrap = server["args"][2]
-        run_path = mock.Mock()
+        observed = {}
+
+        def capture_run_path(*args, **kwargs):
+            observed["argv"] = list(sys.argv)
+
+        run_path = mock.Mock(side_effect=capture_run_path)
+        run_path.observed = observed
         with mock.patch.object(
             sys,
             "argv",
@@ -2010,6 +2034,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         with self.assertRaises(ExecIntercept):
             launcher.main(
+                ["--client", "codex"],
                 environment=original,
                 resolver=lambda **kwargs: "vlt_child-only-canary",
                 which=lambda command: "/test/bin/uv",
@@ -2048,7 +2073,6 @@ class MCPLauncherTests(unittest.TestCase):
                 "TMPDIR": "/test/tmp",
                 "LANG": "en_CA.UTF-8",
                 "REMEM_API_URL": "https://api.remem.io",
-                "REMEM_DEFAULT_NAMESPACE": "engineering",
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "REMEM_API_KEY_FD": mock.ANY,
             },
@@ -2075,6 +2099,7 @@ class MCPLauncherTests(unittest.TestCase):
         ):
             with contextlib.redirect_stderr(stderr):
                 result = launcher.main(
+                    ["--client", "codex"],
                     environment={},
                     resolver=resolver,
                     which=lambda command: None,
@@ -2227,7 +2252,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         self.assertEqual(resolved, str(safe.resolve()))
 
-    def test_launcher_supplies_literal_safe_mcp_defaults(self):
+    def test_launcher_supplies_api_origin_without_namespace_default(self):
         class ExecIntercept(Exception):
             pass
 
@@ -2240,6 +2265,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         with self.assertRaises(ExecIntercept):
             launcher.main(
+                ["--client", "codex"],
                 environment={"PATH": "/test/bin"},
                 resolver=lambda **kwargs: "configured",
                 which=lambda command: "/test/bin/uv",
@@ -2250,7 +2276,7 @@ class MCPLauncherTests(unittest.TestCase):
             child["REMEM_API_URL"],
             "https://api.remem.io",
         )
-        self.assertEqual(child["REMEM_DEFAULT_NAMESPACE"], "default")
+        self.assertNotIn("REMEM_DEFAULT_NAMESPACE", child)
 
     def test_launcher_missing_key_error_is_fixed_and_non_secret(self):
         canary = "vlt_launcher-secret-canary"
@@ -2261,6 +2287,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         with contextlib.redirect_stderr(stderr):
             result = launcher.main(
+                ["--client", "codex"],
                 environment={},
                 resolver=failing_resolver,
                 which=lambda command: "/test/bin/uv",
@@ -2284,6 +2311,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         with contextlib.redirect_stderr(stderr):
             result = launcher.main(
+                ["--client", "codex"],
                 environment={"PATH": "/test/bin"},
                 resolver=lambda **kwargs: canary,
                 which=lambda command: "/test/bin/uv",
@@ -2311,6 +2339,7 @@ class MCPLauncherTests(unittest.TestCase):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     result = launcher.main(
+                        ["--client", "codex"],
                         environment={
                             "PATH": "/test/bin",
                             "HOME": "/test/home",
@@ -2334,6 +2363,7 @@ class MCPLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with contextlib.redirect_stderr(stderr):
                 result = launcher.main(
+                    ["--client", "codex"],
                     environment={
                         "PATH": "/test/bin",
                         "HOME": "/test/home",
@@ -2412,6 +2442,7 @@ class MCPLauncherTests(unittest.TestCase):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             result = launcher.main(
+                ["--client", "codex"],
                 environment={
                     "PATH": "/test/bin",
                     "HOME": "/test/home",
@@ -2447,6 +2478,7 @@ class MCPLauncherTests(unittest.TestCase):
         resolver = mock.Mock(side_effect=AssertionError("must not run"))
         with self.assertRaises(ExecIntercept):
             launcher.main(
+                ["--client", "codex"],
                 environment={
                     "PATH": "/test/bin",
                     "HOME": "/test/home",
@@ -2464,6 +2496,50 @@ class MCPLauncherTests(unittest.TestCase):
             observed["credential"],
             "vlt_loopback-explicit",
         )
+
+    def test_named_connection_cannot_route_any_credential_to_loopback(self):
+        named = remem_routing.Connection(
+            "conn_0123456789abcdef0123456789abcdef",
+            "Work",
+            "connection:0123456789abcdef0123456789abcdef",
+            True,
+        )
+        config = replace(
+            self._routing_config,
+            connections=(*self._routing_config.connections, named),
+            mcp_connections={"codex": named.id},
+        )
+        resolver = mock.Mock(return_value="vlt_named-must-not-cross")
+        execvpe = mock.Mock()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            remem_routing,
+            "load_routing",
+            return_value=config,
+        ):
+            with contextlib.redirect_stderr(stderr):
+                result = launcher.main(
+                    ["--client", "codex"],
+                    environment={
+                        "PATH": "/test/bin",
+                        "HOME": "/test/home",
+                        "REMEM_API_URL": "http://localhost:8000",
+                        "REMEM_API_KEY": "vlt_primary-local-only",
+                        "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+                    },
+                    resolver=resolver,
+                    which=lambda command: "/test/bin/uv",
+                    execvpe=execvpe,
+                )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            stderr.getvalue().strip(),
+            "error: Remem credential is not configured",
+        )
+        resolver.assert_not_called()
+        execvpe.assert_not_called()
 
     def test_launcher_creates_private_content_addressed_cache(self):
         self._cache_environment = None
@@ -2555,6 +2631,10 @@ class MCPLauncherTests(unittest.TestCase):
             f"{plugin_root}/scripts/remem_mcp_launcher.py",
             run_name="__main__",
         )
+        self.assertEqual(
+            run_path.observed["argv"][-2:],
+            ["--client", "claude"],
+        )
 
     def test_mcp_bootstrap_uses_cwd_for_codex_literal_root(self):
         plugin_root = "/opt/codex/plugins/remem-memory"
@@ -2569,6 +2649,10 @@ class MCPLauncherTests(unittest.TestCase):
         run_path.assert_called_once_with(
             f"{plugin_root}/scripts/remem_mcp_launcher.py",
             run_name="__main__",
+        )
+        self.assertEqual(
+            run_path.observed["argv"][-2:],
+            ["--client", "codex"],
         )
 
     def test_mcp_bootstrap_runs_from_isolated_codex_plugin_root(self):
@@ -2598,6 +2682,398 @@ class MCPLauncherTests(unittest.TestCase):
         observed = json.loads(completed.stdout)
         self.assertEqual(observed["cwd"], str(plugin_root.resolve()))
         self.assertEqual(observed["path0"], str(scripts.resolve()))
+
+    def test_launcher_requires_known_client_before_resolving_credentials(self):
+        for arguments in (
+            [],
+            ["--client"],
+            ["--client", "other"],
+            ["--client", "codex", "--client", "claude"],
+        ):
+            with self.subTest(arguments=arguments):
+                resolver = mock.Mock(return_value="configured")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = launcher.main(
+                        arguments,
+                        environment={"PATH": "/test/bin"},
+                        resolver=resolver,
+                        which=lambda command: "/test/bin/uv",
+                        execvpe=mock.Mock(),
+                    )
+
+                self.assertEqual(result, 2)
+                self.assertEqual(
+                    stderr.getvalue().strip(),
+                    "error: invalid Remem MCP client",
+                )
+                resolver.assert_not_called()
+
+    def test_launcher_resolves_only_the_selected_client_connection(self):
+        class ExecIntercept(Exception):
+            pass
+
+        named = remem_routing.Connection(
+            "conn_0123456789abcdef0123456789abcdef",
+            "Work",
+            "connection:0123456789abcdef0123456789abcdef",
+            True,
+        )
+        config = replace(
+            self._routing_config,
+            connections=(*self._routing_config.connections, named),
+            mcp_connections={"codex": named.id, "claude": "primary"},
+        )
+        observed = []
+
+        def resolver(**kwargs):
+            connection = kwargs["connection"]
+            observed.append(connection.id)
+            return {
+                "primary": "vlt_primary-must-not-cross",
+                named.id: "vlt_named-selected",
+            }[connection.id]
+
+        def execvpe(executable, arguments, environment):
+            del executable, arguments
+            descriptor = int(environment["REMEM_API_KEY_FD"])
+            observed.append(os.read(descriptor, 8192).decode("utf-8"))
+            raise ExecIntercept()
+
+        with mock.patch.object(
+            remem_routing,
+            "load_routing",
+            return_value=config,
+        ):
+            with self.assertRaises(ExecIntercept):
+                launcher.main(
+                    ["--client", "codex"],
+                    environment={"PATH": "/test/bin"},
+                    resolver=resolver,
+                    which=lambda command: "/test/bin/uv",
+                    execvpe=execvpe,
+                )
+
+        self.assertEqual(observed, [named.id, "vlt_named-selected"])
+        self.assertNotIn("vlt_primary-must-not-cross", json.dumps(observed))
+
+    def test_bundled_mcp_omits_unspecified_namespaces(self):
+        request = mock.AsyncMock(
+            side_effect=(
+                {"ok": True},
+                {"ok": True},
+                {"results": []},
+                {"results": []},
+            )
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"REMEM_DEFAULT_NAMESPACE": "legacy-must-not-route"},
+            clear=False,
+        ):
+            with mock.patch.object(
+                bundled_mcp_server,
+                "_request",
+                request,
+            ):
+                asyncio.run(
+                    bundled_mcp_server.call_tool(
+                        "remem_ingest",
+                        {
+                            "content": "first",
+                            "source_id": "source-one",
+                        },
+                    )
+                )
+                asyncio.run(
+                    bundled_mcp_server.call_tool(
+                        "remem_ingest",
+                        {
+                            "content": "second",
+                            "source_id": "source-two",
+                            "namespace": "explicit-write",
+                        },
+                    )
+                )
+                asyncio.run(
+                    bundled_mcp_server.call_tool(
+                        "remem_query",
+                        {"query": "all readable"},
+                    )
+                )
+                asyncio.run(
+                    bundled_mcp_server.call_tool(
+                        "remem_query",
+                        {
+                            "query": "selected",
+                            "namespaces": ["one", "two"],
+                        },
+                    )
+                )
+
+        omitted_write = request.await_args_list[0].kwargs["json_body"]
+        explicit_write = request.await_args_list[1].kwargs["json_body"]
+        omitted_read = request.await_args_list[2].kwargs["json_body"]
+        explicit_read = request.await_args_list[3].kwargs["json_body"]
+        self.assertNotIn("namespace", omitted_write)
+        self.assertEqual(explicit_write["namespace"], "explicit-write")
+        self.assertNotIn("namespaces", omitted_read)
+        self.assertEqual(explicit_read["namespaces"], ["one", "two"])
+
+    def test_bundled_mcp_retries_only_fixed_transient_matrix(self):
+        class Response:
+            def __init__(self, status, *, body="vlt_response-body-canary"):
+                self.status_code = status
+                self.text = body
+
+            def json(self):
+                return {"ok": True}
+
+            def raise_for_status(self):
+                if not 200 <= self.status_code < 300:
+                    error = bundled_mcp_server.httpx.HTTPStatusError()
+                    error.response = self
+                    raise error
+
+        class Client:
+            def __init__(self, outcomes, calls):
+                self.outcomes = outcomes
+                self.calls = calls
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def request(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                outcome = self.outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        bundled_mcp_server.httpx.TimeoutException = type(
+            "TimeoutException",
+            (Exception,),
+            {},
+        )
+        bundled_mcp_server.httpx.NetworkError = type(
+            "NetworkError",
+            (Exception,),
+            {},
+        )
+        cases = (
+            (400, "request"),
+            (401, "auth"),
+            (403, "permission"),
+            (404, "namespace"),
+            (422, "request"),
+        )
+        for status, kind in cases:
+            with self.subTest(status=status):
+                calls = []
+                sleeps = mock.AsyncMock()
+                with mock.patch.object(
+                    bundled_mcp_server.httpx,
+                    "AsyncClient",
+                    return_value=Client([Response(status)], calls),
+                ):
+                    with mock.patch.object(
+                        bundled_mcp_server,
+                        "_get_api_key",
+                        return_value="vlt_test-key",
+                    ):
+                        with mock.patch.object(
+                            bundled_mcp_server,
+                            "_sleep",
+                            sleeps,
+                            create=True,
+                        ):
+                            with self.assertRaises(Exception) as caught:
+                                asyncio.run(
+                                    bundled_mcp_server._request(
+                                        "POST",
+                                        "/v1/query",
+                                        json_body={"query": "fixed"},
+                                    )
+                                )
+
+                self.assertEqual(
+                    str(caught.exception),
+                    f"Remem request failed: status={status} kind={kind}",
+                )
+                self.assertEqual(len(calls), 1)
+                sleeps.assert_not_awaited()
+                self.assertNotIn(
+                    "response-body-canary",
+                    str(caught.exception),
+                )
+
+        for status in (429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                calls = []
+                sleeps = mock.AsyncMock()
+                with mock.patch.object(
+                    bundled_mcp_server.httpx,
+                    "AsyncClient",
+                    return_value=Client(
+                        [Response(status), Response(status), Response(200)],
+                        calls,
+                    ),
+                ):
+                    with mock.patch.object(
+                        bundled_mcp_server.uuid,
+                        "uuid4",
+                        return_value="stable-idempotency",
+                    ):
+                        with mock.patch.object(
+                            bundled_mcp_server,
+                            "_get_api_key",
+                            return_value="vlt_test-key",
+                        ):
+                            with mock.patch.object(
+                                bundled_mcp_server,
+                                "_sleep",
+                                sleeps,
+                                create=True,
+                            ):
+                                try:
+                                    result = asyncio.run(
+                                        bundled_mcp_server._request(
+                                            "POST",
+                                            "/v1/query",
+                                            json_body={
+                                                "query": "stable",
+                                                "source_id": "stable-source",
+                                                "namespace": "fixed-destination",
+                                            },
+                                        )
+                                    )
+                                except Exception as error:
+                                    result = error
+
+                self.assertEqual(result, {"ok": True})
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(
+                    all(call[0] == calls[0][0] for call in calls)
+                )
+                self.assertEqual(
+                    [call.args[0] for call in sleeps.await_args_list],
+                    [0.25, 0.5],
+                )
+                self.assertEqual(
+                    {json.dumps(call[1], sort_keys=True, default=str) for call in calls},
+                    {json.dumps(calls[0][1], sort_keys=True, default=str)},
+                )
+                self.assertEqual(
+                    {
+                        call[1]["headers"].get("Idempotency-Key")
+                        for call in calls
+                    },
+                    {"stable-idempotency"},
+                )
+
+        for exception_type in (
+            bundled_mcp_server.httpx.TimeoutException,
+            bundled_mcp_server.httpx.NetworkError,
+        ):
+            with self.subTest(exception=exception_type.__name__):
+                calls = []
+                sleeps = mock.AsyncMock()
+                with mock.patch.object(
+                    bundled_mcp_server.httpx,
+                    "AsyncClient",
+                    return_value=Client(
+                        [
+                            exception_type("vlt_network-canary"),
+                            exception_type("vlt_network-canary"),
+                            Response(200),
+                        ],
+                        calls,
+                    ),
+                ):
+                    with mock.patch.object(
+                        bundled_mcp_server,
+                        "_get_api_key",
+                        return_value="vlt_test-key",
+                    ):
+                        with mock.patch.object(
+                            bundled_mcp_server,
+                            "_sleep",
+                            sleeps,
+                            create=True,
+                        ):
+                            result = asyncio.run(
+                                bundled_mcp_server._request(
+                                    "GET",
+                                    "/v1/entities",
+                                    params={"limit": 10},
+                                )
+                            )
+
+                self.assertEqual(result, {"ok": True})
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(
+                    [call.args[0] for call in sleeps.await_args_list],
+                    [0.25, 0.5],
+                )
+
+    def test_bundled_mcp_retry_keeps_request_and_redacts_response(self):
+        class Response:
+            status_code = 403
+            text = "vlt_response-body-canary"
+
+            def json(self):
+                return {"must": "not return"}
+
+            def raise_for_status(self):
+                error = bundled_mcp_server.httpx.HTTPStatusError()
+                error.response = self
+                raise error
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def request(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return Response()
+
+        client = Client()
+        with mock.patch.object(
+            bundled_mcp_server.httpx,
+            "AsyncClient",
+            return_value=client,
+        ):
+            with mock.patch.object(
+                bundled_mcp_server,
+                "_get_api_key",
+                return_value="vlt_test-key",
+            ):
+                result = asyncio.run(
+                    bundled_mcp_server.call_tool(
+                        "remem_ingest",
+                        {
+                            "content": "stable content",
+                            "source_id": "stable-source",
+                            "namespace": "fixed-destination",
+                        },
+                    )
+                )
+
+        self.assertEqual(
+            result[0].text,
+            "Remem request failed: status=403 kind=permission",
+        )
+        self.assertEqual(len(client.calls), 1)
+        self.assertNotIn("response-body-canary", result[0].text)
 
     def test_mcp_config_uses_cross_loader_and_contains_no_secret(self):
         server = self._mcp_server()

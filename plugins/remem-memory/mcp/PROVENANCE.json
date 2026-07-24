@@ -13,6 +13,8 @@
     "Disable HTTP client environment trust so ambient proxies and CA overrides cannot receive authorization.",
     "Remove the local build backend and project entrypoint; sync only locked dependencies with --no-install-project.",
     "Prepare the locked environment without the user credential; the credential-bearing launch executes cached Python directly against the integrity-checked source.",
-    "Validate document and entity identifiers as canonical UUIDs before constructing API paths."
+    "Validate document and entity identifiers as canonical UUIDs before constructing API paths.",
+    "Delegate omitted read and write namespaces to the selected API key instead of injecting a plugin default.",
+    "Retry only the audited transient matrix with stable requests and return fixed status/kind errors without response bodies."
   ]
 }

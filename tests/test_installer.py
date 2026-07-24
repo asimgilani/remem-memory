@@ -1687,5 +1687,48 @@ class CompatibilityEntrypointTests(unittest.TestCase):
             self.assertNotIn("import httpx", source)
 
 
+class MCPBootstrapTests(unittest.TestCase):
+    def test_installer_bootstrap_derives_and_forwards_exact_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory) / "plugin"
+            scripts = plugin_root / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "remem_mcp_launcher.py").write_text(
+                (
+                    "import json,sys\n"
+                    "print(json.dumps({'argv': sys.argv[1:]}))\n"
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PLUGIN_ROOT"] = str(plugin_root)
+            for token, expected in (
+                (str(plugin_root), "claude"),
+                ("${CLAUDE_PLUGIN_ROOT}", "codex"),
+            ):
+                with self.subTest(token=token):
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-c",
+                            install_remem_memory._MCP_BOOTSTRAP,
+                            token,
+                            "--probe",
+                        ],
+                        cwd=plugin_root,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(
+                        json.loads(completed.stdout)["argv"],
+                        ["--probe", "--client", expected],
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

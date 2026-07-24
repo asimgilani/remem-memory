@@ -14,6 +14,11 @@ import uuid
 from typing import Any
 
 MAX_RESPONSE_CHARS = 50_000
+_ERROR_KINDS = frozenset(
+    ("auth", "permission", "namespace", "request", "transient")
+)
+_TRANSIENT_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
+_RETRY_DELAYS = (0.25, 0.5)
 
 
 def _get_base_url() -> str:
@@ -81,13 +86,42 @@ def _get_default_max_results() -> int:
     return max(1, min(100, value))
 
 
-def _get_default_namespace() -> str:
-    """Return the default namespace from REMEM_DEFAULT_NAMESPACE env var.
+class _RequestError(RuntimeError):
+    """Fixed, non-secret failure safe to return through MCP."""
 
-    Used as fallback for write tools when the caller omits ``namespace``.
-    Empty string means no namespace (original behaviour).
-    """
-    return os.getenv("REMEM_DEFAULT_NAMESPACE", "")
+    def __init__(self, status: int | None, kind: str) -> None:
+        checked_kind = kind if kind in _ERROR_KINDS else "request"
+        checked_status = (
+            status
+            if isinstance(status, int) and 100 <= status <= 599
+            else None
+        )
+        self.status = checked_status
+        self.kind = checked_kind
+        rendered_status = (
+            str(checked_status)
+            if checked_status is not None
+            else "unavailable"
+        )
+        super().__init__(
+            "Remem request failed: "
+            f"status={rendered_status} kind={checked_kind}"
+        )
+
+
+def _http_error_kind(status: int) -> str:
+    if status == 401:
+        return "auth"
+    if status == 403:
+        return "permission"
+    if status == 404:
+        return "namespace"
+    if status in _TRANSIENT_HTTP_STATUSES:
+        return "transient"
+    return "request"
+
+
+_sleep = asyncio.sleep
 
 
 def _truncate_response(text: str, max_size: int = MAX_RESPONSE_CHARS) -> str:
@@ -122,12 +156,13 @@ async def _request(
 ) -> Any:
     api_key = _get_api_key()
     if not api_key:
-        raise RuntimeError("Remem credential is not configured")
+        raise _RequestError(None, "auth")
 
     base_url = _get_base_url()
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Idempotency-Key": str(uuid.uuid4()),
     }
 
     async with httpx.AsyncClient(
@@ -135,15 +170,36 @@ async def _request(
         follow_redirects=False,
         trust_env=False,
     ) as client:
-        resp = await client.request(
-            method,
-            f"{base_url}{path}",
-            headers=headers,
-            json=json_body,
-            params=params,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(3):
+            try:
+                response = await client.request(
+                    method,
+                    f"{base_url}{path}",
+                    headers=headers,
+                    json=json_body,
+                    params=params,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError):
+                failure = _RequestError(None, "transient")
+            except Exception:
+                raise _RequestError(None, "request") from None
+            else:
+                status = getattr(response, "status_code", None)
+                if not isinstance(status, int):
+                    raise _RequestError(None, "request")
+                if 200 <= status < 300:
+                    try:
+                        return response.json()
+                    except Exception:
+                        raise _RequestError(status, "request") from None
+                failure = _RequestError(
+                    status,
+                    _http_error_kind(status),
+                )
+            if failure.kind != "transient" or attempt == 2:
+                raise failure
+            await _sleep(_RETRY_DELAYS[attempt])
+    raise _RequestError(None, "transient")
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +219,7 @@ _NAMESPACE_SCHEMA: dict[str, Any] = {
     "type": "string",
     "description": (
         "Target namespace for this write operation. "
-        "Falls back to REMEM_DEFAULT_NAMESPACE if omitted."
+        "When omitted, the selected key's server-defined default is used."
     ),
 }
 
@@ -415,8 +471,12 @@ def _format_search_results(data: dict[str, Any]) -> str:
 
 def _resolve_write_namespace(arguments: dict[str, Any]) -> str | None:
     """Return the namespace for a write operation, or *None* to omit."""
-    ns = arguments.get("namespace") or _get_default_namespace()
-    return ns if ns else None
+    namespace = arguments.get("namespace")
+    return (
+        namespace
+        if isinstance(namespace, str) and namespace
+        else None
+    )
 
 
 def _resolve_read_namespaces(arguments: dict[str, Any]) -> list[str] | None:
@@ -679,11 +739,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
-    except httpx.HTTPStatusError as exc:
-        # Include response body for debugging, but truncate in case it's large.
-        body = exc.response.text
-        msg = f"HTTP {exc.response.status_code} calling Remem API: {body}"
-        return [TextContent(type="text", text=_truncate_response(msg))]
+    except _RequestError as exc:
+        return [TextContent(type="text", text=str(exc))]
     except Exception as exc:
         return [TextContent(type="text", text=_truncate_response(f"Error: {exc}"))]
 
