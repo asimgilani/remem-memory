@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -21,6 +22,21 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_SCRIPTS))
 
 import remem_api  # noqa: E402
+
+try:
+    from scripts.remem_checkpoint import _consume_route_descriptor
+except ModuleNotFoundError:
+    _CHECKPOINT_PATH = Path(__file__).resolve().with_name(
+        "remem_checkpoint.py"
+    )
+    _SPEC = importlib.util.spec_from_file_location(
+        "_remem_recall_route_descriptor",
+        _CHECKPOINT_PATH,
+    )
+    _MODULE = importlib.util.module_from_spec(_SPEC)
+    assert _SPEC and _SPEC.loader
+    _SPEC.loader.exec_module(_MODULE)
+    _consume_route_descriptor = _MODULE._consume_route_descriptor
 
 _MODE_CHOICES = ("fast", "rich")
 _DEFAULT_API_URL = "https://api.remem.io"
@@ -123,6 +139,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--query", help="Query text.")
     parser.add_argument("--query-file", help="Read query text from file.")
+    parser.add_argument("--client", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--from", dest="route_sources", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=_MODE_CHOICES, default=os.getenv("REMEM_DEFAULT_MODE", "fast"))
     parser.add_argument("--max-results", type=int, default=_int_env("REMEM_MAX_RESULTS", 10))
     parser.add_argument("--synthesize", action="store_true", help="Request LLM synthesis (rich mode only).")
@@ -168,14 +186,33 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(output, indent=2, ensure_ascii=True))
         return 0
 
-    try:
-        api_url, api_key = remem_api.resolve_api_access(args.api_url)
-    except Exception:
-        print("error: invalid Remem API URL", file=sys.stderr)
-        return 2
+    if "REMEM_MEMORY_ROUTE_FD" in os.environ:
+        try:
+            route = _consume_route_descriptor(
+                os.environ,
+                expected_client=args.client,
+                expected_behavior="recall",
+            )
+            api_url = remem_api.normalize_api_origin(
+                args.api_url,
+                allow_local_dev=True,
+            )
+            api_key = remem_api.consume_explicit_api_key(os.environ)
+        except Exception:
+            print("error: invalid route descriptor", file=sys.stderr)
+            return 1
+    else:
+        try:
+            api_url, api_key = remem_api.resolve_api_access(args.api_url)
+        except Exception:
+            print("error: invalid Remem API URL", file=sys.stderr)
+            return 2
+        route = {"read_namespaces": None}
     if not api_key:
         print("error: Remem credential is not configured", file=sys.stderr)
-        return 2
+        return 1
+    if route["read_namespaces"] is not None:
+        payload["namespaces"] = list(route["read_namespaces"])
 
     try:
         response = query_remem(
@@ -183,11 +220,11 @@ def main(argv: list[str] | None = None) -> int:
             api_key=api_key,
             payload=payload,
         )
-    except remem_api.RememAPIError:
-        print("error: query failed", file=sys.stderr)
+    except remem_api.RememAPIError as error:
+        print(f"error: query failed [{error.kind}]", file=sys.stderr)
         return 1
 
-    record = {"timestamp": _utc_now_iso(), "payload": payload, "response": response}
+    record = {"timestamp": _utc_now_iso(), "payload": payload}
     if not args.no_log:
         append_recall_log(args.log_file, record)
 

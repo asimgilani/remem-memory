@@ -28,6 +28,7 @@ class CodexWrapperTests(unittest.TestCase):
         on_wait=None,
         extra_environment=None,
         summary_enabled=False,
+        ingest=False,
     ):
         class FakeChild:
             def __init__(self, environment):
@@ -111,14 +112,19 @@ class CodexWrapperTests(unittest.TestCase):
                                                     "Thread",
                                                     return_value=mock.Mock(),
                                                 ):
-                                                    result = _MODULE.main(
-                                                        [
-                                                            "--checkpoint-on-start",
-                                                            "--always-checkpoint",
+                                                    arguments = [
+                                                        "--checkpoint-on-start",
+                                                        "--always-checkpoint",
+                                                        "--codex-bin",
+                                                        "codex",
+                                                    ]
+                                                    if not ingest:
+                                                        arguments.insert(
+                                                            2,
                                                             "--no-ingest",
-                                                            "--codex-bin",
-                                                            "codex",
-                                                        ]
+                                                        )
+                                                    result = _MODULE.main(
+                                                        arguments
                                                     )
         return result, checkpoint, rollup, popen
 
@@ -171,7 +177,7 @@ class CodexWrapperTests(unittest.TestCase):
                 [],
             )
 
-    def test_direct_wrapper_keeps_key_only_in_memory_helper_environments(
+    def test_direct_wrapper_resolves_key_only_at_live_helper_boundaries(
         self,
     ) -> None:
         canary = "vlt_wrapper-memory-only-secret-canary"
@@ -247,54 +253,68 @@ class CodexWrapperTests(unittest.TestCase):
                                     "_summary_enabled",
                                     return_value=False,
                                 ):
+                                    live_route = (
+                                        _MODULE.SessionsRouteSnapshot(
+                                            route_revision=3,
+                                            connection_id="primary",
+                                            write_namespace=None,
+                                            credential=canary,
+                                        )
+                                    )
                                     with mock.patch.object(
                                         _MODULE,
-                                        "_write_state",
-                                    ):
+                                        "_resolve_live_sessions_route",
+                                        return_value=live_route,
+                                    ) as resolve_route:
                                         with mock.patch.object(
                                             _MODULE,
-                                            "_run_checkpoint",
-                                            side_effect=run_checkpoint,
-                                        ) as checkpoint:
+                                            "_write_state",
+                                        ):
                                             with mock.patch.object(
                                                 _MODULE,
-                                                "_run_rollup",
-                                                side_effect=run_rollup,
-                                            ) as rollup:
+                                                "_run_checkpoint",
+                                                side_effect=run_checkpoint,
+                                            ) as checkpoint:
                                                 with mock.patch.object(
-                                                    _MODULE.subprocess,
-                                                    "Popen",
-                                                    return_value=FakeChild(),
-                                                ) as popen:
+                                                    _MODULE,
+                                                    "_run_rollup",
+                                                    side_effect=run_rollup,
+                                                ) as rollup:
                                                     with mock.patch.object(
-                                                        _MODULE.signal,
-                                                        "signal",
-                                                    ):
+                                                        _MODULE.subprocess,
+                                                        "Popen",
+                                                        return_value=FakeChild(),
+                                                    ) as popen:
                                                         with mock.patch.object(
-                                                            _MODULE.threading,
-                                                            "Thread",
-                                                            return_value=mock.Mock(),
+                                                            _MODULE.signal,
+                                                            "signal",
                                                         ):
-                                                            with contextlib.redirect_stdout(
-                                                                stdout
+                                                            with mock.patch.object(
+                                                                _MODULE.threading,
+                                                                "Thread",
+                                                                return_value=mock.Mock(),
                                                             ):
-                                                                with contextlib.redirect_stderr(
-                                                                    stderr
+                                                                with contextlib.redirect_stdout(
+                                                                    stdout
                                                                 ):
-                                                                    result = _MODULE.main(
-                                                                        [
-                                                                            "--checkpoint-on-start",
-                                                                            "--always-checkpoint",
-                                                                            "--codex-bin",
-                                                                            "codex",
-                                                                        ]
-                                                                    )
+                                                                    with contextlib.redirect_stderr(
+                                                                        stderr
+                                                                    ):
+                                                                        result = _MODULE.main(
+                                                                            [
+                                                                                "--checkpoint-on-start",
+                                                                                "--always-checkpoint",
+                                                                                "--codex-bin",
+                                                                                "codex",
+                                                                            ]
+                                                                        )
 
                 self.assertNotIn("REMEM_API_KEY", os.environ)
 
         self.assertEqual(result, 0)
         self.assertGreaterEqual(checkpoint.call_count, 1)
         rollup.assert_called_once()
+        self.assertGreaterEqual(resolve_route.call_count, 4)
         self.assertTrue(checkpoint_environments)
         self.assertTrue(rollup_environments)
         for environment in (
@@ -425,6 +445,52 @@ class CodexWrapperTests(unittest.TestCase):
         self.assertEqual(result, 0)
         popen.assert_called_once()
         checkpoint.assert_called_once()
+        rollup.assert_not_called()
+
+    def test_wrapper_discards_checkpoint_when_live_route_changes_before_write(
+        self,
+    ) -> None:
+        initial = mock.Mock(
+            route_revision=4,
+            connection_id="primary",
+            write_namespace=None,
+            credential="vlt_initial-canary",
+        )
+        changed = mock.Mock(
+            route_revision=5,
+            connection_id="conn_" + ("c" * 32),
+            write_namespace="sessions",
+            credential="vlt_changed-canary",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "settings.json").write_text(
+                '{"mode":"auto","sensitivity":"balanced"}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                _MODULE,
+                "_resolve_live_sessions_route",
+                create=True,
+                side_effect=[initial, changed],
+            ) as resolve:
+                def switch_off(_environment):
+                    Path(directory, "settings.json").write_text(
+                        '{"mode":"off","sensitivity":"balanced"}',
+                        encoding="utf-8",
+                    )
+
+                result, checkpoint, rollup, popen = (
+                    self._run_wrapper_main(
+                        directory,
+                        on_wait=switch_off,
+                        ingest=True,
+                    )
+                )
+
+        self.assertEqual(result, 0)
+        popen.assert_called_once()
+        self.assertEqual(resolve.call_count, 2)
+        checkpoint.assert_not_called()
         rollup.assert_not_called()
 
     def test_wrapper_shared_off_record_state_skips_exit_writes(self) -> None:
@@ -829,6 +895,66 @@ class CodexWrapperTests(unittest.TestCase):
         self.assertEqual(captured["api_key"], canary)
         self.assertEqual(captured["api_url"], "https://api.remem.io")
         self.assertIsNone(captured["environment_key"])
+
+    def test_in_process_checkpoint_log_omits_api_response_body(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "checkpoint.ndjson"
+            helper = mock.Mock()
+            helper.build_checkpoint_payload.return_value = {
+                "title": "Safe checkpoint",
+                "content": "Safe summary.",
+                "metadata": {},
+                "source": "quick_capture",
+                "source_id": "checkpoint:safe",
+                "source_path": str(Path.cwd()),
+                "mime_type": "text/markdown",
+                "return_id": False,
+            }
+            helper.ingest_checkpoint.return_value = {
+                "document_id": "doc",
+                "private_body": "must-not-be-logged",
+            }
+            helper._utc_now_iso.return_value = (
+                "2026-07-24T00:00:00+00:00"
+            )
+
+            def append_log(path, record):
+                Path(path).write_text(
+                    json.dumps(record),
+                    encoding="utf-8",
+                )
+
+            helper.append_checkpoint_log.side_effect = append_log
+            with mock.patch.object(
+                _MODULE,
+                "_load_helper_module",
+                return_value=helper,
+            ):
+                result = _MODULE._run_checkpoint(
+                    cwd=Path.cwd(),
+                    env={"REMEM_API_URL": "https://api.remem.io"},
+                    project="remem",
+                    session_id="session",
+                    kind="interval",
+                    summary="Safe summary.",
+                    changed_files=[],
+                    max_files=10,
+                    log_file=str(log_path),
+                    ingest=True,
+                    dry_run=False,
+                    decisions=[],
+                    open_questions=[],
+                    next_actions=[],
+                    credential="vlt_selected-canary",
+                )
+
+            logged = json.loads(log_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result)
+        self.assertNotIn("response", logged)
+        self.assertNotIn("must-not-be-logged", repr(logged))
 
     def test_in_process_checkpoint_git_child_keeps_strict_environment(
         self,

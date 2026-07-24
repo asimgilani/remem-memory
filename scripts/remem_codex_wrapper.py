@@ -31,6 +31,7 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
 
 import remem_api  # noqa: E402
 import remem_memory_hook  # noqa: E402
+import remem_routing  # noqa: E402
 from memory_policy import (  # noqa: E402
     contains_explicit_secret,
     contains_secret,
@@ -118,6 +119,22 @@ class EngineeringGate:
     writes_allowed: bool
     summaries_allowed: bool
     privacy_suppressed: bool
+
+
+@dataclass(frozen=True)
+class SessionsRouteSnapshot:
+    route_revision: int
+    connection_id: str
+    write_namespace: str | None
+    credential: str
+
+    @property
+    def identity(self) -> tuple[int, str, str | None]:
+        return (
+            self.route_revision,
+            self.connection_id,
+            self.write_namespace,
+        )
 
 
 def _is_process_injection_variable(name: str) -> bool:
@@ -271,6 +288,72 @@ def _engineering_control(session_id: str) -> EngineeringControl:
         off_record_seen=state.get("off_record_seen") is True,
         state_available=True,
     )
+
+
+def _resolve_live_sessions_route(
+    environment: dict[str, str] | None = None,
+) -> SessionsRouteSnapshot | None:
+    """Resolve one current Codex sessions destination and credential."""
+
+    selected = os.environ if environment is None else environment
+    configured_dir = selected.get("REMEM_MEMORY_DATA_DIR", "").strip()
+    data_dir = (
+        Path(configured_dir).expanduser()
+        if configured_dir
+        else Path.home() / ".config" / "remem-memory"
+    )
+    try:
+        config = remem_routing.load_or_initialize_routing(
+            data_dir,
+            selected,
+        )
+        targets = remem_routing.resolve_routes(
+            config,
+            behavior="sessions",
+            client="codex",
+        )
+        if len(targets) != 1:
+            return None
+        target = targets[0]
+        connection = next(
+            item
+            for item in config.connections
+            if item.id == target.connection_id
+        )
+        credential = remem_api.resolve_connection_api_key(
+            connection,
+            environment=selected,
+        )
+    except Exception:
+        return None
+    if not credential:
+        return None
+    return SessionsRouteSnapshot(
+        route_revision=config.revision,
+        connection_id=target.connection_id,
+        write_namespace=(
+            None if target.namespace == "@default" else target.namespace
+        ),
+        credential=credential,
+    )
+
+
+def _same_sessions_route(
+    first: SessionsRouteSnapshot | Any,
+    second: SessionsRouteSnapshot | Any,
+) -> bool:
+    try:
+        return (
+            first.route_revision,
+            first.connection_id,
+            first.write_namespace,
+        ) == (
+            second.route_revision,
+            second.connection_id,
+            second.write_namespace,
+        )
+    except Exception:
+        return False
 
 
 def _value_contains_secret(
@@ -1189,6 +1272,7 @@ def _run_checkpoint(
     open_questions: list[str],
     next_actions: list[str],
     credential: str | None = None,
+    namespace: str | None = None,
 ) -> bool:
     if contains_explicit_secret(str(cwd)):
         return False
@@ -1246,17 +1330,18 @@ def _run_checkpoint(
         if ingest and not dry_run:
             if not credential:
                 return False
-            response = helper.ingest_checkpoint(
-                api_url=args.api_url,
-                api_key=credential,
-                payload=payload,
-            )
+            ingest_options = {
+                "api_url": args.api_url,
+                "api_key": credential,
+                "payload": payload,
+            }
+            if namespace is not None:
+                ingest_options["namespace"] = namespace
+            response = helper.ingest_checkpoint(**ingest_options)
         record: dict[str, Any] = {
             "timestamp": helper._utc_now_iso(),
             "payload": payload,
         }
-        if response is not None:
-            record["response"] = response
         helper.append_checkpoint_log(log_file, record)
         return True
     except Exception:
@@ -1275,6 +1360,7 @@ def _run_rollup(
     ingest: bool,
     dry_run: bool,
     credential: str | None = None,
+    namespace: str | None = None,
 ) -> bool:
     if contains_explicit_secret(str(cwd)):
         return False
@@ -1320,17 +1406,19 @@ def _run_rollup(
         if ingest and not dry_run:
             if not credential:
                 return False
-            response = helper.ingest_checkpoint(
-                api_url=args.api_url,
-                api_key=credential,
-                payload=payload,
-            )
+            ingest_options = {
+                "api_url": args.api_url,
+                "api_key": credential,
+                "payload": payload,
+            }
+            if namespace is not None:
+                ingest_options["namespace"] = namespace
+            response = helper.ingest_checkpoint(**ingest_options)
         helper.append_checkpoint_log(
             log_file,
             {
                 "timestamp": helper._utc_now_iso(),
                 "payload": payload,
-                "response": response,
                 "event": "rollup",
             },
         )
@@ -1398,6 +1486,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     startup_environment = dict(os.environ)
     explicit_key = remem_api.consume_explicit_api_key(os.environ)
+    startup_environment.pop("REMEM_API_KEY", None)
+    startup_environment.pop("REMEM_API_KEY_FD", None)
     transported_runtime = _consume_runtime_environment(os.environ)
     direct_runtime = {
         name: value
@@ -1421,8 +1511,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     ingest_requested = not args.no_ingest and not args.dry_run
-    api_key: str | None = None
     api_url = args.api_url
+    credential_environment: dict[str, str] = {}
     if ingest_requested:
         credential_environment = {
             "REMEM_MEMORY_ALLOW_LOCAL_DEV": os.getenv(
@@ -1433,14 +1523,16 @@ def main(argv: list[str] | None = None) -> int:
         if explicit_key:
             credential_environment["REMEM_API_KEY"] = explicit_key
         try:
-            api_url, api_key = remem_api.resolve_api_access(
+            api_url = remem_api.normalize_api_origin_for_environment(
                 api_url,
                 credential_environment,
             )
         except Exception:
             print("error: invalid Remem API URL", file=sys.stderr)
             return 2
-    ingest = bool(ingest_requested and api_key)
+    explicit_key = None
+    credential_environment.clear()
+    ingest = ingest_requested
 
     safe_environment = _sanitized_runtime_environment()
     runtime_env = dict(safe_environment)
@@ -1564,6 +1656,15 @@ def main(argv: list[str] | None = None) -> int:
             with lock:
                 last_snapshot = changed
             return False
+        route_before = (
+            _resolve_live_sessions_route()
+            if ingest
+            else None
+        )
+        if ingest and route_before is None:
+            with lock:
+                last_snapshot = changed
+            return False
 
         if not force and not args.always_checkpoint and in_git_repo:
             if not changed:
@@ -1598,6 +1699,18 @@ def main(argv: list[str] | None = None) -> int:
             with lock:
                 last_snapshot = changed
             return False
+        route_after = (
+            _resolve_live_sessions_route()
+            if ingest
+            else None
+        )
+        if ingest and (
+            route_after is None
+            or not _same_sessions_route(route_before, route_after)
+        ):
+            with lock:
+                last_snapshot = changed
+            return False
         ok = _run_checkpoint(
             cwd=cwd,
             env=memory_env,
@@ -1613,7 +1726,16 @@ def main(argv: list[str] | None = None) -> int:
             decisions=decisions,
             open_questions=open_questions,
             next_actions=next_actions,
-            credential=api_key,
+            credential=(
+                route_after.credential
+                if route_after is not None
+                else None
+            ),
+            namespace=(
+                route_after.write_namespace
+                if route_after is not None
+                else None
+            ),
         )
         if ok:
             with lock:
@@ -1665,6 +1787,11 @@ def main(argv: list[str] | None = None) -> int:
         and rollup_gate.writes_allowed
         and not rollup_privacy_pending
     ):
+        rollup_route_before = (
+            _resolve_live_sessions_route()
+            if ingest
+            else None
+        )
         rollup_summary = (
             f"Automatic final rollup from Codex wrapper. "
             f"Exit code: {exit_code}. Checkpoints created: {checkpoints_created}."
@@ -1686,17 +1813,42 @@ def main(argv: list[str] | None = None) -> int:
             rollup_gate.writes_allowed
             and not rollup_privacy_pending
         ):
-            _run_rollup(
-                cwd=cwd,
-                env=memory_env,
-                project=project,
-                session_id=session_id,
-                summary=rollup_summary,
-                log_file=args.log_file,
-                ingest=ingest,
-                dry_run=args.dry_run,
-                credential=api_key,
+            rollup_route_after = (
+                _resolve_live_sessions_route()
+                if ingest
+                else None
             )
+            if (
+                not ingest
+                or (
+                    rollup_route_before is not None
+                    and rollup_route_after is not None
+                    and _same_sessions_route(
+                        rollup_route_before,
+                        rollup_route_after,
+                    )
+                )
+            ):
+                _run_rollup(
+                    cwd=cwd,
+                    env=memory_env,
+                    project=project,
+                    session_id=session_id,
+                    summary=rollup_summary,
+                    log_file=args.log_file,
+                    ingest=ingest,
+                    dry_run=args.dry_run,
+                    credential=(
+                        rollup_route_after.credential
+                        if rollup_route_after is not None
+                        else None
+                    ),
+                    namespace=(
+                        rollup_route_after.write_namespace
+                        if rollup_route_after is not None
+                        else None
+                    ),
+                )
 
     _write_state(
         state_path,

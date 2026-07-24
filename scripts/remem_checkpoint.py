@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, MutableMapping
 
 _PLUGIN_SCRIPTS = (
     Path(__file__).resolve().parents[1]
@@ -26,6 +28,20 @@ import remem_api  # noqa: E402
 _SOURCE_CHOICES = ("api", "quick_capture", "folder_sync", "gmail")
 _KIND_CHOICES = ("interval", "milestone", "final", "manual")
 _DEFAULT_API_URL = "https://api.remem.io"
+_ROUTE_FD_ENV = "REMEM_MEMORY_ROUTE_FD"
+_MAX_ROUTE_DESCRIPTOR_BYTES = 4096
+_ROUTE_FIELDS = frozenset(
+    (
+        "schema_version",
+        "client",
+        "behavior",
+        "route_revision",
+        "connection_id",
+        "read_namespaces",
+        "write_namespace",
+    )
+)
+_CONNECTION_ID = re.compile(r"conn_[0-9a-f]{32}\Z")
 
 
 def _slug(value: str) -> str:
@@ -36,6 +52,123 @@ def _slug(value: str) -> str:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _reject_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    decoded: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError("duplicate route descriptor field")
+        decoded[key] = value
+    return decoded
+
+
+def _valid_connection_id(value: object) -> bool:
+    return value == "primary" or (
+        isinstance(value, str)
+        and _CONNECTION_ID.fullmatch(value) is not None
+    )
+
+
+def _valid_namespace(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 100
+        and value not in {"@readable", "@default"}
+        and all(
+            unicodedata.category(character) != "Cc"
+            for character in value
+        )
+    )
+
+
+def _consume_route_descriptor(
+    environment: MutableMapping[str, str],
+    *,
+    expected_client: str,
+    expected_behavior: str,
+) -> dict[str, Any]:
+    """Consume one exact, non-secret routed-child descriptor."""
+
+    raw_descriptor = environment.pop(_ROUTE_FD_ENV, "")
+    if (
+        not isinstance(raw_descriptor, str)
+        or not raw_descriptor.isdigit()
+        or int(raw_descriptor) < 3
+    ):
+        raise ValueError("invalid route descriptor")
+    descriptor = int(raw_descriptor)
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total <= _MAX_ROUTE_DESCRIPTOR_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    4096,
+                    _MAX_ROUTE_DESCRIPTOR_BYTES + 1 - total,
+                ),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        raise ValueError("invalid route descriptor") from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    raw = b"".join(chunks)
+    if not raw or len(raw) > _MAX_ROUTE_DESCRIPTOR_BYTES:
+        raise ValueError("invalid route descriptor")
+    try:
+        parsed = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, ValueError, TypeError):
+        raise ValueError("invalid route descriptor") from None
+    if (
+        not isinstance(parsed, dict)
+        or frozenset(parsed) != _ROUTE_FIELDS
+        or type(parsed["schema_version"]) is not int
+        or parsed["schema_version"] != 1
+        or parsed["client"] != expected_client
+        or parsed["client"] not in {"codex", "claude"}
+        or parsed["behavior"] != expected_behavior
+        or parsed["behavior"] not in {"recall", "memory", "sessions"}
+        or type(parsed["route_revision"]) is not int
+        or parsed["route_revision"] < 0
+        or not _valid_connection_id(parsed["connection_id"])
+    ):
+        raise ValueError("invalid route descriptor")
+    read_namespaces = parsed["read_namespaces"]
+    write_namespace = parsed["write_namespace"]
+    if expected_behavior == "recall":
+        if write_namespace is not None or (
+            read_namespaces is not None
+            and (
+                not isinstance(read_namespaces, list)
+                or not read_namespaces
+                or len(read_namespaces) > 16
+                or any(
+                    not _valid_namespace(namespace)
+                    for namespace in read_namespaces
+                )
+                or len(set(read_namespaces)) != len(read_namespaces)
+            )
+        ):
+            raise ValueError("invalid route descriptor")
+    elif read_namespaces is not None or (
+        write_namespace is not None
+        and not _valid_namespace(write_namespace)
+    ):
+        raise ValueError("invalid route descriptor")
+    return parsed
 
 
 def _git_branch(repo_root: str) -> str | None:
@@ -173,6 +306,7 @@ def ingest_checkpoint(
     api_url: str,
     api_key: str,
     payload: dict[str, Any],
+    namespace: str | None = None,
 ) -> dict[str, Any]:
     api = remem_api.RememAPI(
         api_url,
@@ -181,7 +315,7 @@ def ingest_checkpoint(
     )
     return api.ingest(
         payload,
-        None,
+        namespace,
         timeout=30.0,
     )
 
@@ -200,6 +334,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--project", required=True, help="Project identifier (for metadata and tags).")
     parser.add_argument("--session-id", required=True, help="Session identifier used to group checkpoints.")
+    parser.add_argument("--client", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--to", help=argparse.SUPPRESS)
     parser.add_argument("--kind", choices=_KIND_CHOICES, default="interval", help="Checkpoint type.")
     parser.add_argument("--title", help="Optional document title override.")
     parser.add_argument("--summary", help="Checkpoint summary text.")
@@ -243,25 +379,49 @@ def main(argv: list[str] | None = None) -> int:
     response: dict[str, Any] | None = None
 
     if args.ingest and not args.dry_run:
-        try:
-            api_url, api_key = remem_api.resolve_api_access(
-                args.api_url
-            )
-        except Exception:
-            print("error: invalid Remem API URL", file=sys.stderr)
-            return 2
+        if _ROUTE_FD_ENV in os.environ:
+            try:
+                route = _consume_route_descriptor(
+                    os.environ,
+                    expected_client=args.client,
+                    expected_behavior="sessions",
+                )
+                api_url = remem_api.normalize_api_origin(
+                    args.api_url,
+                    allow_local_dev=True,
+                )
+                api_key = remem_api.consume_explicit_api_key(os.environ)
+            except Exception:
+                print("error: invalid route descriptor", file=sys.stderr)
+                return 1
+        else:
+            try:
+                api_url, api_key = remem_api.resolve_api_access(
+                    args.api_url
+                )
+            except Exception:
+                print("error: invalid Remem API URL", file=sys.stderr)
+                return 2
+            route = {"write_namespace": None}
         if not api_key:
             print(
                 "error: Remem credential is not configured",
                 file=sys.stderr,
             )
-            return 2
-        response = ingest_checkpoint(
-            api_url=api_url,
-            api_key=api_key,
-            payload=payload,
-        )
-        record["response"] = response
+            return 1
+        try:
+            response = ingest_checkpoint(
+                api_url=api_url,
+                api_key=api_key,
+                payload=payload,
+                namespace=route["write_namespace"],
+            )
+        except remem_api.RememAPIError as error:
+            print(
+                f"error: ingest failed [{error.kind}]",
+                file=sys.stderr,
+            )
+            return 1
 
     if not args.no_log:
         append_checkpoint_log(args.log_file, record)

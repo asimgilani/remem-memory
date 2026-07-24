@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -165,10 +166,32 @@ class RecallCliTests(unittest.TestCase):
         }
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with mock.patch.object(
-            module.remem_api,
-            "resolve_api_access",
-            return_value=("https://api.remem.io", "test-key"),
+        route_read, route_write = os.pipe()
+        key_read, key_write = os.pipe()
+        os.write(
+            route_write,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "client": "codex",
+                    "behavior": "recall",
+                    "route_revision": 1,
+                    "connection_id": "primary",
+                    "read_namespaces": None,
+                    "write_namespace": None,
+                }
+            ).encode("utf-8"),
+        )
+        os.write(key_write, b"test-key")
+        os.close(route_write)
+        os.close(key_write)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REMEM_MEMORY_ROUTE_FD": str(route_read),
+                "REMEM_API_KEY_FD": str(key_read),
+            },
+            clear=True,
         ):
             with mock.patch.object(
                 module,
@@ -192,6 +215,132 @@ class RecallCliTests(unittest.TestCase):
         self.assertNotIn("\x1b", stdout.getvalue())
         self.assertNotIn("\x07", stdout.getvalue())
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_routed_child_consumes_one_descriptor_and_queries_only_its_namespaces(
+        self,
+    ) -> None:
+        module = self._load_recall_module()
+        route = {
+            "schema_version": 1,
+            "client": "claude",
+            "behavior": "recall",
+            "route_revision": 9,
+            "connection_id": "conn_" + ("b" * 32),
+            "read_namespaces": ["history", "decisions"],
+            "write_namespace": None,
+        }
+        route_read, route_write = os.pipe()
+        key_read, key_write = os.pipe()
+        os.write(route_write, json.dumps(route).encode("utf-8"))
+        os.write(key_write, b"vlt_selected-only-canary")
+        os.close(route_write)
+        os.close(key_write)
+        captured = {}
+
+        def query_remem(*, api_url, api_key, payload):
+            captured["api_url"] = api_url
+            captured["api_key"] = api_key
+            captured["payload"] = payload
+            captured["route_environment"] = os.environ.get(
+                "REMEM_MEMORY_ROUTE_FD"
+            )
+            captured["key_environment"] = os.environ.get(
+                "REMEM_API_KEY_FD"
+            )
+            return {"results": []}
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REMEM_MEMORY_ROUTE_FD": str(route_read),
+                "REMEM_API_KEY_FD": str(key_read),
+                "REMEM_API_URL": "https://api.remem.io",
+            },
+            clear=True,
+        ):
+            with mock.patch.object(
+                module,
+                "query_remem",
+                side_effect=query_remem,
+            ):
+                with contextlib.redirect_stdout(stdout):
+                    with contextlib.redirect_stderr(stderr):
+                        result = module.main(
+                            [
+                                "--client",
+                                "claude",
+                                "--query",
+                                "history",
+                                "--no-log",
+                            ]
+                        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(captured["api_key"], "vlt_selected-only-canary")
+        self.assertEqual(
+            captured["payload"]["namespaces"],
+            ["history", "decisions"],
+        )
+        self.assertIsNone(captured["route_environment"])
+        self.assertIsNone(captured["key_environment"])
+        with self.assertRaises(OSError):
+            os.read(route_read, 1)
+        with self.assertRaises(OSError):
+            os.read(key_read, 1)
+
+    def test_routed_child_reports_only_fixed_permanent_failure_kind(
+        self,
+    ) -> None:
+        module = self._load_recall_module()
+        route = {
+            "schema_version": 1,
+            "client": "codex",
+            "behavior": "recall",
+            "route_revision": 3,
+            "connection_id": "primary",
+            "read_namespaces": None,
+            "write_namespace": None,
+        }
+        route_read, route_write = os.pipe()
+        key_read, key_write = os.pipe()
+        os.write(route_write, json.dumps(route).encode("utf-8"))
+        os.write(key_write, b"vlt_selected-only-canary")
+        os.close(route_write)
+        os.close(key_write)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REMEM_MEMORY_ROUTE_FD": str(route_read),
+                "REMEM_API_KEY_FD": str(key_read),
+            },
+            clear=True,
+        ):
+            with mock.patch.object(
+                module,
+                "query_remem",
+                side_effect=module.remem_api.RememAPIError(
+                    "body contains private response",
+                    kind="permission",
+                ),
+            ):
+                with contextlib.redirect_stdout(stdout):
+                    with contextlib.redirect_stderr(stderr):
+                        result = module.main(
+                            ["--query", "history", "--no-log"]
+                        )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: query failed [permission]\n",
+        )
+        self.assertNotIn("private response", stderr.getvalue())
 
 
 if __name__ == "__main__":

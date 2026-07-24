@@ -24,7 +24,12 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
 import remem_api  # noqa: E402
 
 try:
-    from scripts.remem_checkpoint import _slug, append_checkpoint_log, ingest_checkpoint
+    from scripts.remem_checkpoint import (
+        _consume_route_descriptor,
+        _slug,
+        append_checkpoint_log,
+        ingest_checkpoint,
+    )
 except ModuleNotFoundError:
     import importlib.util
 
@@ -34,6 +39,7 @@ except ModuleNotFoundError:
     _MODULE = importlib.util.module_from_spec(_SPEC)
     assert _SPEC and _SPEC.loader
     _SPEC.loader.exec_module(_MODULE)
+    _consume_route_descriptor = _MODULE._consume_route_descriptor
     _slug = _MODULE._slug
     append_checkpoint_log = _MODULE.append_checkpoint_log
     ingest_checkpoint = _MODULE.ingest_checkpoint
@@ -186,6 +192,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--log-file", default=".remem/session-checkpoints.ndjson", help="Checkpoint log file.")
     parser.add_argument("--project", required=True, help="Project identifier.")
     parser.add_argument("--session-id", required=True, help="Session identifier.")
+    parser.add_argument("--client", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--to", help=argparse.SUPPRESS)
     parser.add_argument("--summary", help="Optional rollup summary paragraph.")
     parser.add_argument("--kind", choices=("final", "milestone", "manual"), default="final")
     parser.add_argument("--title", help="Optional title override.")
@@ -228,29 +236,58 @@ def main(argv: list[str] | None = None) -> int:
 
     response: dict[str, Any] | None = None
     if args.ingest and not args.dry_run:
-        try:
-            api_url, api_key = remem_api.resolve_api_access(
-                args.api_url
-            )
-        except Exception:
-            print("error: invalid Remem API URL", file=sys.stderr)
-            return 2
+        if "REMEM_MEMORY_ROUTE_FD" in os.environ:
+            try:
+                route = _consume_route_descriptor(
+                    os.environ,
+                    expected_client=args.client,
+                    expected_behavior="sessions",
+                )
+                api_url = remem_api.normalize_api_origin(
+                    args.api_url,
+                    allow_local_dev=True,
+                )
+                api_key = remem_api.consume_explicit_api_key(os.environ)
+            except Exception:
+                print("error: invalid route descriptor", file=sys.stderr)
+                return 1
+        else:
+            try:
+                api_url, api_key = remem_api.resolve_api_access(
+                    args.api_url
+                )
+            except Exception:
+                print("error: invalid Remem API URL", file=sys.stderr)
+                return 2
+            route = {"write_namespace": None}
         if not api_key:
             print(
                 "error: Remem credential is not configured",
                 file=sys.stderr,
             )
-            return 2
-        response = ingest_checkpoint(
-            api_url=api_url,
-            api_key=api_key,
-            payload=payload,
-        )
+            return 1
+        try:
+            response = ingest_checkpoint(
+                api_url=api_url,
+                api_key=api_key,
+                payload=payload,
+                namespace=route["write_namespace"],
+            )
+        except remem_api.RememAPIError as error:
+            print(
+                f"error: ingest failed [{error.kind}]",
+                file=sys.stderr,
+            )
+            return 1
 
     if not args.no_log:
         append_checkpoint_log(
             args.log_file,
-            {"timestamp": _utc_now_iso(), "payload": payload, "response": response, "event": "rollup"},
+            {
+                "timestamp": _utc_now_iso(),
+                "payload": payload,
+                "event": "rollup",
+            },
         )
 
     print(json.dumps({"payload": payload, "response": response, "records_used": len(records)}, indent=2))

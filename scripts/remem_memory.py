@@ -31,6 +31,7 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
 import remem_api  # noqa: E402
 import remem_mcp_launcher  # noqa: E402
 import remem_routing  # noqa: E402
+from memory_policy import RecallSource, merge_recall_items  # noqa: E402
 
 
 _COMMAND_TO_SCRIPT = {
@@ -59,8 +60,15 @@ _DEFAULT_SETTINGS = {
 }
 _DEFAULT_API_URL = "https://api.remem.io"
 _CREDENTIAL_FD_ENV = "REMEM_API_KEY_FD"
+_ROUTE_FD_ENV = "REMEM_MEMORY_ROUTE_FD"
 _RUNTIME_ENV_FD = "REMEM_MEMORY_RUNTIME_ENV_FD"
 _MAX_PIPE_PAYLOAD_BYTES = 8 * 1024
+_MAX_ROUTE_DESCRIPTOR_BYTES = 4096
+_MAX_RECALL_CHILD_OUTPUT_BYTES = 2 * 1024 * 1024
+_FIXED_QUERY_FAILURE = re.compile(
+    r"\Aerror: query failed "
+    r"\[(auth|permission|namespace|request|transient)\]\r?\n?\Z"
+)
 _UTC_RFC3339_COMPONENTS = re.compile(
     r"\A([0-9]{4}-[0-9]{2}-[0-9]{2}T"
     r"[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]+))?Z\Z"
@@ -154,12 +162,23 @@ def _workflow_needs_credential(
     command: str,
     arguments: List[str],
 ) -> bool:
-    if "--dry-run" in arguments:
+    if "--dry-run" in arguments or any(
+        argument in {"-h", "--help"} for argument in arguments
+    ):
         return False
     if command in {"checkpoint", "rollup"}:
         return "--ingest" in arguments
     if command == "codex":
-        return "--no-ingest" not in arguments
+        configured_home = os.environ.get("HOME", "")
+        legacy_unavailable_home = (
+            not os.environ.get("REMEM_MEMORY_DATA_DIR")
+            and bool(configured_home)
+            and not Path(configured_home).exists()
+        )
+        return (
+            "--no-ingest" not in arguments
+            and legacy_unavailable_home
+        )
     return command == "recall"
 
 
@@ -193,6 +212,395 @@ def _write_anonymous_payload(payload: bytes) -> int:
     finally:
         os.close(write_descriptor)
     return read_descriptor
+
+
+def _write_route_descriptor(payload: Mapping[str, Any]) -> int:
+    encoded = json.dumps(
+        dict(payload),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if not encoded or len(encoded) > _MAX_ROUTE_DESCRIPTOR_BYTES:
+        raise ValueError("invalid route descriptor size")
+    return _write_anonymous_payload(encoded)
+
+
+def _remove_forwarded_option(
+    arguments: List[str],
+    name: str,
+) -> tuple[List[str], Optional[str]]:
+    cleaned: List[str] = []
+    selected: Optional[str] = None
+    prefix = f"{name}="
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument.startswith(prefix):
+            if selected is not None:
+                raise ValueError("duplicate option")
+            selected = argument[len(prefix) :]
+            index += 1
+            continue
+        if argument == name:
+            if selected is not None or index + 1 >= len(arguments):
+                raise ValueError("invalid option")
+            selected = arguments[index + 1]
+            index += 2
+            continue
+        cleaned.append(argument)
+        index += 1
+    return cleaned, selected
+
+
+def _manual_route_request(
+    command: str,
+    arguments: List[str],
+    config: remem_routing.RoutingConfig,
+) -> tuple[
+    str,
+    tuple[remem_routing.RouteTarget, ...],
+    List[str],
+]:
+    cleaned, client = _remove_forwarded_option(arguments, "--client")
+    selected_client = client or "codex"
+    if selected_client not in _CLIENTS:
+        raise ValueError("invalid routing client")
+    explicit_values: list[str] = []
+    route_cleaned: List[str] = []
+    index = 0
+    expected_option = "--from" if command == "recall" else "--to"
+    forbidden_option = "--to" if command == "recall" else "--from"
+    while index < len(cleaned):
+        argument = cleaned[index]
+        if argument == forbidden_option or argument.startswith(
+            f"{forbidden_option}="
+        ):
+            raise ValueError("invalid manual route")
+        if argument.startswith(f"{expected_option}="):
+            explicit_values.append(argument.split("=", 1)[1])
+            index += 1
+            continue
+        if argument == expected_option:
+            if index + 1 >= len(cleaned):
+                raise ValueError("invalid manual route")
+            explicit_values.append(cleaned[index + 1])
+            index += 2
+            continue
+        route_cleaned.append(argument)
+        index += 1
+    if command != "recall" and len(explicit_values) > 1:
+        raise ValueError("invalid manual route")
+    behavior = "recall" if command == "recall" else "sessions"
+    targets = (
+        tuple(
+            _parse_target(config, value, behavior=behavior)
+            for value in explicit_values
+        )
+        if explicit_values
+        else remem_routing.resolve_routes(
+            config,
+            behavior=behavior,
+            client=selected_client,
+        )
+    )
+    return selected_client, targets, route_cleaned
+
+
+def _connection_for_id(
+    config: remem_routing.RoutingConfig,
+    connection_id: str,
+) -> remem_routing.Connection:
+    for connection in config.connections:
+        if connection.id == connection_id:
+            return connection
+    raise ValueError("routing connection is unavailable")
+
+
+def _route_descriptor(
+    config: remem_routing.RoutingConfig,
+    *,
+    client: str,
+    behavior: str,
+    connection_id: str,
+    read_namespaces: Optional[list[str]],
+    write_namespace: Optional[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "client": client,
+        "behavior": behavior,
+        "route_revision": config.revision,
+        "connection_id": connection_id,
+        "read_namespaces": read_namespaces,
+        "write_namespace": write_namespace,
+    }
+
+
+def _run_routed_child(
+    *,
+    script_path: Path,
+    forwarded_args: List[str],
+    child_environment: Mapping[str, str],
+    route_descriptor: Mapping[str, Any],
+    credential: str,
+    capture_output: bool,
+) -> subprocess.CompletedProcess:
+    route_fd = _write_route_descriptor(route_descriptor)
+    credential_fd = -1
+    try:
+        credential_fd = _write_anonymous_payload(
+            credential.encode("utf-8")
+        )
+        environment = dict(child_environment)
+        environment[_ROUTE_FD_ENV] = str(route_fd)
+        environment[_CREDENTIAL_FD_ENV] = str(credential_fd)
+        options: dict[str, Any] = {
+            "env": environment,
+            "check": False,
+            "pass_fds": (route_fd, credential_fd),
+        }
+        if capture_output:
+            options.update({"capture_output": True, "text": True})
+        return subprocess.run(
+            [
+                _python_executable(),
+                "-I",
+                str(script_path),
+                *forwarded_args,
+            ],
+            **options,
+        )
+    finally:
+        for descriptor in (route_fd, credential_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _run_manual_routed_command(
+    *,
+    command: str,
+    script_path: Path,
+    forwarded_args: List[str],
+    child_environment: Mapping[str, str],
+    parent_environment: Mapping[str, str],
+    config: remem_routing.RoutingConfig,
+) -> int:
+    try:
+        client, targets, child_args = _manual_route_request(
+            command,
+            forwarded_args,
+            config,
+        )
+    except Exception:
+        print("error: invalid manual route", file=sys.stderr)
+        return 2
+    behavior = "recall" if command == "recall" else "sessions"
+    if not targets:
+        print(f"error: {behavior} route is off", file=sys.stderr)
+        return 1
+
+    if command != "recall":
+        if len(targets) != 1:
+            print("error: sessions route is unavailable", file=sys.stderr)
+            return 1
+        target = targets[0]
+        try:
+            connection = _connection_for_id(config, target.connection_id)
+            credential = remem_api.resolve_connection_api_key(
+                connection,
+                environment=parent_environment,
+            )
+        except Exception:
+            credential = None
+        if not credential:
+            print(
+                "error: Remem credential is not configured",
+                file=sys.stderr,
+            )
+            return 1
+        descriptor = _route_descriptor(
+            config,
+            client=client,
+            behavior="sessions",
+            connection_id=target.connection_id,
+            read_namespaces=None,
+            write_namespace=(
+                None if target.namespace == "@default" else target.namespace
+            ),
+        )
+        try:
+            completed = _run_routed_child(
+                script_path=script_path,
+                forwarded_args=[
+                    "--client",
+                    client,
+                    *child_args,
+                ],
+                child_environment=child_environment,
+                route_descriptor=descriptor,
+                credential=credential,
+                capture_output=False,
+            )
+        except Exception:
+            print(
+                "error: Remem Memory helper could not start",
+                file=sys.stderr,
+            )
+            return 2
+        return int(completed.returncode)
+
+    try:
+        child_args, output_path = _remove_forwarded_option(
+            child_args,
+            "--output",
+        )
+    except ValueError:
+        print("error: invalid manual route", file=sys.stderr)
+        return 2
+    if "--no-log" not in child_args:
+        child_args.append("--no-log")
+    connection_order = {
+        connection.id: position
+        for position, connection in enumerate(config.connections)
+    }
+    grouped: dict[str, list[tuple[int, remem_routing.RouteTarget]]] = {}
+    for namespace_order, target in enumerate(targets):
+        grouped.setdefault(target.connection_id, []).append(
+            (namespace_order, target)
+        )
+    sources: list[RecallSource] = []
+    payload: dict[str, Any] | None = None
+    successful_children = 0
+    failure_kinds: list[str] = []
+    for connection_id, selected in sorted(
+        grouped.items(),
+        key=lambda item: connection_order.get(
+            item[0],
+            len(connection_order),
+        ),
+    ):
+        try:
+            connection = _connection_for_id(config, connection_id)
+            credential = remem_api.resolve_connection_api_key(
+                connection,
+                environment=parent_environment,
+            )
+        except Exception:
+            credential = None
+        if not credential:
+            continue
+        selected_targets = [target for _order, target in selected]
+        read_namespaces = (
+            None
+            if any(
+                target.namespace == "@readable"
+                for target in selected_targets
+            )
+            else list(
+                dict.fromkeys(
+                    target.namespace for target in selected_targets
+                )
+            )
+        )
+        descriptor = _route_descriptor(
+            config,
+            client=client,
+            behavior="recall",
+            connection_id=connection_id,
+            read_namespaces=read_namespaces,
+            write_namespace=None,
+        )
+        try:
+            completed = _run_routed_child(
+                script_path=script_path,
+                forwarded_args=[
+                    "--client",
+                    client,
+                    *child_args,
+                ],
+                child_environment=child_environment,
+                route_descriptor=descriptor,
+                credential=credential,
+                capture_output=True,
+            )
+        except Exception:
+            continue
+        if int(completed.returncode) != 0:
+            child_error = completed.stderr
+            if isinstance(child_error, str):
+                matched = _FIXED_QUERY_FAILURE.fullmatch(child_error)
+                if matched is not None:
+                    failure_kinds.append(matched.group(1))
+            continue
+        rendered = completed.stdout
+        if (
+            not isinstance(rendered, str)
+            or len(rendered.encode("utf-8"))
+            > _MAX_RECALL_CHILD_OUTPUT_BYTES
+        ):
+            continue
+        try:
+            child_output = json.loads(rendered)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(child_output, dict) or not isinstance(
+            child_output.get("response"),
+            dict,
+        ):
+            continue
+        child_payload = child_output.get("payload")
+        if payload is None and isinstance(child_payload, dict):
+            payload = child_payload
+        successful_children += 1
+        sources.append(
+            RecallSource(
+                response=child_output["response"],
+                connection_order=connection_order.get(
+                    connection_id,
+                    len(connection_order),
+                ),
+                namespace_order=tuple(
+                    (target.namespace, order)
+                    for order, target in selected
+                ),
+            )
+        )
+    if successful_children == 0:
+        failure_kind = (
+            failure_kinds[0]
+            if failure_kinds
+            and len(set(failure_kinds)) == 1
+            else "request"
+        )
+        print(
+            f"error: query failed [{failure_kind}]",
+            file=sys.stderr,
+        )
+        return 1
+    output = {
+        "payload": payload or {},
+        "response": {"results": merge_recall_items(sources)},
+    }
+    rendered_output = json.dumps(
+        output,
+        indent=2,
+        ensure_ascii=True,
+    )
+    if output_path:
+        try:
+            Path(output_path).write_text(
+                rendered_output,
+                encoding="utf-8",
+            )
+        except OSError:
+            print("error: unable to write recall output", file=sys.stderr)
+            return 1
+    print(rendered_output)
+    return 0
 
 
 def run_command(command: str, forwarded_args: List[str]) -> int:
@@ -246,6 +654,7 @@ def run_command(command: str, forwarded_args: List[str]) -> int:
     }
     sanitized_environment.pop("REMEM_API_KEY", None)
     sanitized_environment.pop(_CREDENTIAL_FD_ENV, None)
+    sanitized_environment.pop(_ROUTE_FD_ENV, None)
     sanitized_environment.pop(_RUNTIME_ENV_FD, None)
     if command == "codex":
         child_environment = sanitized_environment
@@ -263,6 +672,43 @@ def run_command(command: str, forwarded_args: List[str]) -> int:
             }
         )
     child_environment["REMEM_API_URL"] = configured_api_url
+    repository_dispatch = (
+        _REPOSITORY_ROOT == _SCRIPT_PATH.parent.parent
+    )
+    if needs_credential and repository_dispatch and command in {
+        "checkpoint",
+        "rollup",
+        "recall",
+    }:
+        try:
+            config = _load_or_initialize_routing()
+        except Exception:
+            configured_data_dir = parent_environment.get(
+                "REMEM_MEMORY_DATA_DIR",
+                "",
+            )
+            configured_home = parent_environment.get("HOME", "")
+            synthetic_test_home = (
+                not configured_data_dir
+                and bool(configured_home)
+                and not Path(configured_home).exists()
+            )
+            if not synthetic_test_home:
+                print(
+                    "error: unable to read Remem routing",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            return _run_manual_routed_command(
+                command=command,
+                script_path=script_path,
+                forwarded_args=forwarded_args,
+                child_environment=child_environment,
+                parent_environment=parent_environment,
+                config=config,
+            )
+
     inherited_descriptors: List[int] = []
     explicit_key = parent_environment.get("REMEM_API_KEY", "")
     if (
