@@ -23,6 +23,7 @@ if _INSERTED_PLUGIN_PATH:
     sys.path.insert(0, str(_PLUGIN_SCRIPTS))
 try:
     import remem_api as _remem_api
+    import remem_routing as _remem_routing
 finally:
     if _INSERTED_PLUGIN_PATH:
         sys.path.remove(str(_PLUGIN_SCRIPTS))
@@ -524,6 +525,20 @@ class Installer:
             str(claude_setting),
             self.home,
         )
+        configured_routing = selected_environment.get(
+            "REMEM_MEMORY_DATA_DIR",
+            "",
+        )
+        routing_setting = (
+            configured_routing.strip()
+            if isinstance(configured_routing, str)
+            and configured_routing.strip()
+            else str(self.home / ".config" / "remem-memory")
+        )
+        self.routing_data_dir = _expand_home_path(
+            str(routing_setting),
+            self.home,
+        )
         self.child_environment = {
             name: selected_environment[name]
             for name in _CHILD_ENVIRONMENT_KEYS
@@ -564,8 +579,7 @@ class Installer:
             self._validate_harness_root(self.claude_config)
 
         legacy_config = self._load_legacy_config()
-        if legacy_config.api_key is not None:
-            self._bridge_legacy_credential(legacy_config.api_key)
+        legacy_discovery = self._discover_legacy_routing(legacy_config)
 
         if codex_available:
             self._prepare_harness_root(self.codex_home)
@@ -583,6 +597,8 @@ class Installer:
         claude_cleanup = (False, False)
         if claude_available:
             claude_cleanup = self._setup_claude()
+
+        self._initialize_routing(legacy_discovery)
 
         if legacy_config.has_remem_mcp and codex_ready:
             self._run_required(
@@ -639,7 +655,10 @@ class Installer:
                 "Codex legacy credential format is not supported"
             ) from None
 
-    def _bridge_legacy_credential(self, value: str) -> None:
+    def _discover_legacy_routing(
+        self,
+        legacy_config: _LegacyConfig,
+    ) -> _remem_routing.LegacyDiscovery:
         selected_keychain = (
             self.keychain
             if self.keychain is not None
@@ -650,36 +669,62 @@ class Installer:
                 KEYCHAIN_SERVICE,
                 KEYCHAIN_ACCOUNT,
             )
-            if existing is not None:
-                if not _constant_time_equal(
-                    existing,
-                    value,
-                ):
-                    raise InstallerError(
-                        "Canonical credential differs from legacy credential"
-                    )
-            else:
-                selected_keychain.write(
-                    KEYCHAIN_SERVICE,
-                    KEYCHAIN_ACCOUNT,
-                    value,
-                )
-            verified = selected_keychain.read(
-                KEYCHAIN_SERVICE,
-                KEYCHAIN_ACCOUNT,
-            )
-            if not _constant_time_equal(
-                verified,
-                value,
+            if existing is not None and (
+                not isinstance(existing, str) or not existing
             ):
                 raise InstallerError(
                     "Credential migration could not be verified"
                 )
+            legacy_value = legacy_config.api_key
+            distinct_credentials = 1 if existing is not None else 0
+            if legacy_value is not None and existing is None:
+                selected_keychain.write(
+                    KEYCHAIN_SERVICE,
+                    KEYCHAIN_ACCOUNT,
+                    legacy_value,
+                )
+                verified = selected_keychain.read(
+                    KEYCHAIN_SERVICE,
+                    KEYCHAIN_ACCOUNT,
+                )
+                if not _constant_time_equal(
+                    verified,
+                    legacy_value,
+                ):
+                    raise InstallerError(
+                        "Credential migration could not be verified"
+                    )
+                distinct_credentials = 1
+            elif (
+                legacy_value is not None
+                and existing is not None
+                and not _constant_time_equal(existing, legacy_value)
+            ):
+                distinct_credentials = 2
+            return _remem_routing.discover_legacy_routing(
+                self.environment,
+                distinct_credentials=distinct_credentials,
+            )
         except InstallerError:
             raise
         except Exception:
             raise InstallerError(
                 "Credential migration could not be verified"
+            ) from None
+
+    def _initialize_routing(
+        self,
+        discovery: _remem_routing.LegacyDiscovery,
+    ) -> None:
+        try:
+            _remem_routing.initialize_routing(
+                self.routing_data_dir,
+                self.environment,
+                discovery=discovery,
+            )
+        except Exception:
+            raise InstallerError(
+                "Routing migration could not be completed"
             ) from None
 
     @staticmethod

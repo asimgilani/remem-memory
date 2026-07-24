@@ -1592,6 +1592,49 @@ class RememMemoryHookTests(unittest.TestCase):
             output["hookSpecificOutput"]["additionalContext"],
         )
 
+    def test_hook_initializes_legacy_routing_once_when_installer_was_skipped(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = FakeAPI(query_response={"results": []})
+            dependencies = self._dependencies(directory, api)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_MEMORY_PERSONAL_NAMESPACE": "hook-memory",
+                },
+                clear=False,
+            ):
+                _HOOK.handle_event(
+                    prompt_payload("What did we decide?"),
+                    harness="codex",
+                    mode="user_prompt_submit",
+                    dependencies=dependencies,
+                )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_MEMORY_PERSONAL_NAMESPACE": "changed-memory",
+                },
+                clear=False,
+            ):
+                _HOOK.handle_event(
+                    prompt_payload(
+                        "What did we decide after that?",
+                        turn_id="t2",
+                    ),
+                    harness="codex",
+                    mode="user_prompt_submit",
+                    dependencies=dependencies,
+                )
+            config = _ROUTING.load_routing(Path(directory))
+
+        self.assertEqual(
+            config.global_routes.routes["memory"][0].namespace,
+            "hook-memory",
+        )
+        self.assertTrue(config.legacy_namespace_migration_completed)
+
     def test_recall_resolves_before_credentials_and_groups_namespaces(
         self,
     ) -> None:

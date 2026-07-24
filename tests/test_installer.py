@@ -20,6 +20,15 @@ from scripts import install_remem_memory
 
 _LIVE_ROOT = Path(__file__).resolve().parents[1]
 _CANARY = "vlt_installer-secret-canary"
+_PLUGIN_SCRIPTS = _LIVE_ROOT / "plugins" / "remem-memory" / "scripts"
+_INSERTED_PLUGIN_PATH = str(_PLUGIN_SCRIPTS) not in sys.path
+if _INSERTED_PLUGIN_PATH:
+    sys.path.insert(0, str(_PLUGIN_SCRIPTS))
+try:
+    import remem_routing
+finally:
+    if _INSERTED_PLUGIN_PATH:
+        sys.path.remove(str(_PLUGIN_SCRIPTS))
 
 
 def _same_text(left: str, right: str) -> bool:
@@ -71,23 +80,33 @@ class FakeKeychain:
         self,
         value: str | None = None,
         *,
+        values: dict[tuple[str, str | None], str] | None = None,
         read_after_write: str | None = None,
     ) -> None:
-        self.value = value
+        self.values = dict(values or {})
+        if value is not None:
+            self.values[
+                (
+                    install_remem_memory.KEYCHAIN_SERVICE,
+                    install_remem_memory.KEYCHAIN_ACCOUNT,
+                )
+            ] = value
         self.read_after_write = read_after_write
         self.calls: list[tuple[Any, ...]] = []
-        self._wrote = False
+        self._written: set[tuple[str, str | None]] = set()
 
     def read(self, service: str, account: str | None = None) -> str | None:
         self.calls.append(("read", service, account))
-        if self._wrote and self.read_after_write is not None:
+        key = (service, account)
+        if key in self._written and self.read_after_write is not None:
             return self.read_after_write
-        return self.value
+        return self.values.get(key)
 
     def write(self, service: str, account: str, value: str) -> None:
         self.calls.append(("write", service, account, value))
-        self.value = value
-        self._wrote = True
+        key = (service, account)
+        self.values[key] = value
+        self._written.add(key)
 
 
 class FakeRunner:
@@ -394,6 +413,7 @@ class InstallerFixture:
         self.home = base / "home"
         self.codex_home = base / "codex"
         self.claude_config = base / "claude"
+        self.data_dir = self.home / ".config" / "remem-memory"
         (self.repo_root / "scripts").mkdir(parents=True)
         for skill_name in install_remem_memory.SKILL_ALIASES:
             (self.repo_root / "codex" / "skills" / skill_name).mkdir(
@@ -434,6 +454,7 @@ class InstallerFixture:
             "HOME": str(self.home),
             "CODEX_HOME": str(self.codex_home),
             "CLAUDE_CONFIG_DIR": str(self.claude_config),
+            "REMEM_MEMORY_DATA_DIR": str(self.data_dir),
             "PATH": "/test/bin:/usr/bin:/bin",
             "REMEM_API_KEY": _CANARY,
         }
@@ -555,6 +576,21 @@ class LegacyCredentialParserTests(unittest.TestCase):
 
 
 class SecureInstallerTests(unittest.TestCase):
+    def test_empty_routing_data_dir_stays_inside_injected_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InstallerFixture(directory)
+            fixture.environment["REMEM_MEMORY_DATA_DIR"] = ""
+
+            installer = install_remem_memory.Installer(
+                home=fixture.home,
+                environment=fixture.environment,
+                runner=FakeRunner(codex=True),
+                keychain=FakeKeychain(),
+                repo_root=fixture.repo_root,
+            )
+
+            self.assertEqual(installer.routing_data_dir, fixture.data_dir)
+
     def test_missing_uv_fails_before_any_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = InstallerFixture(
@@ -935,6 +971,166 @@ class SecureInstallerTests(unittest.TestCase):
                 output,
             )
 
+    def test_initializes_exact_routing_after_client_verification_before_cleanup(
+        self,
+    ) -> None:
+        events: list[tuple[Any, ...]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InstallerFixture(
+                directory,
+                legacy_config=(
+                    "[mcp_servers.remem]\n"
+                    'command = "uvx"\n\n'
+                    "[mcp_servers.remem.env]\n"
+                    f'REMEM_API_KEY = "{_CANARY}"\n'
+                ),
+            )
+            fixture.environment.update(
+                {
+                    "REMEM_MEMORY_PERSONAL_NAMESPACE": "conversation-history",
+                    "REMEM_MEMORY_ENGINEERING_NAMESPACE": "session-history",
+                }
+            )
+            runner = FakeRunner(
+                codex=True,
+                claude=True,
+                events=events,
+                claude_marketplaces=[{"name": "remem-dev-sessions"}],
+                claude_plugins=[
+                    {
+                        "name": "remem-dev-sessions",
+                        "marketplace": "remem-dev-sessions",
+                        "version": "0.1.2",
+                        "enabled": True,
+                    }
+                ],
+            )
+            real_initialize = remem_routing.initialize_routing
+
+            def initialize(*args: Any, **kwargs: Any):
+                discovery = kwargs.get("discovery")
+                events.append(("routing-initialize", discovery))
+                return real_initialize(*args, **kwargs)
+
+            with mock.patch.object(
+                remem_routing,
+                "initialize_routing",
+                side_effect=initialize,
+            ):
+                with mock.patch.object(
+                    install_remem_memory._remem_api,
+                    "RememAPI",
+                    side_effect=AssertionError("installer must stay local"),
+                ) as api:
+                    result, output = fixture.install(
+                        runner=runner,
+                        keychain=FakeKeychain(),
+                    )
+
+            initialize_events = [
+                event for event in events if event[0] == "routing-initialize"
+            ]
+            self.assertEqual(result, 0, output)
+            self.assertEqual(len(initialize_events), 1)
+            discovery = initialize_events[0][1]
+            self.assertEqual(discovery.distinct_credentials, 1)
+            self.assertEqual(
+                dict(discovery.destination_candidates),
+                {
+                    "memory": ("conversation-history",),
+                    "sessions": ("session-history",),
+                },
+            )
+            config = remem_routing.load_routing(fixture.data_dir)
+            self.assertEqual(
+                config.global_routes.routes["memory"][0].namespace,
+                "conversation-history",
+            )
+            self.assertEqual(
+                config.global_routes.routes["sessions"][0].namespace,
+                "session-history",
+            )
+            initialize_index = events.index(initialize_events[0])
+            verification_indices = [
+                index
+                for index, event in enumerate(events)
+                if event[0] == "command"
+                and event[1]
+                in {
+                    ("codex", "plugin", "list", "--json"),
+                    ("claude", "plugin", "list", "--json"),
+                }
+            ]
+            cleanup_indices = [
+                index
+                for index, event in enumerate(events)
+                if event
+                == ("command", ("codex", "mcp", "remove", "remem"))
+                or event
+                == (
+                    "command",
+                    (
+                        "claude",
+                        "plugin",
+                        "disable",
+                        "remem-dev-sessions@remem-dev-sessions",
+                    ),
+                )
+            ]
+            self.assertLess(max(verification_indices), initialize_index)
+            self.assertLess(initialize_index, min(cleanup_indices))
+            api.assert_not_called()
+
+    def test_interrupted_cleanup_rerun_does_not_reimport_changed_legacy_routes(
+        self,
+    ) -> None:
+        legacy_remove = ("codex", "mcp", "remove", "remem")
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InstallerFixture(
+                directory,
+                legacy_config=(
+                    "[mcp_servers.remem]\n"
+                    'command = "uvx"\n\n'
+                    "[mcp_servers.remem.env]\n"
+                    f'REMEM_API_KEY = "{_CANARY}"\n'
+                ),
+            )
+            fixture.environment[
+                "REMEM_MEMORY_PERSONAL_NAMESPACE"
+            ] = "first-destination"
+            keychain = FakeKeychain()
+            runner = FakeRunner(
+                codex=True,
+                failures={legacy_remove},
+            )
+
+            first_result, first_output = fixture.install(
+                runner=runner,
+                keychain=keychain,
+            )
+
+            self.assertEqual(first_result, 1, first_output)
+            self.assertTrue((fixture.data_dir / "routes.json").is_file())
+            first = remem_routing.load_routing(fixture.data_dir)
+            self.assertTrue(first.legacy_namespace_migration_completed)
+            fixture.environment[
+                "REMEM_MEMORY_PERSONAL_NAMESPACE"
+            ] = "changed-after-interruption"
+            runner.failures.clear()
+
+            second_result, second_output = fixture.install(
+                runner=runner,
+                keychain=keychain,
+            )
+
+            self.assertEqual(second_result, 0, second_output)
+            second = remem_routing.load_routing(fixture.data_dir)
+            self.assertEqual(
+                second.global_routes.routes["memory"][0].namespace,
+                "first-destination",
+            )
+            self.assertNotIn("changed-after-interruption", second_output)
+
     def test_failed_mcp_runtime_probe_preserves_legacy_codex_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = InstallerFixture(
@@ -1015,7 +1211,9 @@ class SecureInstallerTests(unittest.TestCase):
             self.assertIn(unrelated.strip(), rendered)
             self.assertIn('[unrelated]\nvalue = "preserved"', rendered)
 
-    def test_equal_existing_key_is_idempotent_but_different_key_fails_closed(self) -> None:
+    def test_distinct_canonical_and_legacy_credentials_block_writes_without_overwrite(
+        self,
+    ) -> None:
         config = (
             "[mcp_servers.remem]\n"
             'command = "uvx"\n\n'
@@ -1033,27 +1231,117 @@ class SecureInstallerTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertFalse(any(call[0] == "write" for call in keychain.calls))
             self.assertIn(("codex", "mcp", "remove", "remem"), runner.commands)
+            self.assertTrue((fixture.data_dir / "routes.json").is_file())
+            stored = remem_routing.load_routing(fixture.data_dir)
+            self.assertFalse(stored.migration_write_blocked)
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = InstallerFixture(directory, legacy_config=config)
             runner = FakeRunner(codex=True)
             keychain = FakeKeychain("vlt_different")
+            fixture.data_dir.mkdir(parents=True)
+            settings = fixture.data_dir / "settings.json"
+            settings.write_text(
+                '{"mode":"auto","sensitivity":"balanced"}\n',
+                encoding="utf-8",
+            )
 
             result, output = fixture.install(runner=runner, keychain=keychain)
 
             _assert_secret_absent(self, _CANARY, output)
-            self.assertEqual(result, 1)
+            self.assertEqual(result, 0, output)
+            self.assertFalse(any(call[0] == "write" for call in keychain.calls))
             self.assertTrue(
                 _same_text(
-                    (fixture.codex_home / "config.toml").read_text(
-                        encoding="utf-8"
-                    ),
-                    config,
+                    keychain.values[
+                        (
+                            install_remem_memory.KEYCHAIN_SERVICE,
+                            install_remem_memory.KEYCHAIN_ACCOUNT,
+                        )
+                    ],
+                    "vlt_different",
                 )
             )
-            self.assertNotIn(("codex", "mcp", "remove", "remem"), runner.commands)
-            self.assertFalse((fixture.repo_root / ".venv").exists())
-            self.assertFalse(fixture.home.exists())
+            stored = remem_routing.load_routing(fixture.data_dir)
+            self.assertTrue(stored.migration_write_blocked)
+            self.assertEqual(
+                remem_routing.resolve_routes(
+                    stored,
+                    behavior="memory",
+                    client="codex",
+                ),
+                (),
+            )
+            self.assertEqual(
+                json.loads(settings.read_text(encoding="utf-8"))["mode"],
+                "auto",
+            )
+
+    def test_fresh_and_032_upgrade_initialize_simple_routing_without_mode_change(
+        self,
+    ) -> None:
+        cases = (
+            ("fresh", [], []),
+            (
+                "upgrade",
+                [
+                    {
+                        "name": "remem-memory",
+                        "marketplaceSource": {
+                            "sourceType": "local",
+                            "source": "",
+                        },
+                    }
+                ],
+                [
+                    {
+                        "name": "remem-memory",
+                        "marketplace": "remem-memory",
+                        "version": "0.3.2",
+                        "enabled": True,
+                    }
+                ],
+            ),
+        )
+        for label, marketplaces, plugins in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                fixture = InstallerFixture(directory)
+                if marketplaces:
+                    marketplaces[0]["marketplaceSource"]["source"] = str(
+                        fixture.repo_root
+                    )
+                fixture.data_dir.mkdir(parents=True)
+                settings = fixture.data_dir / "settings.json"
+                settings.write_text(
+                    '{"mode":"recall-only","sensitivity":"aggressive"}\n',
+                    encoding="utf-8",
+                )
+                runner = FakeRunner(
+                    codex=True,
+                    codex_marketplaces=marketplaces,
+                    codex_plugins=plugins,
+                )
+
+                result, output = fixture.install(
+                    runner=runner,
+                    keychain=FakeKeychain("vlt_primary"),
+                )
+
+                self.assertEqual(result, 0, output)
+                self.assertTrue((fixture.data_dir / "routes.json").is_file())
+                config = remem_routing.load_routing(fixture.data_dir)
+                self.assertTrue(
+                    config.legacy_namespace_migration_completed
+                )
+                self.assertFalse(config.migration_write_blocked)
+                self.assertEqual(dict(config.global_routes.routes), {})
+                self.assertEqual(
+                    json.loads(settings.read_text(encoding="utf-8")),
+                    {
+                        "mode": "recall-only",
+                        "sensitivity": "aggressive",
+                    },
+                )
 
     def test_keychain_compare_digest_handles_valid_unicode_basic_strings(self) -> None:
         credential = "vlt_\N{SNOWMAN}"

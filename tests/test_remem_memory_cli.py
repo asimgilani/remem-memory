@@ -563,6 +563,37 @@ class RoutingCliTests(unittest.TestCase):
             ),
         )
 
+    def test_cli_initializes_legacy_routing_once_when_installer_was_skipped(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            first_environment = {
+                "REMEM_MEMORY_DATA_DIR": directory,
+                "REMEM_MEMORY_PERSONAL_NAMESPACE": "first-memory",
+            }
+            first = self._run(
+                ["routes", "show", "--json"],
+                environment=first_environment,
+            )
+            second = self._run(
+                ["routes", "show", "--json"],
+                environment={
+                    "REMEM_MEMORY_DATA_DIR": directory,
+                    "REMEM_MEMORY_PERSONAL_NAMESPACE": "changed-memory",
+                },
+            )
+            config = remem_memory.remem_routing.load_routing(
+                Path(directory)
+            )
+
+        self.assertEqual(first[0], 0, first)
+        self.assertEqual(second[0], 0, second)
+        self.assertEqual(
+            config.global_routes.routes["memory"][0].namespace,
+            "first-memory",
+        )
+        self.assertTrue(config.legacy_namespace_migration_completed)
+
     def test_routes_show_json_is_deterministic_and_client_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             arguments = [
@@ -1954,13 +1985,13 @@ class MCPLauncherTests(unittest.TestCase):
             Path(self._routing.name),
             {},
         )
-        routing_patcher = mock.patch.object(
+        self._routing_patcher = mock.patch.object(
             remem_routing,
-            "load_routing",
+            "load_or_initialize_routing",
             return_value=self._routing_config,
         )
-        routing_patcher.start()
-        self.addCleanup(routing_patcher.stop)
+        self._routing_patcher.start()
+        self.addCleanup(self._routing_patcher.stop)
 
     def _mcp_server(self):
         config = json.loads(
@@ -2515,7 +2546,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         with mock.patch.object(
             remem_routing,
-            "load_routing",
+            "load_or_initialize_routing",
             return_value=config,
         ):
             with contextlib.redirect_stderr(stderr):
@@ -2742,7 +2773,7 @@ class MCPLauncherTests(unittest.TestCase):
 
         with mock.patch.object(
             remem_routing,
-            "load_routing",
+            "load_or_initialize_routing",
             return_value=config,
         ):
             with self.assertRaises(ExecIntercept):
@@ -2756,6 +2787,43 @@ class MCPLauncherTests(unittest.TestCase):
 
         self.assertEqual(observed, [named.id, "vlt_named-selected"])
         self.assertNotIn("vlt_primary-must-not-cross", json.dumps(observed))
+
+    def test_launcher_initializes_legacy_routing_when_installer_was_skipped(
+        self,
+    ):
+        class ExecIntercept(Exception):
+            pass
+
+        self._routing_patcher.stop()
+        with tempfile.TemporaryDirectory() as directory:
+            observed = []
+
+            def execvpe(executable, arguments, environment):
+                del executable, arguments
+                descriptor = int(environment["REMEM_API_KEY_FD"])
+                observed.append(os.read(descriptor, 8192).decode("utf-8"))
+                raise ExecIntercept()
+
+            with self.assertRaises(ExecIntercept):
+                launcher.main(
+                    ["--client", "codex"],
+                    environment={
+                        "PATH": "/test/bin",
+                        "REMEM_MEMORY_DATA_DIR": directory,
+                        "REMEM_MEMORY_PERSONAL_NAMESPACE": "runtime-memory",
+                    },
+                    resolver=lambda **kwargs: "vlt_runtime-selected",
+                    which=lambda command: "/test/bin/uv",
+                    execvpe=execvpe,
+                )
+            config = remem_routing.load_routing(Path(directory))
+
+        self.assertEqual(observed, ["vlt_runtime-selected"])
+        self.assertEqual(
+            config.global_routes.routes["memory"][0].namespace,
+            "runtime-memory",
+        )
+        self.assertTrue(config.legacy_namespace_migration_completed)
 
     def test_bundled_mcp_omits_unspecified_namespaces(self):
         request = mock.AsyncMock(

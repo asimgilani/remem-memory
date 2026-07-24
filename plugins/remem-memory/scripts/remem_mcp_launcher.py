@@ -430,10 +430,11 @@ def main(
     ).hostname
     try:
         data_dir = selected.get("REMEM_MEMORY_DATA_DIR")
-        config = remem_routing.load_routing(
+        config = remem_routing.load_or_initialize_routing(
             Path(data_dir).expanduser()
             if isinstance(data_dir, str) and data_dir.strip()
-            else None
+            else None,
+            selected,
         )
         connection = remem_routing.resolve_mcp_connection(
             config,
