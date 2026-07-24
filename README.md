@@ -67,7 +67,7 @@ activation steps:
 
 | Surface | What to do |
 | --- | --- |
-| Codex Desktop | Open **Plugins → Remem Memory → Hooks**, choose **Review**, inspect the five hooks, then trust them. |
+| Codex Desktop | Restart Codex Desktop, then open **Plugins → Remem Memory → Hooks**, choose **Review**, inspect the five hooks, and trust them. |
 | Codex CLI | Start interactive Codex, enter `/hooks`, select **Remem Memory**, inspect the five hooks, then approve them. |
 | Claude Code | Run `/reload-plugins`, or restart Claude Code and begin a new session. Claude has no separate Codex-style hook approval; its `/hooks` view is read-only and can verify that the plugin hooks loaded. |
 
@@ -78,9 +78,11 @@ durable capture, and engineering checkpoints do not run before approval. MCP
 tools, skills, and manual CLI commands can still work before hook trust. After
 any new or changed hook version, run `/hooks` and re-review it.
 
-Setup is active when Keychain status says `credential: configured`, every
-installed client reports Remem Memory enabled at version `0.3.2`, and Codex
-shows all five Remem Memory hooks trusted.
+Setup is active when the canonical status command above reports the intended
+mode and sensitivity plus `credential: configured`; every installed client
+reports Remem Memory enabled at version `0.3.2`; if Codex is installed, it
+shows all five Remem Memory hooks trusted; and a fresh supported-client session
+can use automatic memory.
 
 If activation does not work:
 

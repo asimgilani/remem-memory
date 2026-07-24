@@ -40,6 +40,25 @@ def _assert_secret_absent(
     )
 
 
+def _snapshot_tree(root: Path) -> tuple[tuple[Any, ...], ...]:
+    if not root.exists() and not root.is_symlink():
+        return ()
+
+    snapshot: list[tuple[Any, ...]] = []
+    for path in (root, *sorted(root.rglob("*"))):
+        relative = "." if path == root else str(path.relative_to(root))
+        mode = stat.S_IMODE(path.lstat().st_mode)
+        if path.is_symlink():
+            snapshot.append((relative, "symlink", mode, os.readlink(path)))
+        elif path.is_dir():
+            snapshot.append((relative, "directory", mode, None))
+        elif path.is_file():
+            snapshot.append((relative, "file", mode, path.read_bytes()))
+        else:
+            snapshot.append((relative, "other", mode, None))
+    return tuple(snapshot)
+
+
 class FakeResult:
     def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
@@ -561,29 +580,55 @@ class SecureInstallerTests(unittest.TestCase):
 
     def test_no_supported_client_fails_before_any_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            fixture = InstallerFixture(directory)
+            legacy_config = (
+                "[mcp_servers.remem]\n"
+                'command = "uvx"\n\n'
+                "[mcp_servers.remem.env]\n"
+                f'REMEM_API_KEY = "{_CANARY}"\n'
+            )
+            fixture = InstallerFixture(
+                directory,
+                legacy_config=legacy_config,
+            )
             keychain = FakeKeychain()
             runner = FakeRunner()
-            before = sorted(
-                item.relative_to(fixture.repo_root)
-                for item in fixture.repo_root.rglob("*")
-            )
+            config_path = fixture.codex_home / "config.toml"
+            config_before = config_path.read_bytes()
+            codex_root_before = _snapshot_tree(fixture.codex_home)
+            repo_before = _snapshot_tree(fixture.repo_root)
 
             result, output = fixture.install(runner=runner, keychain=keychain)
 
-            after = sorted(
-                item.relative_to(fixture.repo_root)
-                for item in fixture.repo_root.rglob("*")
-            )
             self.assertEqual(result, 1)
             self.assertIn("install Codex or Claude Code first", output)
-            self.assertNotIn("installed successfully", output)
+            self.assertNotIn("success", output.lower())
             self.assertNotIn("Finish activation", output)
+            _assert_secret_absent(self, _CANARY, output)
             self.assertEqual(keychain.calls, [])
-            self.assertEqual(before, after)
+            self.assertEqual(config_path.read_bytes(), config_before)
+            self.assertEqual(
+                _snapshot_tree(fixture.codex_home),
+                codex_root_before,
+            )
+            self.assertEqual(_snapshot_tree(fixture.repo_root), repo_before)
             self.assertFalse(fixture.home.exists())
-            self.assertFalse(
-                any(command[-1:] == ("--probe",) for command in runner.commands)
+            self.assertFalse((fixture.repo_root / ".venv").exists())
+            for alias in install_remem_memory.COMMAND_ALIASES:
+                self.assertFalse(
+                    (fixture.home / ".local" / "bin" / alias).exists()
+                )
+            for alias in install_remem_memory.SKILL_ALIASES:
+                self.assertFalse(
+                    (fixture.home / ".agents" / "skills" / alias).exists()
+                )
+            self.assertFalse(fixture.claude_config.exists())
+            self.assertEqual(
+                runner.commands,
+                [
+                    ("uv", "--version"),
+                    ("codex", "--version"),
+                    ("claude", "--version"),
+                ],
             )
 
     def test_success_output_matches_verified_clients(self) -> None:

@@ -103,6 +103,26 @@ class PackagingDocsTests(unittest.TestCase):
         self.assertIn("exact hook hash", codex.lower())
         self.assertIn("local", codex.lower())
 
+        readme_desktop = readme.split("| Codex Desktop |", 1)[1].split(
+            "\n",
+            1,
+        )[0]
+        codex_desktop = codex.split("- **Codex Desktop:**", 1)[1].split(
+            "- **Codex CLI:**",
+            1,
+        )[0]
+        for document_name, desktop_route in (
+            ("README.md", readme_desktop),
+            ("docs/README.codex.md", codex_desktop),
+        ):
+            normalized_route = " ".join(desktop_route.lower().split())
+            self.assertIn("restart codex desktop", normalized_route, document_name)
+            self.assertLess(
+                normalized_route.index("restart codex desktop"),
+                normalized_route.index("plugins"),
+                document_name,
+            )
+
     def test_activation_docs_define_expected_state_and_common_recovery(
         self,
     ) -> None:
@@ -113,9 +133,20 @@ class PackagingDocsTests(unittest.TestCase):
         )[0]
         normalized = " ".join(activation.lower().split())
 
-        self.assertIn("credential: configured", normalized)
-        self.assertIn("enabled at version", normalized)
-        self.assertIn("all five", normalized)
+        self.assertIn(
+            (
+                "canonical status command above reports the intended mode "
+                "and sensitivity plus `credential: configured`"
+            ),
+            normalized,
+        )
+        self.assertIn("enabled at version `0.3.2`", normalized)
+        self.assertIn("if codex is installed", normalized)
+        self.assertIn("all five remem memory hooks trusted", normalized)
+        self.assertIn(
+            "fresh supported-client session can use automatic memory",
+            normalized,
+        )
         self.assertIn("keychain", normalized)
         self.assertIn("rerun the installer", normalized)
         self.assertIn("reload-plugins", normalized)

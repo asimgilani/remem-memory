@@ -47,8 +47,9 @@ Saying “off the record” suppresses memory for that turn.
 
 Finish activation in the Codex surface you use:
 
-- **Codex Desktop:** open **Plugins → Remem Memory → Hooks**, choose
-  **Review**, inspect the five hooks, and trust them.
+- **Codex Desktop:** restart Codex Desktop, then open
+  **Plugins → Remem Memory → Hooks**, choose **Review**, inspect the five
+  hooks, and trust them.
 - **Codex CLI:** start interactive Codex, enter `/hooks`, select
   **Remem Memory**, inspect the five hooks, and approve them.
 
