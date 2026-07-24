@@ -520,5 +520,221 @@ class DefaultRoutesTests(unittest.TestCase):
         self.assertEqual(config.mcp_connections, reset.mcp_connections)
 
 
+class LegacyNamespaceMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temporary_directory.name) / "routing"
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def test_clean_initialization_records_completed_migration(self):
+        config, outcome = remem_routing.initialize_routing(self.data_dir, {})
+
+        self.assertTrue(config.legacy_namespace_migration_completed)
+        self.assertFalse(config.migration_write_blocked)
+        self.assertEqual({}, config.global_routes.routes)
+        self.assertTrue(outcome.initialized)
+        self.assertEqual(1, outcome.distinct_credentials)
+
+    def test_personal_namespace_is_imported_as_global_memory_route(self):
+        config, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "personal"},
+        )
+
+        self.assertEqual(
+            (target("primary", "personal"),),
+            remem_routing.resolve_routes(
+                config, behavior="memory", client="codex"
+            ),
+        )
+        self.assertNotIn("sessions", config.global_routes.routes)
+
+    def test_engineering_namespace_is_imported_as_global_sessions_route(self):
+        config, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_ENGINEERING_NAMESPACE": "engineering"},
+        )
+
+        self.assertEqual(
+            (target("primary", "engineering"),),
+            remem_routing.resolve_routes(
+                config, behavior="sessions", client="claude"
+            ),
+        )
+        self.assertNotIn("memory", config.global_routes.routes)
+
+    def test_both_legacy_namespaces_are_independent_global_routes(self):
+        config, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {
+                "REMEM_MEMORY_PERSONAL_NAMESPACE": "personal",
+                "REMEM_MEMORY_ENGINEERING_NAMESPACE": "engineering",
+            },
+        )
+
+        self.assertEqual(
+            (target("primary", "personal"),),
+            remem_routing.resolve_routes(
+                config, behavior="memory", client="codex"
+            ),
+        )
+        self.assertEqual(
+            (target("primary", "engineering"),),
+            remem_routing.resolve_routes(
+                config, behavior="sessions", client="codex"
+            ),
+        )
+
+    def test_default_namespace_is_deprecated_without_becoming_a_route(self):
+        config, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_DEFAULT_NAMESPACE": "must-not-be-imported"},
+        )
+
+        self.assertEqual({}, config.global_routes.routes)
+        self.assertEqual(
+            ("REMEM_DEFAULT_NAMESPACE is deprecated",),
+            config.deprecations,
+        )
+        self.assertEqual(config.deprecations, outcome.deprecations)
+
+    def test_legacy_environment_is_imported_only_once(self):
+        first, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "default"},
+        )
+        second, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "changed"},
+        )
+
+        self.assertEqual(
+            "default",
+            remem_routing.resolve_routes(
+                second, behavior="memory", client="codex"
+            )[0].namespace,
+        )
+        self.assertTrue(first.legacy_namespace_migration_completed)
+        self.assertFalse(outcome.initialized)
+
+    def test_use_default_does_not_allow_legacy_environment_to_reapply(self):
+        original, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "personal"},
+        )
+        remem_routing.store_routing(
+            remem_routing.use_default_routes(original), self.data_dir
+        )
+
+        reloaded, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "changed"},
+        )
+
+        self.assertTrue(reloaded.legacy_namespace_migration_completed)
+        self.assertEqual({}, reloaded.global_routes.routes)
+        self.assertEqual(
+            (target("primary", "@default"),),
+            remem_routing.resolve_routes(
+                reloaded, behavior="memory", client="codex"
+            ),
+        )
+
+    def test_ambiguous_credentials_block_automatic_writes(self):
+        config, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "personal"},
+            remem_routing.LegacyDiscovery(2, {}),
+        )
+
+        self.assertTrue(config.migration_write_blocked)
+        self.assertTrue(outcome.credential_ambiguous)
+        self.assertEqual(
+            (),
+            remem_routing.resolve_routes(
+                config, behavior="memory", client="codex"
+            ),
+        )
+        self.assertEqual(
+            (),
+            remem_routing.resolve_routes(
+                config, behavior="sessions", client="codex"
+            ),
+        )
+
+    def test_destination_conflicts_are_per_behavior_and_block_writes(self):
+        config, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(
+                1,
+                {"memory": ("one", "two"), "sessions": ("sessions",)},
+            ),
+        )
+
+        self.assertTrue(config.migration_write_blocked)
+        self.assertTrue(outcome.destination_ambiguous)
+        self.assertEqual(
+            (),
+            remem_routing.resolve_routes(
+                config, behavior="memory", client="claude"
+            ),
+        )
+
+    def test_use_default_and_complete_global_routes_unblock_writes(self):
+        blocked, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(2, {}),
+        )
+        self.assertTrue(blocked.migration_write_blocked)
+
+        partial = remem_routing.update_routing(
+            lambda config: replace(
+                config,
+                client_routes={"codex": remem_routing.RouteLayer({"memory": ()})},
+                global_routes=remem_routing.RouteLayer(
+                    {"memory": (target("primary", "memory"),)}
+                ),
+            ),
+            self.data_dir,
+        )
+        self.assertTrue(partial.migration_write_blocked)
+
+        complete = remem_routing.update_routing(
+            lambda config: replace(
+                config,
+                global_routes=remem_routing.RouteLayer(
+                    {
+                        "memory": (target("primary", "memory"),),
+                        "sessions": (),
+                    }
+                ),
+            ),
+            self.data_dir,
+        )
+        self.assertFalse(complete.migration_write_blocked)
+
+        reset = remem_routing.use_default_routes(blocked)
+        self.assertFalse(reset.migration_write_blocked)
+
+    def test_migration_output_and_storage_are_secret_free(self):
+        secret = "vlt_migration-secret-canary"
+        config, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {
+                "REMEM_API_KEY": secret,
+                "REMEM_MEMORY_PERSONAL_NAMESPACE": "personal",
+            },
+        )
+
+        persisted = (self.data_dir / "routes.json").read_text(encoding="utf-8")
+        self.assertNotIn(secret, persisted)
+        self.assertNotIn(secret, repr(outcome))
+        self.assertNotIn(secret, repr(config))
+
+
 if __name__ == "__main__":
     unittest.main()

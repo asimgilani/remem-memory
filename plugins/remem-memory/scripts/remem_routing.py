@@ -113,12 +113,26 @@ class LegacyDiscovery:
     distinct_credentials: int
     destination_candidates: Mapping[str, tuple[str, ...]]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "destination_candidates",
+            MappingProxyType(
+                {
+                    behavior: tuple(candidates)
+                    for behavior, candidates in self.destination_candidates.items()
+                }
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class MigrationOutcome:
-    """Minimal initialization result; legacy migration is added separately."""
-
     initialized: bool
+    distinct_credentials: int = 0
+    credential_ambiguous: bool = False
+    destination_ambiguous: bool = False
+    deprecations: tuple[str, ...] = ()
 
 
 def _default_data_dir() -> Path:
@@ -349,6 +363,8 @@ def resolve_routes(
     checked = _validate_config(config)
     behavior = _validate_behavior(behavior)
     client = _validate_client(client)
+    if checked.migration_write_blocked and behavior in {"memory", "sessions"}:
+        return ()
     client_layer = checked.client_routes.get(client)
     if client_layer is not None and behavior in client_layer.routes:
         return client_layer.routes[behavior]
@@ -378,6 +394,13 @@ def use_default_routes(config: RoutingConfig) -> RoutingConfig:
         global_routes=RouteLayer({}),
         client_routes={},
         migration_write_blocked=False,
+    )
+
+
+def _has_explicit_global_write_routes(config: RoutingConfig) -> bool:
+    return all(
+        behavior in config.global_routes.routes
+        for behavior in ("memory", "sessions")
     )
 
 
@@ -710,6 +733,10 @@ def update_routing(
     with _locked(selected, "routes.lock"):
         current = load_routing(selected)
         updated = _validate_config(mutator(current))
+        if updated.migration_write_blocked and _has_explicit_global_write_routes(
+            updated
+        ):
+            updated = replace(updated, migration_write_blocked=False)
         updated = replace(updated, revision=current.revision + 1)
         store_routing(updated, selected)
         return updated
@@ -720,10 +747,85 @@ def discover_legacy_routing(
     *,
     distinct_credentials: int = 1,
 ) -> LegacyDiscovery:
-    del environment
     if not _is_plain_int(distinct_credentials) or distinct_credentials < 0:
         raise ValueError("Invalid legacy credential count")
-    return LegacyDiscovery(distinct_credentials, {})
+    source = os.environ if environment is None else environment
+    if not isinstance(source, Mapping):
+        raise ValueError("Invalid legacy environment")
+    destinations: dict[str, tuple[str, ...]] = {}
+    for behavior, variable in (
+        ("memory", "REMEM_MEMORY_PERSONAL_NAMESPACE"),
+        ("sessions", "REMEM_MEMORY_ENGINEERING_NAMESPACE"),
+    ):
+        value = source.get(variable, "")
+        if not isinstance(value, str):
+            raise ValueError("Invalid legacy namespace")
+        value = value.strip()
+        if value:
+            destinations[behavior] = (value,)
+    return LegacyDiscovery(distinct_credentials, destinations)
+
+
+def _checked_legacy_discovery(discovery: object) -> LegacyDiscovery:
+    if not isinstance(discovery, LegacyDiscovery):
+        raise ValueError("Invalid legacy discovery")
+    if not _is_plain_int(discovery.distinct_credentials) or (
+        discovery.distinct_credentials < 0
+    ):
+        raise ValueError("Invalid legacy credential count")
+    destinations: dict[str, tuple[str, ...]] = {}
+    for behavior, candidates in discovery.destination_candidates.items():
+        if behavior not in {"memory", "sessions"} or not isinstance(
+            candidates, tuple
+        ):
+            raise ValueError("Invalid legacy destinations")
+        nonempty: list[str] = []
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                raise ValueError("Invalid legacy namespace")
+            candidate = candidate.strip()
+            if candidate:
+                nonempty.append(_validate_namespace(candidate, behavior=behavior))
+        if nonempty:
+            destinations[behavior] = tuple(nonempty)
+    return LegacyDiscovery(discovery.distinct_credentials, destinations)
+
+
+def _legacy_default_deprecations(environment: Mapping[str, str]) -> tuple[str, ...]:
+    if "REMEM_DEFAULT_NAMESPACE" in environment:
+        return ("REMEM_DEFAULT_NAMESPACE is deprecated",)
+    return ()
+
+
+def _migrate_legacy_routing(
+    discovery: LegacyDiscovery,
+    environment: Mapping[str, str],
+) -> tuple[RoutingConfig, MigrationOutcome]:
+    checked = _checked_legacy_discovery(discovery)
+    routes: dict[str, tuple[RouteTarget, ...]] = {}
+    destination_ambiguous = False
+    for behavior, candidates in checked.destination_candidates.items():
+        distinct_destinations = tuple(dict.fromkeys(candidates))
+        if len(distinct_destinations) > 1:
+            destination_ambiguous = True
+            continue
+        routes[behavior] = (RouteTarget("primary", distinct_destinations[0]),)
+    credential_ambiguous = checked.distinct_credentials > 1
+    deprecations = _legacy_default_deprecations(environment)
+    config = replace(
+        _empty_config(),
+        global_routes=RouteLayer(routes),
+        legacy_namespace_migration_completed=True,
+        migration_write_blocked=(credential_ambiguous or destination_ambiguous),
+        deprecations=deprecations,
+    )
+    return config, MigrationOutcome(
+        initialized=True,
+        distinct_credentials=checked.distinct_credentials,
+        credential_ambiguous=credential_ambiguous,
+        destination_ambiguous=destination_ambiguous,
+        deprecations=deprecations,
+    )
 
 
 def initialize_routing(
@@ -731,15 +833,22 @@ def initialize_routing(
     environment: Mapping[str, str] | None = None,
     discovery: LegacyDiscovery | None = None,
 ) -> tuple[RoutingConfig, MigrationOutcome]:
-    del environment, discovery
     selected = _selected_data_dir(data_dir)
     with _locked(selected, "routes.lock"):
         try:
             return load_routing(selected), MigrationOutcome(False)
         except FileNotFoundError:
-            config = _empty_config()
+            source = os.environ if environment is None else environment
+            if not isinstance(source, Mapping):
+                raise ValueError("Invalid legacy environment")
+            selected_discovery = (
+                discover_legacy_routing(source)
+                if discovery is None
+                else discovery
+            )
+            config, outcome = _migrate_legacy_routing(selected_discovery, source)
             store_routing(config, selected)
-            return config, MigrationOutcome(True)
+            return config, outcome
 
 
 def load_or_initialize_routing(
