@@ -1468,6 +1468,55 @@ class RememMemoryHookTests(unittest.TestCase):
         assert primary_event is not None
         return secondary, config, secondary_event, primary_event
 
+    def _run_raw_worker_claim(self, raw, dependencies):
+        captured_payloads = []
+        original_handle_event = _HOOK.handle_event
+
+        def handle_with_dependencies(
+            payload,
+            harness,
+            mode,
+            dependencies=None,
+        ):
+            del dependencies
+            captured_payloads.append(payload)
+            return original_handle_event(
+                payload,
+                harness=harness,
+                mode=mode,
+                dependencies=selected_dependencies,
+            )
+
+        selected_dependencies = dependencies
+        standard_input = io.TextIOWrapper(
+            io.BytesIO(raw),
+            encoding="utf-8",
+        )
+        standard_output = io.StringIO()
+        with (
+            mock.patch.object(_HOOK.sys, "stdin", standard_input),
+            contextlib.redirect_stdout(standard_output),
+            mock.patch.object(
+                _HOOK,
+                "handle_event",
+                side_effect=handle_with_dependencies,
+            ),
+            mock.patch.object(
+                _HOOK,
+                "resolve_api_key",
+                return_value=None,
+            ),
+        ):
+            return_code = _HOOK.main(
+                [
+                    "--mode",
+                    "worker_drain",
+                    "--harness",
+                    "codex",
+                ]
+            )
+        return return_code, captured_payloads, standard_output.getvalue()
+
     def test_hook_dependencies_expose_routing_and_connection_resolvers(
         self,
     ) -> None:
@@ -4003,6 +4052,266 @@ class RememMemoryHookTests(unittest.TestCase):
                         [event["id"] for event in store.load("s1")],
                         [secondary_event["id"]],
                     )
+
+    def test_raw_worker_claim_rejects_duplicate_names_recursively(
+        self,
+    ) -> None:
+        secondary, config, secondary_event, _primary_event = (
+            self._claim_race_fixture()
+        )
+        event_id = secondary_event["id"]
+        duplicate_inputs = (
+            (
+                '{"session_id":"wrong","session_id":"s1",'
+                f'"claim":{{"schema_version":1,"event_ids":["{event_id}"]}}}}'
+            ),
+            (
+                '{"session_id":"s1","claim":{'
+                '"schema_version":2,"schema_version":1,'
+                f'"event_ids":["{event_id}"]}}}}'
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            writes = []
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: writes.append(
+                    mode
+                ),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    "secondary-key"
+                    if connection.id == secondary.id
+                    else "primary-key"
+                ),
+            )
+            for raw in duplicate_inputs:
+                with self.subTest(raw=raw):
+                    writes.clear()
+                    store.save("s1", [secondary_event])
+                    return_code, captured, output = (
+                        self._run_raw_worker_claim(
+                            raw.encode("utf-8"),
+                            dependencies,
+                        )
+                    )
+
+                    self.assertEqual(return_code, 0)
+                    self.assertEqual(captured, [{}])
+                    self.assertEqual(json.loads(output), {})
+                    self.assertEqual(writes, [])
+                    self.assertEqual(
+                        [event["id"] for event in store.load("s1")],
+                        [event_id],
+                    )
+
+    def test_raw_worker_claim_is_bounded_and_rejects_trailing_data(
+        self,
+    ) -> None:
+        secondary, config, secondary_event, _primary_event = (
+            self._claim_race_fixture()
+        )
+        event_id = secondary_event["id"]
+        valid = (
+            '{"session_id":"s1","claim":{"schema_version":1,'
+            f'"event_ids":["{event_id}"]}}}}'
+        ).encode("utf-8")
+        oversized = valid + (b" " * (8_193 - len(valid)))
+        self.assertEqual(len(oversized), 8_193)
+        malformed_inputs = (
+            oversized,
+            valid + b" ",
+            valid + b"\n{}",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            writes = []
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: writes.append(
+                    mode
+                ),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    "secondary-key"
+                    if connection.id == secondary.id
+                    else "primary-key"
+                ),
+            )
+            for raw in malformed_inputs:
+                with self.subTest(length=len(raw)):
+                    writes.clear()
+                    store.save("s1", [secondary_event])
+                    return_code, captured, output = (
+                        self._run_raw_worker_claim(raw, dependencies)
+                    )
+
+                    self.assertEqual(return_code, 0)
+                    self.assertEqual(captured, [{}])
+                    self.assertEqual(json.loads(output), {})
+                    self.assertEqual(writes, [])
+                    self.assertEqual(
+                        [event["id"] for event in store.load("s1")],
+                        [event_id],
+                    )
+
+    def test_raw_worker_claim_bounds_read_before_json_decode(
+        self,
+    ) -> None:
+        requested_amounts = []
+
+        class GuardedInput:
+            buffer = None
+
+            def read(self, amount=None):
+                requested_amounts.append(amount)
+                return b"x" * (amount or 8_193)
+
+        guarded_input = GuardedInput()
+        guarded_input.buffer = guarded_input
+        with mock.patch.object(_HOOK.sys, "stdin", guarded_input):
+            parsed = _HOOK._read_stdin_json("worker_drain")
+
+        self.assertEqual(parsed, {})
+        self.assertEqual(requested_amounts, [8_193])
+
+    def test_raw_worker_claim_requires_exact_top_level_envelope(
+        self,
+    ) -> None:
+        secondary, config, secondary_event, _primary_event = (
+            self._claim_race_fixture()
+        )
+        event_id = secondary_event["id"]
+        overlong_session = "s" * 201
+        malformed_inputs = (
+            (
+                '{"session_id":"s1","claim":{"schema_version":1,'
+                f'"event_ids":["{event_id}"]}},"payload":{{}}}}'
+            ),
+            (
+                '{"claim":{"schema_version":1,'
+                f'"event_ids":["{event_id}"]}}}}'
+            ),
+            '{"session_id":"s1"}',
+            (
+                '{"session_id":"","claim":{"schema_version":1,'
+                f'"event_ids":["{event_id}"]}}}}'
+            ),
+            (
+                '{"session_id":" s1","claim":{"schema_version":1,'
+                f'"event_ids":["{event_id}"]}}}}'
+            ),
+            (
+                f'{{"session_id":"{overlong_session}",'
+                '"claim":{"schema_version":1,'
+                f'"event_ids":["{event_id}"]}}}}'
+            ),
+            (
+                '{"session_id":"api_key=vlt_abcdefghijklmnopqrstuvwxyz",'
+                '"claim":{"schema_version":1,'
+                f'"event_ids":["{event_id}"]}}}}'
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            writes = []
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: writes.append(
+                    mode
+                ),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    "secondary-key"
+                    if connection.id == secondary.id
+                    else "primary-key"
+                ),
+            )
+            for raw in malformed_inputs:
+                with self.subTest(raw=raw):
+                    writes.clear()
+                    store.save("s1", [secondary_event])
+                    return_code, captured, output = (
+                        self._run_raw_worker_claim(
+                            raw.encode("utf-8"),
+                            dependencies,
+                        )
+                    )
+
+                    self.assertEqual(return_code, 0)
+                    self.assertEqual(captured, [{}])
+                    self.assertEqual(json.loads(output), {})
+                    self.assertEqual(writes, [])
+                    self.assertEqual(
+                        [event["id"] for event in store.load("s1")],
+                        [event_id],
+                    )
+
+    def test_raw_worker_claim_accepts_one_exact_bounded_envelope(
+        self,
+    ) -> None:
+        secondary, config, secondary_event, _primary_event = (
+            self._claim_race_fixture()
+        )
+        event_id = secondary_event["id"]
+        raw = (
+            '{"session_id":"s1","claim":{"schema_version":1,'
+            f'"event_ids":["{event_id}"]}}}}'
+        ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [secondary_event])
+            writes = []
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=lambda mode, payload: writes.append(
+                    mode
+                ),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: (
+                    "secondary-key"
+                    if connection.id == secondary.id
+                    else "primary-key"
+                ),
+            )
+            return_code, captured, output = self._run_raw_worker_claim(
+                raw,
+                dependencies,
+            )
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(
+                captured,
+                [
+                    {
+                        "session_id": "s1",
+                        "claim": {
+                            "schema_version": 1,
+                            "event_ids": [event_id],
+                        },
+                    }
+                ],
+            )
+            self.assertEqual(json.loads(output), {})
+            self.assertEqual(writes, ["post_tool_use"])
+            self.assertEqual(store.load("s1"), [])
 
     def test_secondary_claim_never_drains_primary_appended_before_lock(
         self,

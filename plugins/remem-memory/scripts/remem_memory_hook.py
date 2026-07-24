@@ -2341,7 +2341,52 @@ def handle_event(
         return fallback
 
 
-def _read_stdin_json() -> dict[str, Any]:
+def _read_worker_claim_json() -> dict[str, Any]:
+    try:
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = stream.read(_MAX_BACKGROUND_CLAIM_BYTES + 1)
+        if isinstance(raw, str):
+            encoded = raw.encode("utf-8")
+        elif isinstance(raw, bytes):
+            encoded = raw
+        else:
+            return {}
+        if (
+            not encoded
+            or len(encoded) > _MAX_BACKGROUND_CLAIM_BYTES
+        ):
+            return {}
+        serialized = encoded.decode("utf-8")
+        if serialized != serialized.strip():
+            return {}
+        parsed = json.loads(
+            serialized,
+            object_pairs_hook=_unique_json_object,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict) or set(parsed) != {
+        "session_id",
+        "claim",
+    }:
+        return {}
+    session_id = parsed.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id != session_id.strip()
+        or len(session_id) > 200
+        or contains_secret(session_id)
+        or any(ord(character) < 32 for character in session_id)
+        or _normalize_background_claim(parsed.get("claim")) is None
+    ):
+        return {}
+    return parsed
+
+
+def _read_stdin_json(mode: str) -> dict[str, Any]:
+    if mode == _WORKER_DRAIN_MODE:
+        return _read_worker_claim_json()
     try:
         parsed = json.loads(sys.stdin.read() or "{}")
     except (OSError, json.JSONDecodeError):
@@ -2391,7 +2436,7 @@ def main(argv: list[str] | None = None) -> int:
     primary_override = _consume_dispatcher_primary_credential(args.mode)
     with _worker_credential_scope(args.mode):
         result = handle_event(
-            _read_stdin_json(),
+            _read_stdin_json(args.mode),
             harness=args.harness,
             mode=args.mode,
             dependencies=(
