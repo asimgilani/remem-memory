@@ -54,6 +54,72 @@ def parse_frontmatter(path: str) -> dict[str, str]:
 
 
 class PackagingDocsTests(unittest.TestCase):
+    def test_readme_puts_complete_activation_path_after_quick_install(
+        self,
+    ) -> None:
+        readme = read("README.md")
+        quick = readme.index("## Quick install")
+        activation = readme.index("## Finish activation")
+        requirements = readme.index("## Requirements")
+
+        self.assertLess(quick, activation)
+        self.assertLess(activation, requirements)
+        self.assertIn("Codex or Claude Code", readme[quick:activation])
+        self.assertIn("https://app.remem.io", readme[activation:requirements])
+        self.assertIn(
+            "env -u REMEM_API_KEY ~/.local/bin/remem-memory status",
+            readme[activation:requirements],
+        )
+        self.assertIn(
+            "~/.local/bin/remem-memory auth",
+            readme[activation:requirements],
+        )
+
+    def test_activation_docs_distinguish_codex_and_claude_surfaces(
+        self,
+    ) -> None:
+        readme = read("README.md")
+        install = read(".codex/INSTALL.md")
+        codex = read("docs/README.codex.md")
+
+        for document_name, document in (
+            ("README.md", readme),
+            (".codex/INSTALL.md", install),
+        ):
+            self.assertIn("Codex Desktop", document, document_name)
+            self.assertIn("Plugins", document, document_name)
+            self.assertIn("Remem Memory", document, document_name)
+            self.assertIn("Review", document, document_name)
+            self.assertIn("five hooks", document, document_name)
+            self.assertIn("Codex CLI", document, document_name)
+            self.assertIn("/hooks", document, document_name)
+            self.assertIn("Claude Code", document, document_name)
+            self.assertIn("/reload-plugins", document, document_name)
+            self.assertIn("read-only", document.lower(), document_name)
+
+        for label in ("Codex Desktop", "Codex CLI"):
+            self.assertIn(label, codex)
+        self.assertIn("/hooks", codex)
+        self.assertIn("exact hook hash", codex.lower())
+        self.assertIn("local", codex.lower())
+
+    def test_activation_docs_define_expected_state_and_common_recovery(
+        self,
+    ) -> None:
+        readme = read("README.md")
+        activation = readme.split("## Finish activation", 1)[1].split(
+            "## Requirements",
+            1,
+        )[0]
+        normalized = " ".join(activation.lower().split())
+
+        self.assertIn("credential: configured", normalized)
+        self.assertIn("enabled at version", normalized)
+        self.assertIn("all five", normalized)
+        self.assertIn("keychain", normalized)
+        self.assertIn("rerun the installer", normalized)
+        self.assertIn("reload-plugins", normalized)
+
     def test_docs_use_one_product_name_and_keep_install_url(self) -> None:
         readme = read("README.md")
         install = read(".codex/INSTALL.md")

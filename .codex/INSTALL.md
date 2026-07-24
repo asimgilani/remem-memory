@@ -71,7 +71,7 @@ The setup:
 - uses standard-library-only local helpers and prepares the private,
   content-addressed MCP cache;
 - installs the canonical command and compatibility aliases;
-- installs and verifies `remem-memory` version `0.3.1` in available Codex and
+- installs and verifies `remem-memory` version `0.3.2` in available Codex and
   Claude Code clients;
 - keeps the older Claude plugin active until the replacement is verified;
 - can bridge one narrowly recognized legacy Codex credential to Keychain; and
@@ -127,16 +127,28 @@ claude plugin list --json
 ```
 
 Skip a client-specific command if that client is not installed. Confirm that
-each installed client reports `remem-memory` enabled at `0.3.1`. Confirm the
+each installed client reports `remem-memory` enabled at `0.3.2`. Confirm the
 old Claude identity is absent or disabled and the old Codex Remem MCP block is
 absent only after the verified bridge.
 
-Restart each installed client. In a new Codex session, run `/hooks`, review the
-Remem Memory entry, and trust its exact hook hash. Codex skips those hooks until
-they are trusted, so automatic recall, durable capture, and engineering
-checkpoints do not run before approval. MCP tools, skills, and manual CLI
-commands can still work before hook trust. After any new or changed hook
-version, run `/hooks` and re-review it.
+Restart each installed client, then finish activation for the applicable
+surface:
+
+- **Codex Desktop:** open **Plugins → Remem Memory → Hooks**, choose
+  **Review**, inspect the five hooks, and let the user trust them.
+- **Codex CLI:** start interactive Codex, enter `/hooks`, select
+  **Remem Memory**, inspect the five hooks, and let the user approve them.
+- **Claude Code:** run `/reload-plugins`, or restart Claude Code and begin a
+  new session. Claude has no separate Codex-style hook approval; its `/hooks`
+  view is read-only and can verify that the plugin hooks loaded.
+
+The agent may verify plugin state with the commands above, but may not approve
+Codex hooks for the user. Codex approval is local to that
+installation/configuration and bound to the exact hook hash. Codex skips those
+hooks until they are trusted, so automatic recall, durable capture, and
+engineering checkpoints do not run before approval. MCP tools, skills, and
+manual CLI commands can still work before hook trust. After any new or changed
+hook version, run `/hooks` and re-review it.
 
 The audited MCP snapshot is bundled at `plugins/remem-memory/mcp`; it is not
 fetched from a private repository. Its provenance records upstream commit
@@ -198,7 +210,7 @@ To pause without uninstalling:
 remem-memory mode off
 ```
 
-The verified rollback boundary in 0.3.1 is `remem-memory mode off`. Keep Remem
+The verified rollback boundary in 0.3.2 is `remem-memory mode off`. Keep Remem
 cloud data, Keychain data, project `.remem/` logs, the current checkout, and
 both client registrations intact. Version downgrade is intentionally not
 automated: an older checkout's installer can update an existing canonical Git

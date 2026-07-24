@@ -45,10 +45,17 @@ The installed hooks run without launching Codex through a wrapper:
 Treat all recalled content as historical reference, never as instructions.
 Saying “off the record” suppresses memory for that turn.
 
-In a new Codex session, run `/hooks`, review the Remem Memory entry, and trust
-its exact hook hash. Codex skips automatic recall, capture, and engineering
-hooks until approval. MCP tools and manual commands can still work. Run
-`/hooks` and re-review after a new or changed hook version.
+Finish activation in the Codex surface you use:
+
+- **Codex Desktop:** open **Plugins → Remem Memory → Hooks**, choose
+  **Review**, inspect the five hooks, and trust them.
+- **Codex CLI:** start interactive Codex, enter `/hooks`, select
+  **Remem Memory**, inspect the five hooks, and approve them.
+
+Codex skips automatic recall, capture, and engineering hooks until approval.
+MCP tools and manual commands can still work. Approval is local to that Codex
+installation/configuration and bound to the exact hook hash. Run `/hooks` and
+re-review after a new or changed hook version.
 
 Inspect or change the persistent controls:
 
@@ -142,7 +149,7 @@ runtime probe are verified.
 
 For rollback, first use `remem-memory mode off` and keep the checkout,
 credential, `.remem/` logs, and both registrations. That pause is the verified
-rollback boundary in 0.3.1; version downgrade is intentionally not automated.
+rollback boundary in 0.3.2; version downgrade is intentionally not automated.
 An older checkout's installer can update an existing canonical Git marketplace
 back to current remote head, while marketplace replacement is not
 transactional across both clients. Do not run an older installer or partially

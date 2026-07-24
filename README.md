@@ -37,15 +37,61 @@ conversations use Remem Memory.
 
 ## Quick install
 
-Tell Codex on the target Mac:
+Ask Codex or Claude Code on the target Mac:
 
 ```text
 Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/remem-memory/refs/heads/master/.codex/INSTALL.md
 ```
 
+## Finish activation
+
+The installer safely installs and verifies the plugin. Complete these local
+activation steps:
+
+1. Check the canonical Keychain credential:
+
+   ```bash
+   env -u REMEM_API_KEY ~/.local/bin/remem-memory status
+   ```
+
+   If it reports `credential: missing`, get a least-privilege API key from your
+   [Remem account](https://app.remem.io), then enter it only in the hidden
+   prompt:
+
+   ```bash
+   ~/.local/bin/remem-memory auth
+   ```
+
+   Never paste the key into chat, a command argument, or a configuration file.
+2. Finish activation for each installed client:
+
+| Surface | What to do |
+| --- | --- |
+| Codex Desktop | Open **Plugins → Remem Memory → Hooks**, choose **Review**, inspect the five hooks, then trust them. |
+| Codex CLI | Start interactive Codex, enter `/hooks`, select **Remem Memory**, inspect the five hooks, then approve them. |
+| Claude Code | Run `/reload-plugins`, or restart Claude Code and begin a new session. Claude has no separate Codex-style hook approval; its `/hooks` view is read-only and can verify that the plugin hooks loaded. |
+
+Codex approval is local to that installation/configuration and bound to the
+exact hook hash. Review again on a new Mac/configuration or after hook content
+changes. Codex skips those hooks until they are trusted, so automatic recall,
+durable capture, and engineering checkpoints do not run before approval. MCP
+tools, skills, and manual CLI commands can still work before hook trust. After
+any new or changed hook version, run `/hooks` and re-review it.
+
+Setup is active when Keychain status says `credential: configured`, every
+installed client reports Remem Memory enabled at version `0.3.2`, and Codex
+shows all five Remem Memory hooks trusted.
+
+If activation does not work:
+
+- Missing credential: run the hidden `auth` prompt above.
+- Plugin not listed: update a clean checkout and rerun the installer.
+- Codex automation absent: review its local hook trust.
+- Claude still shows old plugin state: run `/reload-plugins` or restart it.
+
 The installer detects Codex and Claude Code, installs the same
 `remem-memory` plugin into each available harness, and verifies version
-`0.3.1` before retiring an older active identity.
+`0.3.2` before retiring an older active identity.
 
 ## Requirements
 
@@ -94,12 +140,7 @@ placed in plugin manifests, shell startup files, or Codex configuration.
 To verify Keychain rather than an environment override, run
 `env -u REMEM_API_KEY ~/.local/bin/remem-memory status`.
 
-Restart the installed clients after setup. In a new Codex session, run
-`/hooks`, review the Remem Memory entry, and trust its exact hook hash. Codex
-skips those hooks until they are trusted, so automatic recall, durable capture,
-and engineering checkpoints do not run before approval. MCP tools, skills, and
-manual CLI commands can still work before hook trust. After any new or changed
-hook version, run `/hooks` and re-review it.
+For client-specific reload and trust steps, see [Finish activation](#finish-activation).
 
 The audited MCP snapshot is bundled at `plugins/remem-memory/mcp`; no private
 repository fetch is needed. Its provenance records upstream commit
@@ -269,7 +310,7 @@ The verified rollback boundary in this release is the immediate `mode off`
 pause. Keep the current checkout, Keychain item, cloud data, `.remem/` files,
 and both client registrations intact while investigating.
 
-Version downgrade is intentionally not automated in 0.3.1. Running an older
+Version downgrade is intentionally not automated in 0.3.2. Running an older
 checkout's installer is not a pin: an existing canonical Git marketplace can
 update back to its current remote head. Replacing that marketplace source is
 client-specific and is not transactional across Codex and Claude Code. Do not
