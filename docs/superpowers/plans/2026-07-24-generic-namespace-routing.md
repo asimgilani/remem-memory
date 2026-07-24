@@ -161,7 +161,8 @@ Configuration limits are fixed and tested:
 `route-health.json` is also non-secret and atomically replaced. It is bounded
 to 32,768 bytes and 64 records. Each record contains only the seven fields in
 `RouteHealthRecord`; `status` is one of `ok`, `credential_error`,
-`auth_error`, `permission_error`, `namespace_error`, or `transient_error`.
+`auth_error`, `permission_error`, `namespace_error`, `request_error`, or
+`transient_error`.
 `detail_code` is a fixed internal code of at most 64 ASCII characters, and
 `observed_at` is a UTC RFC 3339 timestamp. No API body, recalled content,
 credential, Keychain account, or free-form exception string is stored.
