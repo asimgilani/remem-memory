@@ -242,7 +242,7 @@ Update only a clean checkout with `git pull --ff-only`; preserve and report a
 dirty checkout instead of forcing it. The installer verifies the new plugin
 before legacy cleanup and stops on credential conflicts.
 
-The verified rollback boundary in 0.3.1 is non-destructive: pause memory and
+The verified rollback boundary in 0.3.2 is non-destructive: pause memory and
 keep the current checkout, Keychain item, Remem cloud data, project `.remem/`
 logs, and both client registrations. Version downgrade is intentionally not
 automated. An older checkout's installer can update an existing canonical Git

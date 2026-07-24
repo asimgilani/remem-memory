@@ -442,7 +442,7 @@ class PackagingDocsTests(unittest.TestCase):
             self.assertIn("personal", description, path)
             self.assertIn("engineering", description, path)
             self.assertEqual(manifest["name"], "remem-memory")
-            self.assertEqual(manifest["version"], "0.3.1")
+            self.assertEqual(manifest["version"], "0.3.2")
 
     def test_security_doc_covers_full_boundary(self) -> None:
         security = read("docs/SECURITY.md").lower()
