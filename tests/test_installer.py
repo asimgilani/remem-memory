@@ -589,7 +589,12 @@ class SecureInstallerTests(unittest.TestCase):
     def test_success_output_matches_verified_clients(self) -> None:
         cases = (
             (True, False, ("Codex Desktop", "Codex CLI"), ("Claude Code:",)),
-            (False, True, ("Claude Code:", "/reload-plugins"), ("Codex Desktop", "Codex CLI")),
+            (
+                False,
+                True,
+                ("Claude Code:", "/reload-plugins"),
+                ("Codex Desktop", "Codex CLI", "Codex hooks trusted"),
+            ),
             (True, True, ("Codex Desktop", "Codex CLI", "Claude Code:"), ()),
         )
         for codex, claude, included, excluded in cases:

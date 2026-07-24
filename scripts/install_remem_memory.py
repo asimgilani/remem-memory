@@ -1186,9 +1186,12 @@ def _activation_guidance(installed: _InstalledClients) -> str:
                 ),
             )
         )
-    lines.append(
-        "3. Confirm credential: configured, plugin enabled, and Codex hooks trusted."
-    )
+    final_verification = "3. Confirm credential: configured, plugin enabled"
+    if installed.codex:
+        final_verification += ", and Codex hooks trusted."
+    else:
+        final_verification += "."
+    lines.append(final_verification)
     return "\n".join(lines)
 
 
