@@ -802,14 +802,14 @@ class MCPLauncherTests(unittest.TestCase):
         self.assertEqual(resolved, str(valid.resolve()))
 
     def test_launcher_rejects_relative_uv_found_on_inherited_path(self):
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             malicious = Path(directory) / "uv"
             malicious.write_text("#!/bin/sh\n", encoding="utf-8")
             malicious.chmod(0o700)
             safe = Path(directory) / "safe-uv"
             safe.write_text("#!/bin/sh\n", encoding="utf-8")
             safe.chmod(0o700)
-            relative = str(malicious.relative_to(Path.cwd()))
+            relative = os.path.relpath(malicious, Path.cwd())
 
             with mock.patch.object(
                 launcher.shutil,
