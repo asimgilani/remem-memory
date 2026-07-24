@@ -9,15 +9,18 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Mapping
 from uuid import uuid4
 
 from memory_policy import (
@@ -61,6 +64,7 @@ _RECALL_TIMEOUT = 2.0
 _INGEST_TIMEOUT = 2.0
 _MAX_COMPLETED_TURNS = 100
 _MAX_BACKGROUND_QUEUE = 128
+_MAX_BACKGROUND_QUEUE_BYTES = 262_144
 _MAX_CREDENTIAL_BYTES = 8192
 _DEFAULT_API_URL = "https://api.remem.io"
 _BASE_WORKER_ENVIRONMENT_KEYS = (
@@ -78,12 +82,10 @@ _WORKER_ENVIRONMENT_KEYS = (
     "REMEM_MEMORY_ALLOW_LOCAL_DEV",
     "REMEM_MEMORY_DATA_DIR",
     "REMEM_MEMORY_AUTO_ENABLED",
-    "REMEM_MEMORY_PERSONAL_NAMESPACE",
     "REMEM_MEMORY_PROJECT",
     "REMEM_MEMORY_SESSION_ID",
     "REMEM_MEMORY_WRAPPER_SESSION_ID",
     "REMEM_MEMORY_ENGINEERING_ENABLED",
-    "REMEM_MEMORY_ENGINEERING_NAMESPACE",
     "REMEM_MEMORY_STATE_FILE",
     "REMEM_MEMORY_LOG_FILE",
     "REMEM_MEMORY_INTERVAL_SECONDS",
@@ -124,19 +126,35 @@ _BACKGROUND_MODES = {
 _WORKER_DRAIN_MODE = "worker_drain"
 _WORKER_CREDENTIAL_MODES = {
     *_BACKGROUND_MODES.values(),
-    _WORKER_DRAIN_MODE,
 }
 _WRITE_MODE_ORIGINS = {
     **{mode: mode for mode in _BACKGROUND_MODES},
     **{worker: mode for mode, worker in _BACKGROUND_MODES.items()},
     "engineering_session_end": "session_end",
 }
+_BACKGROUND_EVENT_ID = re.compile(r"[0-9a-f]{32}\Z")
+_BACKGROUND_CONNECTION_ID = re.compile(r"conn_[0-9a-f]{32}\Z")
 
 
 @dataclass(frozen=True)
 class Settings:
     mode: str = _DEFAULT_MODE
     sensitivity: str = _DEFAULT_SENSITIVITY
+
+
+@dataclass(frozen=True)
+class RoutedBackgroundEvent:
+    schema_version: int
+    id: str
+    client: Literal["codex", "claude"]
+    behavior: Literal["memory", "sessions"]
+    lifecycle_mode: str
+    connection_id: str
+    namespace: str
+    route_revision: int
+    session_id: str
+    payload: Mapping[str, Any]
+    off_record_seen: bool
 
 
 @dataclass(frozen=True)
@@ -343,12 +361,43 @@ class BackgroundQueueStore:
 
     def load(self, session_id: str) -> list[dict[str, Any]]:
         path = self.path_for(session_id)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
+            descriptor = os.open(path, flags)
         except FileNotFoundError:
             return []
-        except (OSError, json.JSONDecodeError):
+        except OSError:
             raise RuntimeError("background queue unavailable") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or metadata.st_size > _MAX_BACKGROUND_QUEUE_BYTES
+            ):
+                raise RuntimeError("background queue unavailable")
+            chunks: list[bytes] = []
+            remaining = _MAX_BACKGROUND_QUEUE_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(65_536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            encoded = b"".join(chunks)
+            if len(encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+                raise RuntimeError("background queue unavailable")
+            parsed = json.loads(encoded.decode("utf-8"))
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            raise RuntimeError("background queue unavailable") from None
+        finally:
+            os.close(descriptor)
         events = parsed.get("events") if isinstance(parsed, dict) else None
         if not isinstance(events, list):
             raise RuntimeError("background queue unavailable")
@@ -361,6 +410,17 @@ class BackgroundQueueStore:
     ) -> None:
         self._ensure_directories()
         path = self.path_for(session_id)
+        normalized = _normalize_background_queue(events)
+        try:
+            encoded = json.dumps(
+                {"events": normalized},
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise RuntimeError("background queue unavailable") from None
+        if len(encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+            raise RuntimeError("background queue unavailable")
         descriptor = -1
         temporary = ""
         try:
@@ -370,14 +430,9 @@ class BackgroundQueueStore:
                 dir=str(self.queues_dir),
             )
             os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            with os.fdopen(descriptor, "wb") as stream:
                 descriptor = -1
-                json.dump(
-                    {"events": _normalize_background_queue(events)},
-                    stream,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                )
+                stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
@@ -670,11 +725,20 @@ def _record_target_success(
 
 
 def _default_engineering_handler(
-    mode: str, payload: dict[str, Any]
+    mode: str,
+    payload: dict[str, Any],
+    *,
+    connection_id: str | None = None,
+    namespace: str | None = None,
 ) -> int:
     import auto_memory_hook
 
-    return auto_memory_hook.handle_payload(mode, payload)
+    return auto_memory_hook.handle_payload(
+        mode,
+        payload,
+        connection_id=connection_id,
+        namespace=namespace,
+    )
 
 
 def _invoke_engineering(
@@ -684,10 +748,12 @@ def _invoke_engineering(
     harness: str,
     *,
     summaries_allowed: bool = True,
+    connection_id: str | None = None,
+    namespace: str | None = None,
 ) -> None:
     if not _engineering_enabled():
         return
-    handler = dependencies.engineering_handler or _default_engineering_handler
+    handler = dependencies.engineering_handler
     previous_key = os.environ.get("REMEM_API_KEY")
     previous_harness = os.environ.get("REMEM_MEMORY_HARNESS")
     previous_rollup_trigger = os.environ.get(
@@ -720,7 +786,15 @@ def _invoke_engineering(
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.redirect_stderr(io.StringIO()):
-                handler(mode, payload)
+                if handler is None:
+                    _default_engineering_handler(
+                        mode,
+                        payload,
+                        connection_id=connection_id,
+                        namespace=namespace,
+                    )
+                else:
+                    handler(mode, payload)
     except Exception:
         pass
     finally:
@@ -942,6 +1016,8 @@ def _handle_stop(
     dependencies: Dependencies,
     settings: Settings,
     turn_state: dict[str, Any] | None = None,
+    *,
+    invoke_engineering: bool = True,
 ) -> dict[str, Any]:
     output = {"continue": True} if harness == "codex" else {}
     if settings.mode != "auto":
@@ -960,13 +1036,14 @@ def _handle_stop(
     if current is None or current["off_record"]:
         return output
 
-    _invoke_engineering(
-        dependencies,
-        "task_completed",
-        payload,
-        harness,
-        summaries_allowed=not current["off_record_seen"],
-    )
+    if invoke_engineering:
+        _invoke_engineering(
+            dependencies,
+            "task_completed",
+            payload,
+            harness,
+            summaries_allowed=not current["off_record_seen"],
+        )
 
     assistant = payload.get("last_assistant_message")
     assistant = assistant if isinstance(assistant, str) else ""
@@ -1140,6 +1217,12 @@ def _background_payload(
         assistant = _bounded_field(payload, "last_assistant_message", 2000)
         if assistant and not contains_secret(assistant):
             minimized["last_assistant_message"] = assistant
+        turn_state = payload.get("_turn_state")
+        if isinstance(turn_state, dict):
+            safe_turn_state = _normalize_turn_state(turn_state)
+            if safe_turn_state["off_record"]:
+                return None
+            minimized["_turn_state"] = safe_turn_state
     return minimized
 
 
@@ -1171,44 +1254,101 @@ def _normalize_background_queue(
     for item in value[:_MAX_BACKGROUND_QUEUE]:
         if not isinstance(item, dict):
             continue
+        schema_version = item.get("schema_version")
         event_id = item.get("id")
-        mode = item.get("mode")
-        harness = item.get("harness")
+        client = item.get("client")
+        behavior = item.get("behavior")
+        lifecycle_mode = item.get("lifecycle_mode")
+        connection_id = item.get("connection_id")
+        namespace = item.get("namespace")
+        route_revision = item.get("route_revision")
+        session_id = item.get("session_id")
         payload = item.get("payload")
-        turn_state = item.get("turn_state")
         off_record_seen = item.get("off_record_seen")
         if (
-            not isinstance(event_id, str)
-            or not event_id
-            or len(event_id) > 64
-            or mode not in _BACKGROUND_MODES
-            or harness not in {"codex", "claude"}
+            type(schema_version) is not int
+            or schema_version != 1
+            or not isinstance(event_id, str)
+            or _BACKGROUND_EVENT_ID.fullmatch(event_id) is None
+            or client not in {"codex", "claude"}
+            or behavior not in {"memory", "sessions"}
+            or lifecycle_mode not in _BACKGROUND_MODES
+            or (behavior == "memory" and lifecycle_mode != "stop")
+            or not isinstance(connection_id, str)
+            or (
+                connection_id != "primary"
+                and _BACKGROUND_CONNECTION_ID.fullmatch(connection_id)
+                is None
+            )
+            or not isinstance(namespace, str)
+            or not namespace
+            or len(namespace) > 100
+            or namespace == "@readable"
+            or contains_secret(namespace)
+            or any(
+                unicodedata.category(character) == "Cc"
+                for character in namespace
+            )
+            or type(route_revision) is not int
+            or route_revision < 0
+            or not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > 200
+            or any(ord(character) < 32 for character in session_id)
+            or contains_secret(session_id)
             or not isinstance(payload, dict)
+            or type(off_record_seen) is not bool
         ):
             continue
-        safe_payload = _background_payload(payload, mode)
-        if safe_payload is None or not isinstance(
-            safe_payload.get("session_id"),
-            str,
+        safe_payload = _background_payload(payload, lifecycle_mode)
+        if (
+            safe_payload is None
+            or safe_payload != payload
+            or safe_payload.get("session_id") != session_id
         ):
+            continue
+        unknown = {
+            name: item[name]
+            for name in item
+            if name
+            not in {
+                "schema_version",
+                "id",
+                "client",
+                "behavior",
+                "lifecycle_mode",
+                "connection_id",
+                "namespace",
+                "route_revision",
+                "session_id",
+                "payload",
+                "off_record_seen",
+            }
+        }
+        try:
+            unsafe_unknown = bool(
+                unknown
+                and contains_secret(
+                    json.dumps(unknown, ensure_ascii=True)
+                )
+            )
+        except (TypeError, ValueError):
+            unsafe_unknown = True
+        if unsafe_unknown:
             continue
         normalized.append(
             {
+                "schema_version": 1,
                 "id": event_id,
-                "mode": mode,
-                "harness": harness,
+                "client": client,
+                "behavior": behavior,
+                "lifecycle_mode": lifecycle_mode,
+                "connection_id": connection_id,
+                "namespace": namespace,
+                "route_revision": route_revision,
+                "session_id": session_id,
                 "payload": safe_payload,
-                "off_record_seen": (
-                    off_record_seen
-                    if type(off_record_seen) is bool
-                    else False
-                ),
-                **(
-                    {"turn_state": _normalize_turn_state(turn_state)}
-                    if mode == "stop"
-                    and isinstance(turn_state, dict)
-                    else {}
-                ),
+                "off_record_seen": off_record_seen,
             }
         )
     return normalized
@@ -1217,47 +1357,71 @@ def _normalize_background_queue(
 def _enqueue_background(
     store: BackgroundQueueStore,
     session_id: str,
-    mode: str,
-    harness: str,
-    payload: dict[str, Any],
-    turn_state: dict[str, Any] | None = None,
-    append_rollup_snapshot: bool = False,
-    off_record_seen: bool = False,
+    new_events: list[dict[str, Any]],
 ) -> bool:
     with store.locked(session_id):
         events = store.load(session_id)
-        required = 2 if append_rollup_snapshot else 1
-        if len(events) + required > _MAX_BACKGROUND_QUEUE:
+        normalized_new = _normalize_background_queue(new_events)
+        if len(normalized_new) != len(new_events):
             return False
-        events.append(
-            {
-                "id": uuid4().hex,
-                "mode": mode,
-                "harness": harness,
-                "payload": payload,
-                "off_record_seen": bool(off_record_seen),
-                **(
-                    {"turn_state": turn_state}
-                    if turn_state is not None
-                    else {}
-                ),
-            }
-        )
-        if append_rollup_snapshot:
-            rollup_payload = _background_payload(payload, "session_end")
-            if rollup_payload is None:
-                return False
-            events.append(
-                {
-                    "id": uuid4().hex,
-                    "mode": "session_end",
-                    "harness": harness,
-                    "payload": rollup_payload,
-                    "off_record_seen": bool(off_record_seen),
-                }
-            )
-        store.save(session_id, events)
+        if len(events) + len(normalized_new) > _MAX_BACKGROUND_QUEUE:
+            return False
+        try:
+            store.save(session_id, [*events, *normalized_new])
+        except Exception:
+            return False
     return True
+
+
+def _background_event(
+    *,
+    client: str,
+    behavior: str,
+    lifecycle_mode: str,
+    target: RouteTarget,
+    route_revision: int,
+    session_id: str,
+    payload: dict[str, Any],
+    off_record_seen: bool,
+) -> dict[str, Any] | None:
+    candidate = {
+        "schema_version": 1,
+        "id": uuid4().hex,
+        "client": client,
+        "behavior": behavior,
+        "lifecycle_mode": lifecycle_mode,
+        "connection_id": target.connection_id,
+        "namespace": target.namespace,
+        "route_revision": route_revision,
+        "session_id": session_id,
+        "payload": payload,
+        "off_record_seen": bool(off_record_seen),
+    }
+    normalized = _normalize_background_queue([candidate])
+    return normalized[0] if len(normalized) == 1 else None
+
+
+def _background_target(
+    dependencies: Dependencies,
+    *,
+    behavior: str,
+    client: str,
+) -> tuple[RoutingConfig, RouteTarget] | None:
+    try:
+        config, targets = _resolved_route(
+            dependencies,
+            behavior=behavior,
+            harness=client,
+        )
+    except Exception:
+        return None
+    if len(targets) != 1:
+        return None
+    target = targets[0]
+    connection = _connection_for(config, target.connection_id)
+    if connection is None or not connection.configured:
+        return None
+    return config, target
 
 
 def _worker_environment(
@@ -1449,6 +1613,38 @@ def _worker_credential_scope(mode: str):
             )
 
 
+@contextmanager
+def _selected_credential_scope(credential: str):
+    previous_key = os.environ.get("REMEM_API_KEY")
+    previous_descriptor = os.environ.get("REMEM_API_KEY_FD")
+    previous_url = os.environ.get("REMEM_API_URL")
+    descriptor: int | None = None
+    try:
+        descriptor = _credential_descriptor(credential)
+        os.environ["REMEM_API_KEY_FD"] = str(descriptor)
+        with _worker_credential_scope("worker_stop"):
+            yield os.environ.get("REMEM_API_KEY")
+        descriptor = None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if previous_key is None:
+            os.environ.pop("REMEM_API_KEY", None)
+        else:
+            os.environ["REMEM_API_KEY"] = previous_key
+        if previous_descriptor is None:
+            os.environ.pop("REMEM_API_KEY_FD", None)
+        else:
+            os.environ["REMEM_API_KEY_FD"] = previous_descriptor
+        if previous_url is None:
+            os.environ.pop("REMEM_API_URL", None)
+        else:
+            os.environ["REMEM_API_URL"] = previous_url
+
+
 def _spawn_background(
     payload: dict[str, Any],
     harness: str,
@@ -1476,8 +1672,14 @@ def _spawn_background(
         str,
     ):
         return output
-
-    session_id = _session_id(minimized)
+    session_id = raw_session_id.strip()[:200]
+    if (
+        not session_id
+        or contains_secret(session_id)
+        or any(ord(character) < 32 for character in session_id)
+    ):
+        return output
+    minimized["session_id"] = session_id
     turn_state: dict[str, Any] | None = None
     if mode == "stop":
         payload_turn_id = _turn_id(payload, current["turn_id"])
@@ -1503,18 +1705,77 @@ def _spawn_background(
     elif current["off_record"]:
         return output
 
+    new_events: list[dict[str, Any]] = []
+    if _engineering_enabled():
+        sessions_target = _background_target(
+            dependencies,
+            behavior="sessions",
+            client=harness,
+        )
+        if sessions_target is not None:
+            sessions_config, target = sessions_target
+            session_event = _background_event(
+                client=harness,
+                behavior="sessions",
+                lifecycle_mode=mode,
+                target=target,
+                route_revision=sessions_config.revision,
+                session_id=session_id,
+                payload=minimized,
+                off_record_seen=current["off_record_seen"],
+            )
+            if session_event is not None:
+                new_events.append(session_event)
+            if harness == "codex" and mode == "pre_compact":
+                rollup_payload = _background_payload(
+                    minimized,
+                    "session_end",
+                )
+                if rollup_payload is not None:
+                    rollup_event = _background_event(
+                        client=harness,
+                        behavior="sessions",
+                        lifecycle_mode="session_end",
+                        target=target,
+                        route_revision=sessions_config.revision,
+                        session_id=session_id,
+                        payload=rollup_payload,
+                        off_record_seen=current["off_record_seen"],
+                    )
+                    if rollup_event is not None:
+                        new_events.append(rollup_event)
+    if mode == "stop" and turn_state is not None:
+        memory_target = _background_target(
+            dependencies,
+            behavior="memory",
+            client=harness,
+        )
+        if memory_target is not None:
+            memory_config, target = memory_target
+            memory_payload = _background_payload(
+                {**minimized, "_turn_state": turn_state},
+                "stop",
+            )
+            if memory_payload is not None:
+                memory_event = _background_event(
+                    client=harness,
+                    behavior="memory",
+                    lifecycle_mode="stop",
+                    target=target,
+                    route_revision=memory_config.revision,
+                    session_id=session_id,
+                    payload=memory_payload,
+                    off_record_seen=current["off_record_seen"],
+                )
+                if memory_event is not None:
+                    new_events.append(memory_event)
+    if not new_events:
+        return output
     queue = BackgroundQueueStore(dependencies.state_dir)
     if not _enqueue_background(
         queue,
         session_id,
-        mode,
-        harness,
-        minimized,
-        turn_state,
-        append_rollup_snapshot=(
-            harness == "codex" and mode == "pre_compact"
-        ),
-        off_record_seen=current["off_record_seen"],
+        new_events,
     ):
         return output
 
@@ -1523,12 +1784,7 @@ def _spawn_background(
         harness,
         summaries_allowed=not current["off_record_seen"],
     )
-    credential = os.environ.get("REMEM_API_KEY", "").strip()
-    descriptor: int | None = None
     try:
-        if credential:
-            descriptor = _credential_descriptor(credential)
-            environment["REMEM_API_KEY_FD"] = str(descriptor)
         python = str(Path(sys.executable).resolve(strict=True))
         script = Path(__file__).resolve(strict=True)
         process = subprocess.Popen(
@@ -1550,7 +1806,7 @@ def _spawn_background(
             start_new_session=True,
             close_fds=True,
             env=environment,
-            pass_fds=(descriptor,) if descriptor is not None else (),
+            pass_fds=(),
         )
         if process.stdin is not None:
             process.stdin.write(
@@ -1562,12 +1818,6 @@ def _spawn_background(
             process.stdin.close()
     except Exception:
         pass
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
     return output
 
 
@@ -1576,44 +1826,109 @@ def _process_background_event(
     dependencies: Dependencies,
     settings: Settings,
 ) -> None:
-    mode = event["mode"]
-    harness = event["harness"]
+    if settings.mode != "auto":
+        return
+    mode = event["lifecycle_mode"]
+    harness = event["client"]
+    behavior = event["behavior"]
     payload = event["payload"]
     live_state = _read_current_state(
         StateStore(dependencies.state_dir),
-        _session_id(payload),
+        event["session_id"],
     )
-    off_record_seen = bool(event.get("off_record_seen"))
-    if live_state is None:
-        off_record_seen = True
-    else:
-        off_record_seen = bool(
-            off_record_seen
-            or live_state["off_record_seen"]
+    if live_state is None or live_state["off_record"]:
+        return
+    try:
+        config, targets = _resolved_route(
+            dependencies,
+            behavior=behavior,
+            harness=harness,
         )
-    if mode == "stop":
-        turn_state = event.get("turn_state")
-        if isinstance(turn_state, dict):
-            turn_state = _normalize_turn_state(turn_state)
-            turn_state["off_record_seen"] = bool(
-                turn_state["off_record_seen"]
-                or off_record_seen
+    except Exception:
+        return
+    if config.revision != event["route_revision"] or len(targets) != 1:
+        return
+    target = targets[0]
+    if (
+        target.connection_id != event["connection_id"]
+        or target.namespace != event["namespace"]
+    ):
+        return
+    connection = _connection_for(config, target.connection_id)
+    if connection is None or not connection.configured:
+        return
+    credential = _connection_credential(dependencies, connection)
+    if credential is None:
+        _record_target_failure(
+            dependencies,
+            harness=harness,
+            behavior=behavior,
+            targets=(target,),
+            error=None,
+        )
+        return
+    off_record_seen = bool(
+        event["off_record_seen"] or live_state["off_record_seen"]
+    )
+    with _selected_credential_scope(credential) as selected_credential:
+        if not selected_credential:
+            return
+        namespace = (
+            None if target.namespace == "@default" else target.namespace
+        )
+        if behavior == "sessions":
+            engineering_mode = (
+                "task_completed" if mode == "stop" else mode
             )
+            _invoke_engineering(
+                dependencies,
+                engineering_mode,
+                payload,
+                harness,
+                summaries_allowed=not off_record_seen,
+                connection_id=connection.id,
+                namespace=namespace,
+            )
+            return
+        turn_state = payload.get("_turn_state")
+        if not isinstance(turn_state, dict):
+            return
+        turn_state = _normalize_turn_state(turn_state)
+        turn_state["off_record_seen"] = bool(
+            turn_state["off_record_seen"] or off_record_seen
+        )
+
+        def fixed_route(
+            requested_behavior: str,
+            requested_client: str,
+        ) -> tuple[RoutingConfig, tuple[RouteTarget, ...]]:
+            selected = (
+                (target,)
+                if requested_behavior == "memory"
+                and requested_client == harness
+                else ()
+            )
+            return config, selected
+
+        selected_dependencies = replace(
+            dependencies,
+            routing_resolver=fixed_route,
+            connection_credential_resolver=(
+                lambda selected_connection: (
+                    selected_credential
+                    if selected_connection.id == connection.id
+                    else None
+                )
+            ),
+        )
         _handle_stop(
             payload,
             harness,
-            dependencies,
+            selected_dependencies,
             settings,
             turn_state=turn_state,
+            invoke_engineering=False,
         )
-        return
-    _invoke_engineering(
-        dependencies,
-        mode,
-        payload,
-        harness,
-        summaries_allowed=not off_record_seen,
-    )
 
 
 def _drain_background_queue(

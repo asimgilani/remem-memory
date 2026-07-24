@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -111,7 +112,8 @@ class Config:
     log_path: Path
     enabled: bool
     rollup_on_session_end: bool
-    engineering_namespace: str | None = None
+    connection_id: str = "primary"
+    namespace: str | None = None
     allow_local_dev: bool = False
 
 
@@ -163,6 +165,13 @@ def _resolve_path(cwd: Path, raw: str | None, default_rel: str) -> Path:
     if path.is_absolute():
         return path
     return cwd / path
+
+
+def _scoped_path(path: Path, connection_id: str, session_id: str) -> Path:
+    digest = hashlib.sha256(
+        f"{connection_id}\0{session_id}".encode("utf-8")
+    ).hexdigest()[:24]
+    return path.with_name(f"{path.stem}.{digest}{path.suffix}")
 
 
 def _read_stdin_json() -> dict[str, Any]:
@@ -283,7 +292,12 @@ def _git_branch(cwd: Path) -> str | None:
     return branch or None
 
 
-def _load_config(payload: dict[str, Any]) -> Config:
+def _load_config(
+    payload: dict[str, Any],
+    *,
+    connection_id: str | None = None,
+    namespace: str | None = None,
+) -> Config:
     cwd_raw = payload.get("cwd")
     safe_cwd = _safe_cwd_path(cwd_raw)
     cwd_candidate = (
@@ -304,8 +318,12 @@ def _load_config(payload: dict[str, Any]) -> Config:
         else fallback_project
     )
     configured_session = (
-        os.getenv("REMEM_MEMORY_SESSION_ID", "").strip()
-        or _derive_session_id(payload)
+        _derive_session_id(payload)
+        if connection_id is not None
+        else (
+            os.getenv("REMEM_MEMORY_SESSION_ID", "").strip()
+            or _derive_session_id(payload)
+        )
     )
     session_id = (
         configured_session[:200]
@@ -321,11 +339,20 @@ def _load_config(payload: dict[str, Any]) -> Config:
         os.environ,
     )
     api_key = os.getenv("REMEM_API_KEY", "").strip()
-    engineering_namespace = os.getenv(
-        "REMEM_MEMORY_ENGINEERING_NAMESPACE", ""
-    ).strip() or None
     state_path = _resolve_path(cwd, os.getenv("REMEM_MEMORY_STATE_FILE"), _DEFAULT_STATE_PATH)
     log_path = _resolve_path(cwd, os.getenv("REMEM_MEMORY_LOG_FILE"), _DEFAULT_LOG_PATH)
+    selected_connection = connection_id or "primary"
+    if connection_id is not None:
+        state_path = _scoped_path(
+            state_path,
+            selected_connection,
+            session_id,
+        )
+        log_path = _scoped_path(
+            log_path,
+            selected_connection,
+            session_id,
+        )
     return Config(
         cwd=cwd,
         project=project,
@@ -338,7 +365,8 @@ def _load_config(payload: dict[str, Any]) -> Config:
         log_path=log_path,
         enabled=_bool_env("REMEM_MEMORY_AUTO_ENABLED", True),
         rollup_on_session_end=_bool_env("REMEM_MEMORY_ROLLUP_ON_SESSION_END", True),
-        engineering_namespace=engineering_namespace,
+        connection_id=selected_connection,
+        namespace=namespace,
         allow_local_dev=api_url != _DEFAULT_API_URL,
     )
 
@@ -1568,8 +1596,6 @@ def _build_checkpoint_payload(
         "mime_type": "text/markdown",
         "return_id": False,
     }
-    if config.engineering_namespace is not None:
-        result["namespace"] = config.engineering_namespace
     return result
 
 
@@ -1754,8 +1780,6 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
         "mime_type": "text/markdown",
         "return_id": False,
     }
-    if config.engineering_namespace is not None:
-        result["namespace"] = config.engineering_namespace
     return result
 
 
@@ -1774,7 +1798,7 @@ def _ingest(config: Config, payload: dict[str, Any]) -> dict[str, Any] | None:
             api_key=config.api_key,
             allow_local_dev=config.allow_local_dev,
         )
-        return api.ingest(payload, None, timeout=20)
+        return api.ingest(payload, config.namespace, timeout=20)
     except Exception:  # pragma: no cover
         sys.stderr.write("[remem-memory] ingest failed\n")
     return None
@@ -1956,10 +1980,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def handle_payload(mode: str, payload: dict[str, Any]) -> int:
+def handle_payload(
+    mode: str,
+    payload: dict[str, Any],
+    *,
+    connection_id: str | None = None,
+    namespace: str | None = None,
+) -> int:
     """Run one existing engineering hook mode for an already-parsed payload."""
 
-    config = _load_config(payload)
+    config = _load_config(
+        payload,
+        connection_id=connection_id,
+        namespace=namespace,
+    )
     if not config.enabled:
         return 0
     if mode == "post_tool_use":

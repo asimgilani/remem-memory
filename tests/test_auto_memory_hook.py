@@ -30,7 +30,8 @@ def _build_cfg():
         log_path=Path("/tmp/log.ndjson"),
         enabled=True,
         rollup_on_session_end=True,
-        engineering_namespace=None,
+        connection_id="primary",
+        namespace=None,
     )
 
 
@@ -128,6 +129,125 @@ class AutoMemoryHookTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unsupported mode"):
             _MODULE.handle_payload("unknown", payload)
+
+    def test_routed_handle_uses_explicit_target_not_legacy_namespace_env(
+        self,
+    ) -> None:
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "cwd": "/tmp",
+            "session_id": "sess-a",
+            "tool_name": "Write",
+        }
+        observed = []
+
+        def handle(config, value):
+            observed.append(
+                (
+                    config.connection_id,
+                    config.namespace,
+                    config.session_id,
+                )
+            )
+            return 0
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REMEM_MEMORY_ENGINEERING_NAMESPACE": (
+                    "must-not-be-consulted"
+                ),
+                "REMEM_MEMORY_SESSION_ID": "must-not-replace-job-session",
+                "REMEM_API_KEY": "selected-key",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(
+                _MODULE,
+                "_handle_post_tool_use",
+                side_effect=handle,
+            ):
+                _MODULE.handle_payload(
+                    "post_tool_use",
+                    payload,
+                    connection_id="primary",
+                    namespace=None,
+                )
+                _MODULE.handle_payload(
+                    "post_tool_use",
+                    payload,
+                    connection_id="primary",
+                    namespace="session-history",
+                )
+
+        self.assertEqual(
+            observed,
+            [
+                ("primary", None, "sess-a"),
+                ("primary", "session-history", "sess-a"),
+            ],
+        )
+
+    def test_routed_state_and_log_are_isolated_by_session_and_connection(
+        self,
+    ) -> None:
+        secondary = f"conn_{'4' * 32}"
+        with tempfile.TemporaryDirectory() as directory:
+            base = {
+                "hook_event_name": "PostToolUse",
+                "cwd": directory,
+                "tool_name": "Write",
+            }
+            first = _MODULE._load_config(
+                {**base, "session_id": "session-a"},
+                connection_id="primary",
+                namespace=None,
+            )
+            other_session = _MODULE._load_config(
+                {**base, "session_id": "session-b"},
+                connection_id="primary",
+                namespace=None,
+            )
+            other_connection = _MODULE._load_config(
+                {**base, "session_id": "session-a"},
+                connection_id=secondary,
+                namespace=None,
+            )
+
+        self.assertEqual(
+            len(
+                {
+                    first.state_path,
+                    other_session.state_path,
+                    other_connection.state_path,
+                }
+            ),
+            3,
+        )
+        self.assertEqual(
+            len(
+                {
+                    first.log_path,
+                    other_session.log_path,
+                    other_connection.log_path,
+                }
+            ),
+            3,
+        )
+        serialized = " ".join(
+            str(path)
+            for path in (
+                first.state_path,
+                other_session.state_path,
+                other_connection.state_path,
+                first.log_path,
+                other_session.log_path,
+                other_connection.log_path,
+            )
+        )
+        self.assertNotIn("session-a", serialized)
+        self.assertNotIn("session-b", serialized)
+        self.assertNotIn(secondary, serialized)
 
     def test_git_child_uses_resolved_executable_and_strict_environment(self) -> None:
         executable = str(Path(sys.executable).resolve())
@@ -449,7 +569,37 @@ class AutoMemoryHookTests(unittest.TestCase):
             timeout=20,
         )
 
-    def test_checkpoint_namespace_is_only_added_when_explicit(self) -> None:
+    def test_ingest_supplies_exact_resolved_namespace_or_omits_it(self) -> None:
+        payload = {
+            "title": "Trusted checkpoint",
+            "content": "Safe engineering summary.",
+        }
+        for namespace in (None, "session-history"):
+            with self.subTest(namespace=namespace):
+                config = _MODULE.Config(
+                    **{
+                        **_build_cfg().__dict__,
+                        "api_key": "selected-key",
+                        "namespace": namespace,
+                    }
+                )
+                api = mock.Mock()
+                api.ingest.return_value = {"ok": True}
+                with mock.patch.object(
+                    _MODULE,
+                    "RememAPI",
+                    return_value=api,
+                ):
+                    result = _MODULE._ingest(config, payload)
+
+                self.assertEqual(result, {"ok": True})
+                api.ingest.assert_called_once_with(
+                    payload,
+                    namespace,
+                    timeout=20,
+                )
+
+    def test_checkpoint_payload_stays_destination_neutral(self) -> None:
         with mock.patch.object(_MODULE, "_utc_now_iso", return_value="fixed"):
             with mock.patch.object(_MODULE, "_git_branch", return_value=None):
                 without = _MODULE._build_checkpoint_payload(
@@ -464,7 +614,7 @@ class AutoMemoryHookTests(unittest.TestCase):
                     config=_MODULE.Config(
                         **{
                             **_build_cfg().__dict__,
-                            "engineering_namespace": "engineering",
+                            "namespace": "engineering",
                         }
                     ),
                     kind="interval",
@@ -475,27 +625,23 @@ class AutoMemoryHookTests(unittest.TestCase):
                 )
 
         self.assertNotIn("namespace", without)
-        expected = dict(without)
-        expected["namespace"] = "engineering"
-        self.assertEqual(with_namespace, expected)
+        self.assertEqual(with_namespace, without)
 
-    def test_rollup_namespace_is_only_added_when_explicit(self) -> None:
+    def test_rollup_payload_stays_destination_neutral(self) -> None:
         with mock.patch.object(_MODULE, "_utc_now_iso", return_value="fixed"):
             without = _MODULE._build_rollup_payload(_build_cfg(), [])
             with_namespace = _MODULE._build_rollup_payload(
                 _MODULE.Config(
                     **{
                         **_build_cfg().__dict__,
-                        "engineering_namespace": "engineering",
+                        "namespace": "engineering",
                     }
                 ),
                 [],
             )
 
         self.assertNotIn("namespace", without)
-        expected = dict(without)
-        expected["namespace"] = "engineering"
-        self.assertEqual(with_namespace, expected)
+        self.assertEqual(with_namespace, without)
 
     def test_rollup_loader_excludes_prior_rollups(self) -> None:
         checkpoint = {

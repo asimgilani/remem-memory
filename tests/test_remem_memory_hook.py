@@ -289,13 +289,14 @@ def routing_config(
     global_routes=None,
     client_routes=None,
     migration_write_blocked=False,
+    revision=1,
 ):
     selected_connections = connections or (
         _ROUTING.Connection("primary", "Primary", "default", True),
     )
     return _ROUTING.RoutingConfig(
         schema_version=1,
-        revision=1,
+        revision=revision,
         connections=tuple(selected_connections),
         global_routes=_ROUTING.RouteLayer(global_routes or {}),
         client_routes={
@@ -2091,6 +2092,7 @@ class RememMemoryHookTests(unittest.TestCase):
                 directory,
                 api,
                 engineering_handler=engineering_handler,
+                connection_credential_resolver=lambda connection: "key",
             )
             with mock.patch.dict(
                 os.environ,
@@ -2637,25 +2639,555 @@ class RememMemoryHookTests(unittest.TestCase):
             json.loads(written.decode("utf-8")),
             {"session_id": "s1"},
         )
-        self.assertEqual(queued[0]["mode"], "session_end")
+        self.assertEqual(queued[0]["lifecycle_mode"], "session_end")
+        self.assertEqual(queued[0]["behavior"], "sessions")
         self.assertEqual(
             queued[0]["payload"]["hook_event_name"],
             "SessionEnd",
         )
         process.stdin.close.assert_called_once_with()
 
-    def test_background_worker_uses_isolated_python_and_anonymous_key_fd(
+    def test_stop_queues_separate_neutral_memory_and_session_jobs(self) -> None:
+        secondary_hex = "1" * 32
+        secondary = _ROUTING.Connection(
+            f"conn_{secondary_hex}",
+            "Sessions",
+            f"connection:{secondary_hex}",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection("primary", "Primary", "default", True),
+                secondary,
+            ),
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "durable-memory"),
+                ),
+                "sessions": (
+                    _ROUTING.RouteTarget(
+                        secondary.id,
+                        "session-history",
+                    ),
+                ),
+            },
+            revision=7,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            dependencies = self._dependencies(
+                directory,
+                None,
+                background_writes=True,
+                routing_resolver=routed(config),
+            )
+            with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                popen.return_value.stdin = mock.Mock()
+                output = _HOOK.handle_event(
+                    stop_payload(),
+                    harness="codex",
+                    mode="stop",
+                    dependencies=dependencies,
+                )
+            queued = _HOOK.BackgroundQueueStore(Path(directory)).load("s1")
+
+        self.assertEqual(output, {"continue": True})
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(
+            [event["behavior"] for event in queued],
+            ["sessions", "memory"],
+        )
+        self.assertEqual(
+            [
+                (event["connection_id"], event["namespace"])
+                for event in queued
+            ],
+            [
+                (secondary.id, "session-history"),
+                ("primary", "durable-memory"),
+            ],
+        )
+        for event in queued:
+            self.assertEqual(
+                set(event),
+                {
+                    "schema_version",
+                    "id",
+                    "client",
+                    "behavior",
+                    "lifecycle_mode",
+                    "connection_id",
+                    "namespace",
+                    "route_revision",
+                    "session_id",
+                    "payload",
+                    "off_record_seen",
+                },
+            )
+            self.assertEqual(event["schema_version"], 1)
+            self.assertRegex(event["id"], r"\A[0-9a-f]{32}\Z")
+            self.assertEqual(event["client"], "codex")
+            self.assertEqual(event["lifecycle_mode"], "stop")
+            self.assertEqual(event["route_revision"], 7)
+            self.assertEqual(event["session_id"], "s1")
+            self.assertNotIn("credential", json.dumps(event).lower())
+
+    def test_routed_background_event_normalization_is_exact_and_bounded(
+        self,
+    ) -> None:
+        payload = _HOOK._background_payload(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "cwd": "/tmp/project",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "src/main.py"},
+            },
+            "post_tool_use",
+        )
+        self.assertIsNotNone(payload)
+        event = {
+            "schema_version": 1,
+            "id": "0" * 32,
+            "client": "codex",
+            "behavior": "sessions",
+            "lifecycle_mode": "post_tool_use",
+            "connection_id": "primary",
+            "namespace": "@default",
+            "route_revision": 3,
+            "session_id": "s1",
+            "payload": payload,
+            "off_record_seen": False,
+        }
+
+        normalized = _HOOK._normalize_background_queue(
+            [{**event, "ignored": "bounded forward compatibility"}]
+        )
+
+        self.assertEqual(normalized, [event])
+        self.assertEqual(
+            len(
+                _HOOK._normalize_background_queue(
+                    [
+                        {
+                            **event,
+                            "id": f"{index:032x}",
+                        }
+                        for index in range(129)
+                    ]
+                )
+            ),
+            128,
+        )
+
+    def test_routed_background_event_rejects_malformed_or_secret_data(
+        self,
+    ) -> None:
+        payload = _HOOK._background_payload(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Write",
+            },
+            "post_tool_use",
+        )
+        self.assertIsNotNone(payload)
+        valid = {
+            "schema_version": 1,
+            "id": "a" * 32,
+            "client": "claude",
+            "behavior": "sessions",
+            "lifecycle_mode": "post_tool_use",
+            "connection_id": "primary",
+            "namespace": "@default",
+            "route_revision": 0,
+            "session_id": "s1",
+            "payload": payload,
+            "off_record_seen": False,
+        }
+        canary = "vlt_abcdefghijklmnopqrstuvwxyz"
+        invalid = (
+            {**valid, "schema_version": 2},
+            {**valid, "id": "A" * 32},
+            {**valid, "id": "a" * 31},
+            {**valid, "client": "unknown"},
+            {**valid, "behavior": "recall"},
+            {**valid, "lifecycle_mode": "unknown"},
+            {**valid, "connection_id": "../primary"},
+            {**valid, "namespace": "@readable"},
+            {**valid, "namespace": f"api_key={canary}"},
+            {**valid, "route_revision": -1},
+            {**valid, "session_id": "s" * 201},
+            {**valid, "session_id": "other"},
+            {**valid, "off_record_seen": 1},
+            {
+                **valid,
+                "payload": {
+                    **payload,
+                    "tool_input": {"command": f"api_key={canary}"},
+                },
+            },
+            {**valid, "credential": canary},
+        )
+
+        for event in invalid:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    _HOOK._normalize_background_queue([event]),
+                    [],
+                )
+
+    def test_background_queue_enforces_private_262144_byte_io_bound(
+        self,
+    ) -> None:
+        payload = _HOOK._background_payload(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "apply_patch",
+                "tool_input": {"patch": "x" * 8192},
+            },
+            "post_tool_use",
+        )
+        self.assertIsNotNone(payload)
+        events = [
+            {
+                "schema_version": 1,
+                "id": f"{index:032x}",
+                "client": "codex",
+                "behavior": "sessions",
+                "lifecycle_mode": "post_tool_use",
+                "connection_id": "primary",
+                "namespace": "@default",
+                "route_revision": 1,
+                "session_id": "s1",
+                "payload": payload,
+                "off_record_seen": False,
+            }
+            for index in range(64)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "background queue unavailable",
+            ):
+                store.save("s1", events)
+            self.assertFalse(store.path_for("s1").exists())
+
+            store._ensure_directories()
+            store.path_for("s1").write_bytes(b" " * 262_145)
+            os.chmod(store.path_for("s1"), 0o600)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "background queue unavailable",
+            ):
+                store.load("s1")
+
+    def test_worker_uses_each_jobs_exact_route_credential_and_destination(
+        self,
+    ) -> None:
+        secondary_hex = "2" * 32
+        secondary = _ROUTING.Connection(
+            f"conn_{secondary_hex}",
+            "Sessions",
+            f"connection:{secondary_hex}",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection("primary", "Primary", "default", True),
+                secondary,
+            ),
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "durable-memory"),
+                ),
+                "sessions": (
+                    _ROUTING.RouteTarget(
+                        secondary.id,
+                        "session-history",
+                    ),
+                ),
+            },
+            revision=9,
+        )
+        credentials = {
+            "primary": "memory-key",
+            secondary.id: "sessions-key",
+        }
+        credential_calls = []
+        factory_calls = []
+        engineering_calls = []
+        memory_api = FakeAPI()
+
+        def resolve_credential(connection):
+            credential_calls.append(connection.id)
+            return credentials[connection.id]
+
+        def api_factory(connection, credential):
+            factory_calls.append((connection.id, credential))
+            return memory_api
+
+        def engineering_handler(mode, payload):
+            engineering_calls.append(
+                (
+                    mode,
+                    payload["session_id"],
+                    os.environ.get("REMEM_API_KEY"),
+                )
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            dependencies = self._dependencies(
+                directory,
+                None,
+                engineering_handler=engineering_handler,
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=resolve_credential,
+                api_factory=api_factory,
+            )
+            with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                popen.return_value.stdin = mock.Mock()
+                _HOOK.handle_event(
+                    stop_payload(),
+                    harness="codex",
+                    mode="stop",
+                    dependencies=dependencies,
+                )
+            _HOOK.handle_event(
+                {"session_id": "s1"},
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+            queued = _HOOK.BackgroundQueueStore(Path(directory)).load("s1")
+
+        self.assertEqual(
+            engineering_calls,
+            [("task_completed", "s1", "sessions-key")],
+        )
+        self.assertEqual(credential_calls, [secondary.id, "primary"])
+        self.assertEqual(factory_calls, [("primary", "memory-key")])
+        self.assertEqual(len(memory_api.ingests), 1)
+        self.assertEqual(
+            memory_api.ingests[0]["namespace"],
+            "durable-memory",
+        )
+        self.assertEqual(queued, [])
+        self.assertNotIn("REMEM_API_KEY", os.environ)
+
+    def test_worker_discards_disabled_stale_or_uncredentialed_session_jobs(
+        self,
+    ) -> None:
+        primary = _ROUTING.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        secondary_hex = "3" * 32
+        secondary = _ROUTING.Connection(
+            f"conn_{secondary_hex}",
+            "Other",
+            f"connection:{secondary_hex}",
+            True,
+        )
+        initial = routing_config(
+            connections=(primary, secondary),
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-a"),
+                )
+            },
+            revision=4,
+        )
+        cases = (
+            ("recall-only", initial, "recall-only", False, "key"),
+            ("global off", initial, "off", False, "key"),
+            ("off record", initial, "auto", True, "key"),
+            (
+                "stale revision",
+                routing_config(
+                    connections=(primary, secondary),
+                    global_routes={
+                        "sessions": (
+                            _ROUTING.RouteTarget("primary", "session-a"),
+                        )
+                    },
+                    revision=5,
+                ),
+                "auto",
+                False,
+                "key",
+            ),
+            (
+                "changed connection",
+                routing_config(
+                    connections=(primary, secondary),
+                    global_routes={
+                        "sessions": (
+                            _ROUTING.RouteTarget(
+                                secondary.id,
+                                "session-a",
+                            ),
+                        )
+                    },
+                    revision=4,
+                ),
+                "auto",
+                False,
+                "key",
+            ),
+            (
+                "changed destination",
+                routing_config(
+                    connections=(primary, secondary),
+                    global_routes={
+                        "sessions": (
+                            _ROUTING.RouteTarget("primary", "session-b"),
+                        )
+                    },
+                    revision=4,
+                ),
+                "auto",
+                False,
+                "key",
+            ),
+            (
+                "sessions off",
+                routing_config(
+                    connections=(primary, secondary),
+                    global_routes={"sessions": ()},
+                    revision=4,
+                ),
+                "auto",
+                False,
+                "key",
+            ),
+            ("missing credential", initial, "auto", False, None),
+        )
+
+        for label, live_config, mode, off_record, credential in cases:
+            with self.subTest(label=label):
+                calls = []
+                credential_calls = []
+                selected = [initial]
+
+                def route(behavior, client):
+                    config = selected[0]
+                    return (
+                        config,
+                        _ROUTING.resolve_routes(
+                            config,
+                            behavior=behavior,
+                            client=client,
+                        ),
+                    )
+
+                def resolve_credential(connection):
+                    credential_calls.append(connection.id)
+                    return credential
+
+                with tempfile.TemporaryDirectory() as directory:
+                    dependencies = self._dependencies(
+                        directory,
+                        None,
+                        engineering_handler=lambda mode, payload: calls.append(
+                            mode
+                        ),
+                        background_writes=True,
+                        routing_resolver=route,
+                        connection_credential_resolver=resolve_credential,
+                    )
+                    with mock.patch.object(
+                        _HOOK.subprocess,
+                        "Popen",
+                    ) as popen:
+                        popen.return_value.stdin = mock.Mock()
+                        _HOOK.handle_event(
+                            {
+                                "hook_event_name": "PostToolUse",
+                                "session_id": "s1",
+                                "tool_name": "Write",
+                            },
+                            harness="codex",
+                            mode="post_tool_use",
+                            dependencies=dependencies,
+                        )
+                    selected[0] = live_config
+                    object.__setattr__(
+                        dependencies,
+                        "settings",
+                        _HOOK.Settings(mode=mode),
+                    )
+                    if off_record:
+                        state = _HOOK.StateStore(Path(directory))
+                        current = state.load("s1")
+                        current["off_record"] = True
+                        state.save("s1", current)
+
+                    _HOOK.handle_event(
+                        {"session_id": "s1"},
+                        harness="codex",
+                        mode="worker_drain",
+                        dependencies=dependencies,
+                    )
+                    queued = _HOOK.BackgroundQueueStore(
+                        Path(directory)
+                    ).load("s1")
+
+                self.assertEqual(calls, [])
+                self.assertEqual(queued, [])
+                self.assertEqual(
+                    credential_calls,
+                    ["primary"] if label == "missing credential" else [],
+                )
+
+    def test_sessions_off_suppresses_enqueue_before_credentials(self) -> None:
+        calls = []
+        config = routing_config(global_routes={"sessions": ()})
+        with tempfile.TemporaryDirectory() as directory:
+            dependencies = self._dependencies(
+                directory,
+                None,
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: calls.append(
+                    connection.id
+                ),
+            )
+            with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                output = _HOOK.handle_event(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "s1",
+                        "tool_name": "Write",
+                    },
+                    harness="codex",
+                    mode="post_tool_use",
+                    dependencies=dependencies,
+                )
+            queued = _HOOK.BackgroundQueueStore(Path(directory)).load("s1")
+
+        self.assertEqual(output, {})
+        self.assertEqual(queued, [])
+        self.assertEqual(calls, [])
+        popen.assert_not_called()
+
+    def test_background_dispatcher_has_no_remem_credential(
         self,
     ) -> None:
         canary = "vlt_trusted-worker-canary"
         observed = {}
 
         def launch(arguments, **kwargs):
-            descriptor = kwargs["pass_fds"][0]
             observed["arguments"] = list(arguments)
             observed["environment"] = dict(kwargs["env"])
             observed["pass_fds"] = tuple(kwargs["pass_fds"])
-            observed["credential"] = os.read(descriptor, 8192).decode("utf-8")
             process = mock.Mock()
             process.stdin = mock.Mock()
             return process
@@ -2707,7 +3239,6 @@ class RememMemoryHookTests(unittest.TestCase):
                         dependencies=dependencies,
                     )
 
-        self.assertEqual(observed["credential"], canary)
         self.assertEqual(observed["arguments"][0], str(Path(sys.executable).resolve()))
         self.assertEqual(observed["arguments"][1], "-I")
         self.assertEqual(observed["arguments"][2], "-c")
@@ -2717,11 +3248,8 @@ class RememMemoryHookTests(unittest.TestCase):
         )
         worker_environment = observed["environment"]
         self.assertNotIn("REMEM_API_KEY", worker_environment)
-        self.assertTrue(worker_environment["REMEM_API_KEY_FD"].isdigit())
-        self.assertEqual(
-            observed["pass_fds"],
-            (int(worker_environment["REMEM_API_KEY_FD"]),),
-        )
+        self.assertNotIn("REMEM_API_KEY_FD", worker_environment)
+        self.assertEqual(observed["pass_fds"], ())
         self.assertEqual(
             worker_environment["ANTHROPIC_API_KEY"],
             "anthropic-summary-canary",
@@ -2735,7 +3263,6 @@ class RememMemoryHookTests(unittest.TestCase):
             "LANG",
             "LC_ALL",
             "LC_CTYPE",
-            "REMEM_API_KEY_FD",
             "REMEM_API_URL",
             "REMEM_MEMORY_DATA_DIR",
             "REMEM_MEMORY_SUMMARY_ENABLED",
@@ -3235,6 +3762,7 @@ class RememMemoryHookTests(unittest.TestCase):
                 directory,
                 FakeAPI(),
                 engineering_handler=engineering_handler,
+                connection_credential_resolver=lambda connection: "key",
             )
             for worker_mode, payload in (
                 (
@@ -3323,6 +3851,7 @@ class RememMemoryHookTests(unittest.TestCase):
                 directory,
                 FakeAPI(),
                 engineering_handler=engineering_handler,
+                connection_credential_resolver=lambda connection: "key",
             )
             with mock.patch.object(
                 _HOOK.subprocess,
@@ -3384,6 +3913,7 @@ class RememMemoryHookTests(unittest.TestCase):
                 FakeAPI(),
                 engineering_handler=lambda mode, payload: calls.append(mode),
                 background_writes=True,
+                connection_credential_resolver=lambda connection: "key",
             )
             with mock.patch.object(
                 _HOOK.subprocess,
@@ -3441,7 +3971,9 @@ class RememMemoryHookTests(unittest.TestCase):
             ],
         )
 
-    def test_delayed_claude_stop_uses_its_queued_turn_snapshot(self) -> None:
+    def test_delayed_claude_stop_is_discarded_if_session_turn_is_off_record(
+        self,
+    ) -> None:
         launches = []
         engineering_calls = []
 
@@ -3474,6 +4006,7 @@ class RememMemoryHookTests(unittest.TestCase):
                         ),
                     )
                 ),
+                connection_credential_resolver=lambda connection: "key",
             )
             with mock.patch.dict(
                 os.environ,
@@ -3528,11 +4061,8 @@ class RememMemoryHookTests(unittest.TestCase):
                     "1",
                 )
 
-        self.assertEqual(engineering_calls, [("task_completed", "0")])
-        self.assertEqual(len(api.ingests), 1)
-        content = api.ingests[0]["payload"]["content"]
-        self.assertIn("Remember that I prefer concise answers.", content)
-        self.assertNotIn("do not retain this next turn", content)
+        self.assertEqual(engineering_calls, [])
+        self.assertEqual(api.ingests, [])
 
     def test_worker_clears_backlog_if_memory_mode_changes_to_off(self) -> None:
         calls = []
