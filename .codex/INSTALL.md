@@ -71,7 +71,7 @@ The setup:
 - uses standard-library-only local helpers and prepares the private,
   content-addressed MCP cache;
 - installs the canonical command and compatibility aliases;
-- installs and verifies `remem-memory` version `0.3.0` in available Codex and
+- installs and verifies `remem-memory` version `0.3.1` in available Codex and
   Claude Code clients;
 - keeps the older Claude plugin active until the replacement is verified;
 - can bridge one narrowly recognized legacy Codex credential to Keychain; and
@@ -127,7 +127,7 @@ claude plugin list --json
 ```
 
 Skip a client-specific command if that client is not installed. Confirm that
-each installed client reports `remem-memory` enabled at `0.3.0`. Confirm the
+each installed client reports `remem-memory` enabled at `0.3.1`. Confirm the
 old Claude identity is absent or disabled and the old Codex Remem MCP block is
 absent only after the verified bridge.
 
@@ -198,7 +198,7 @@ To pause without uninstalling:
 remem-memory mode off
 ```
 
-The verified rollback boundary in 0.3.0 is `remem-memory mode off`. Keep Remem
+The verified rollback boundary in 0.3.1 is `remem-memory mode off`. Keep Remem
 cloud data, Keychain data, project `.remem/` logs, the current checkout, and
 both client registrations intact. Version downgrade is intentionally not
 automated: an older checkout's installer can update an existing canonical Git

@@ -187,7 +187,7 @@ class FakeRunner:
                 {
                     "name": "remem-memory",
                     "marketplace": "remem-memory",
-                    "version": "0.3.0" if self.codex_verifies else "0.2.9",
+                    "version": "0.3.1" if self.codex_verifies else "0.2.9",
                     "enabled": self.codex_verifies,
                 }
             )
@@ -264,7 +264,7 @@ class FakeRunner:
             ),
         }:
             self._set_claude_plugin(
-                version="0.3.0" if self.claude_verifies else "0.2.9",
+                version="0.3.1" if self.claude_verifies else "0.2.9",
                 enabled=self.claude_action_enabled and self.claude_verifies,
             )
             return FakeResult()
@@ -275,7 +275,7 @@ class FakeRunner:
             "remem-memory@remem-memory",
         ):
             self._set_claude_plugin(
-                version="0.3.0" if self.claude_verifies else "0.2.9",
+                version="0.3.1" if self.claude_verifies else "0.2.9",
                 enabled=self.claude_verifies,
             )
             return FakeResult()
@@ -1215,7 +1215,7 @@ class SecureInstallerTests(unittest.TestCase):
                 {
                     "name": "remem-memory",
                     "marketplace": "remem-memory",
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                     "enabled": False,
                 },
                 (

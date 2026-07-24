@@ -45,7 +45,7 @@ Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/
 
 The installer detects Codex and Claude Code, installs the same
 `remem-memory` plugin into each available harness, and verifies version
-`0.3.0` before retiring an older active identity.
+`0.3.1` before retiring an older active identity.
 
 ## Requirements
 
@@ -269,7 +269,7 @@ The verified rollback boundary in this release is the immediate `mode off`
 pause. Keep the current checkout, Keychain item, cloud data, `.remem/` files,
 and both client registrations intact while investigating.
 
-Version downgrade is intentionally not automated in 0.3.0. Running an older
+Version downgrade is intentionally not automated in 0.3.1. Running an older
 checkout's installer is not a pin: an existing canonical Git marketplace can
 update back to its current remote head. Replacing that marketplace source is
 client-specific and is not transactional across Codex and Claude Code. Do not

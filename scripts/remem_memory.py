@@ -6,7 +6,6 @@ from __future__ import annotations
 import getpass
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +22,7 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_SCRIPTS))
 
 import remem_api  # noqa: E402
+import remem_mcp_launcher  # noqa: E402
 
 
 _COMMAND_TO_SCRIPT = {
@@ -428,7 +428,13 @@ def _status() -> int:
         if credential
         else "credential: missing"
     )
-    if shutil.which("uv"):
+    try:
+        remem_mcp_launcher._find_uv(os.environ, None)
+    except Exception:
+        uv_available = False
+    else:
+        uv_available = True
+    if uv_available:
         print("uv: available")
     else:
         print("uv: missing (required for MCP)")

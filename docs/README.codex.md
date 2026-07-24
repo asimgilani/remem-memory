@@ -142,7 +142,7 @@ runtime probe are verified.
 
 For rollback, first use `remem-memory mode off` and keep the checkout,
 credential, `.remem/` logs, and both registrations. That pause is the verified
-rollback boundary in 0.3.0; version downgrade is intentionally not automated.
+rollback boundary in 0.3.1; version downgrade is intentionally not automated.
 An older checkout's installer can update an existing canonical Git marketplace
 back to current remote head, while marketplace replacement is not
 transactional across both clients. Do not run an older installer or partially

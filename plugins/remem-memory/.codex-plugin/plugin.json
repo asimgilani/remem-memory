@@ -1,7 +1,7 @@
 {
   "name": "remem-memory",
   "description": "Automatic personal recall, durable capture, and engineering memory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": {
     "name": "Remem",
     "email": "support@remem.io"

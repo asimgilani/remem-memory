@@ -9,7 +9,7 @@
     {
       "name": "remem-memory",
       "description": "Automatic Remem recall, durable memory, and engineering checkpoints",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "source": "./plugins/remem-memory",
       "author": {
         "name": "Remem",

@@ -444,6 +444,34 @@ class CanonicalCliTests(unittest.TestCase):
         self.assertNotIn(canary, rendered)
         self.assertNotIn("sha256", rendered)
 
+    def test_status_finds_user_uv_install_when_desktop_path_is_narrow(self):
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            uv = Path(directory) / ".local" / "bin" / "uv"
+            uv.parent.mkdir(parents=True)
+            uv.write_text("#!/bin/sh\n", encoding="utf-8")
+            uv.chmod(0o700)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": directory,
+                    "PATH": "/usr/bin:/bin",
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    remem_memory.remem_api,
+                    "resolve_api_key",
+                    return_value=None,
+                ):
+                    with contextlib.redirect_stdout(stdout):
+                        self.assertEqual(
+                            remem_memory.main(["status"]),
+                            0,
+                        )
+
+        self.assertIn("uv: available", stdout.getvalue())
+
     def test_auth_passes_hidden_input_to_keychain_without_printing_it(self):
         canary = "vlt_auth-secret-canary"
         stdout = io.StringIO()
@@ -641,18 +669,164 @@ class MCPLauncherTests(unittest.TestCase):
     def test_launcher_reports_missing_uv_without_claiming_mcp_health(self):
         stderr = io.StringIO()
         resolver = mock.Mock(return_value="configured")
-        with contextlib.redirect_stderr(stderr):
-            result = launcher.main(
-                environment={},
-                resolver=resolver,
-                which=lambda command: None,
-                execvpe=mock.Mock(),
-            )
+        with mock.patch.object(
+            launcher,
+            "_uv_fallback_paths",
+            return_value=("/definitely/missing/remem-memory-test-uv",),
+        ):
+            with contextlib.redirect_stderr(stderr):
+                result = launcher.main(
+                    environment={},
+                    resolver=resolver,
+                    which=lambda command: None,
+                    execvpe=mock.Mock(),
+                )
 
         self.assertEqual(result, 2)
         resolver.assert_not_called()
         self.assertIn("uv is required", stderr.getvalue())
         self.assertNotIn("healthy", stderr.getvalue().lower())
+
+    def test_launcher_finds_user_uv_install_when_desktop_path_is_narrow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uv = Path(directory) / ".local" / "bin" / "uv"
+            uv.parent.mkdir(parents=True)
+            uv.write_text("#!/bin/sh\n", encoding="utf-8")
+            uv.chmod(0o700)
+
+            resolved = launcher._find_uv(
+                {
+                    "HOME": directory,
+                    "PATH": "/usr/bin:/bin",
+                },
+                lambda command: None,
+            )
+
+        self.assertEqual(resolved, str(uv.resolve()))
+
+    def test_uv_fallbacks_cover_homebrew_and_user_installers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidates = launcher._uv_fallback_paths(
+                {"HOME": directory},
+            )
+
+        self.assertIn("/opt/homebrew/bin/uv", candidates)
+        self.assertIn("/usr/local/bin/uv", candidates)
+        self.assertIn(
+            str(Path(directory) / ".local" / "bin" / "uv"),
+            candidates,
+        )
+        self.assertIn(
+            str(Path(directory) / ".cargo" / "bin" / "uv"),
+            candidates,
+        )
+
+    def test_uv_fallbacks_never_search_relative_home_from_plugin_cwd(self):
+        candidates = launcher._uv_fallback_paths(
+            {"HOME": "attacker-controlled-relative-home"},
+        )
+
+        self.assertTrue(
+            all(Path(candidate).is_absolute() for candidate in candidates)
+        )
+        self.assertNotIn(
+            "attacker-controlled-relative-home/.local/bin/uv",
+            candidates,
+        )
+
+    def test_launcher_canonicalizes_executable_uv_fallback_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            target = Path(directory) / "uv-target"
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            target.chmod(0o700)
+            candidate = home / ".local" / "bin" / "uv"
+            candidate.parent.mkdir(parents=True)
+            candidate.symlink_to(target)
+
+            resolved = launcher._find_uv(
+                {
+                    "HOME": str(home),
+                    "PATH": "/usr/bin:/bin",
+                },
+                lambda command: None,
+            )
+
+        self.assertEqual(resolved, str(target.resolve()))
+
+    def test_launcher_canonicalizes_uv_found_on_inherited_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uv = Path(directory) / "bin" / "uv"
+            uv.parent.mkdir(parents=True)
+            uv.write_text("#!/bin/sh\n", encoding="utf-8")
+            uv.chmod(0o700)
+            with mock.patch.object(
+                launcher.shutil,
+                "which",
+                return_value=str(uv),
+            ):
+                resolved = launcher._find_uv(
+                    {"PATH": str(uv.parent)},
+                    None,
+                )
+
+        self.assertEqual(resolved, str(uv.resolve()))
+
+    def test_launcher_skips_symlink_loop_before_valid_uv_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            loop = home / ".local" / "bin" / "uv"
+            loop.parent.mkdir(parents=True)
+            loop.symlink_to(loop)
+            valid = home / ".cargo" / "bin" / "uv"
+            valid.parent.mkdir(parents=True)
+            valid.write_text("#!/bin/sh\n", encoding="utf-8")
+            valid.chmod(0o700)
+
+            real_resolve = Path.resolve
+
+            def resolve(path, *, strict=False):
+                if path == loop:
+                    raise RuntimeError("simulated Python 3.9 symlink loop")
+                return real_resolve(path, strict=strict)
+
+            with mock.patch.object(Path, "resolve", resolve):
+                resolved = launcher._find_uv(
+                    {
+                        "HOME": str(home),
+                        "PATH": "/usr/bin:/bin",
+                    },
+                    lambda command: None,
+                )
+
+        self.assertEqual(resolved, str(valid.resolve()))
+
+    def test_launcher_rejects_relative_uv_found_on_inherited_path(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            malicious = Path(directory) / "uv"
+            malicious.write_text("#!/bin/sh\n", encoding="utf-8")
+            malicious.chmod(0o700)
+            safe = Path(directory) / "safe-uv"
+            safe.write_text("#!/bin/sh\n", encoding="utf-8")
+            safe.chmod(0o700)
+            relative = str(malicious.relative_to(Path.cwd()))
+
+            with mock.patch.object(
+                launcher.shutil,
+                "which",
+                return_value=relative,
+            ):
+                with mock.patch.object(
+                    launcher,
+                    "_uv_fallback_paths",
+                    return_value=(str(safe),),
+                ):
+                    resolved = launcher._find_uv(
+                        {"PATH": ".:/usr/bin:/bin"},
+                        None,
+                    )
+
+        self.assertEqual(resolved, str(safe.resolve()))
 
     def test_launcher_supplies_literal_safe_mcp_defaults(self):
         class ExecIntercept(Exception):

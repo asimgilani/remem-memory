@@ -122,11 +122,51 @@ def _find_uv(
         )
     except Exception:
         uv = None
-    if not uv:
-        raise _LauncherError(
-            "error: uv is required for the Remem MCP server"
+    if uv:
+        if which is not None:
+            return uv
+        try:
+            path = Path(uv)
+            if path.is_absolute():
+                path = path.resolve(strict=True)
+                if path.is_file() and os.access(path, os.X_OK):
+                    return str(path)
+        except (OSError, RuntimeError):
+            pass
+    for candidate in _uv_fallback_paths(environment):
+        try:
+            path = Path(candidate).resolve(strict=True)
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+        except (OSError, RuntimeError):
+            continue
+    raise _LauncherError(
+        "error: uv is required for the Remem MCP server"
+    )
+
+
+def _uv_fallback_paths(environment: Mapping[str, str]) -> tuple[str, ...]:
+    """Return conventional uv locations omitted by desktop app PATHs."""
+
+    executable = "uv.exe" if os.name == "nt" else "uv"
+    candidates: List[str] = []
+    home = environment.get("HOME")
+    if isinstance(home, str) and home.strip():
+        base = Path(home)
+        if base.is_absolute():
+            candidates.extend(
+                (
+                    str(base / ".local" / "bin" / executable),
+                    str(base / ".cargo" / "bin" / executable),
+                )
+            )
+    candidates.extend(
+        (
+            str(Path("/opt/homebrew/bin") / executable),
+            str(Path("/usr/local/bin") / executable),
         )
-    return uv
+    )
+    return tuple(candidates)
 
 
 def _cache_environment(
