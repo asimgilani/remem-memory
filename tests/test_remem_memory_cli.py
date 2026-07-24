@@ -1225,6 +1225,102 @@ class RoutingCliTests(unittest.TestCase):
         )
         self.assertNotIn("earlier_denied", stdout)
 
+    def test_status_preserves_submicrosecond_precision_per_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            data_dir = Path(directory)
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                environment,
+            )
+            for status, detail_code, observed_at in (
+                (
+                    "ok",
+                    "newer_same_route",
+                    "2026-07-24T12:34:56.1234568Z",
+                ),
+                (
+                    "permission_error",
+                    "older_same_route",
+                    "2026-07-24T12:34:56.1234567Z",
+                ),
+            ):
+                remem_memory.remem_routing.record_route_health(
+                    remem_memory.remem_routing.RouteHealthRecord(
+                        "codex",
+                        "recall",
+                        "primary",
+                        "@readable",
+                        status,
+                        detail_code,
+                        observed_at,
+                    ),
+                    data_dir,
+                )
+
+            result, stdout, stderr = self._run(
+                ["status"],
+                environment=environment,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(
+            "last API result: primary/@readable recall (codex): "
+            "ok [newer_same_route]\n",
+            stdout,
+        )
+        self.assertNotIn("older_same_route", stdout)
+
+    def test_status_preserves_submicrosecond_precision_in_final_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            data_dir = Path(directory)
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                environment,
+            )
+            for client, status, detail_code, observed_at in (
+                (
+                    "claude",
+                    "permission_error",
+                    "older_other_route",
+                    "2026-07-24T12:34:56.1234567Z",
+                ),
+                (
+                    "codex",
+                    "ok",
+                    "newer_other_route",
+                    "2026-07-24T12:34:56.1234568Z",
+                ),
+            ):
+                remem_memory.remem_routing.record_route_health(
+                    remem_memory.remem_routing.RouteHealthRecord(
+                        client,
+                        "recall",
+                        "primary",
+                        "@readable",
+                        status,
+                        detail_code,
+                        observed_at,
+                    ),
+                    data_dir,
+                )
+
+            result, stdout, stderr = self._run(
+                ["status"],
+                environment=environment,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(
+            "last API result: primary/@readable recall (codex): "
+            "ok [newer_other_route]\n",
+            stdout,
+        )
+        self.assertNotIn("older_other_route", stdout)
+
     def test_doctor_missing_storage_and_unsafe_modes_are_strictly_read_only(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)

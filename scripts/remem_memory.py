@@ -7,6 +7,7 @@ import getpass
 import hmac
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import tempfile
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -59,6 +61,15 @@ _DEFAULT_API_URL = "https://api.remem.io"
 _CREDENTIAL_FD_ENV = "REMEM_API_KEY_FD"
 _RUNTIME_ENV_FD = "REMEM_MEMORY_RUNTIME_ENV_FD"
 _MAX_PIPE_PAYLOAD_BYTES = 8 * 1024
+_UTC_RFC3339_COMPONENTS = re.compile(
+    r"\A([0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]+))?Z\Z"
+)
+_INVALID_RFC3339_SORT_KEY = (
+    0,
+    datetime.min.replace(tzinfo=timezone.utc),
+    Decimal(0),
+)
 _HELPER_ENVIRONMENT_KEYS = (
     "PATH",
     "HOME",
@@ -565,8 +576,8 @@ def _latest_health(
         prior = selected.get(key)
         if key in affected and (
             prior is None
-            or _rfc3339_datetime(record.observed_at)
-            >= _rfc3339_datetime(prior.observed_at)
+            or _rfc3339_sort_key(record.observed_at)
+            >= _rfc3339_sort_key(prior.observed_at)
         ):
             selected[key] = record
     return [
@@ -585,17 +596,25 @@ def _latest_health(
     ]
 
 
-def _rfc3339_datetime(value: object) -> datetime:
+def _rfc3339_sort_key(value: object) -> tuple[int, datetime, Decimal]:
     if not isinstance(value, str):
-        return datetime.min.replace(tzinfo=timezone.utc)
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return _INVALID_RFC3339_SORT_KEY
+    match = _UTC_RFC3339_COMPONENTS.fullmatch(value)
+    if match is None:
+        return _INVALID_RFC3339_SORT_KEY
     try:
-        observed = datetime.fromisoformat(normalized)
-        if observed.tzinfo is None:
-            raise ValueError
-        return observed.astimezone(timezone.utc)
-    except (OverflowError, ValueError):
-        return datetime.min.replace(tzinfo=timezone.utc)
+        observed = datetime.strptime(
+            match.group(1),
+            "%Y-%m-%dT%H:%M:%S",
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return _INVALID_RFC3339_SORT_KEY
+    fraction = match.group(2)
+    return (
+        1,
+        observed,
+        Decimal(f"0.{fraction}") if fraction is not None else Decimal(0),
+    )
 
 
 def _routes_payload(
@@ -1200,7 +1219,7 @@ def _status() -> int:
         if health:
             latest = max(
                 health,
-                key=lambda record: _rfc3339_datetime(
+                key=lambda record: _rfc3339_sort_key(
                     record["observed_at"]
                 ),
             )
