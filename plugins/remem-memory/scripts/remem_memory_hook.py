@@ -587,7 +587,7 @@ def _health_failure(error: Exception) -> tuple[str, str]:
         "auth": ("auth_error", "request_auth"),
         "permission": ("permission_error", "request_permission"),
         "namespace": ("namespace_error", "request_namespace"),
-        "request": ("transient_error", "request_invalid"),
+        "request": ("request_error", "request_invalid"),
         "transient": ("transient_error", "request_transient"),
     }.get(kind, ("transient_error", "request_transient"))
 
@@ -1659,10 +1659,12 @@ def handle_event(
 ) -> dict[str, Any]:
     """Handle one hook event and always return valid, non-blocking JSON."""
 
+    if harness not in {"codex", "claude"}:
+        return {}
     selected_dependencies = dependencies or Dependencies(
         background_writes=True
     )
-    selected_harness = harness if harness in {"codex", "claude"} else "claude"
+    selected_harness = harness
     fallback = (
         {"continue": True}
         if selected_harness == "codex" and mode == "stop"

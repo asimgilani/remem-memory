@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -257,6 +258,106 @@ class MemoryPolicyTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(merged), 4)
+
+    def test_recall_merge_treats_huge_and_nonfinite_scores_as_zero(
+        self,
+    ) -> None:
+        merge = _MODULE.merge_recall_items
+        source = self._recall_source(
+            {
+                "results": [
+                    {
+                        "title": "huge",
+                        "content": "huge numeric result",
+                        "score": 10**10_000,
+                    },
+                    {
+                        "title": "infinite",
+                        "content": "infinite numeric result",
+                        "score": float("inf"),
+                    },
+                    {
+                        "title": "nan",
+                        "content": "not a number result",
+                        "score": float("nan"),
+                    },
+                    {
+                        "title": "valid",
+                        "content": "valid scored result",
+                        "score": 0.9,
+                    },
+                ]
+            },
+            connection_order=0,
+            namespace_order={},
+        )
+
+        merged = merge([source])
+
+        self.assertEqual(merged[0]["title"], "valid")
+        self.assertEqual(
+            {item["title"] for item in merged},
+            {"huge", "infinite", "nan", "valid"},
+        )
+
+    def test_recall_merge_isolates_malformed_items_and_sources(
+        self,
+    ) -> None:
+        class ExplodingMapping(Mapping):
+            def __getitem__(self, key):
+                raise RuntimeError("vlt_secret-item-canary")
+
+            def __iter__(self):
+                return iter(())
+
+            def __len__(self):
+                return 1
+
+            def get(self, key, default=None):
+                del key, default
+                raise RuntimeError("vlt_secret-item-canary")
+
+        malformed_item_source = self._recall_source(
+            {
+                "results": [
+                    ExplodingMapping(),
+                    {
+                        "title": "same source valid",
+                        "content": "usable result after malformed item",
+                        "score": 0.8,
+                    },
+                ]
+            },
+            connection_order=0,
+            namespace_order={},
+        )
+        malformed_source = self._recall_source(
+            ExplodingMapping(),
+            connection_order=1,
+            namespace_order={},
+        )
+        valid_source = self._recall_source(
+            {
+                "results": [
+                    {
+                        "title": "other source valid",
+                        "content": "usable result from another source",
+                        "score": 0.9,
+                    }
+                ]
+            },
+            connection_order=2,
+            namespace_order={},
+        )
+
+        merged = _MODULE.merge_recall_items(
+            [malformed_item_source, malformed_source, valid_source]
+        )
+
+        self.assertEqual(
+            [item["title"] for item in merged],
+            ["other source valid", "same source valid"],
+        )
 
     def test_recall_normalization_preserves_grouped_fact_rendering(self) -> None:
         normalized = _MODULE.normalize_recall_items(

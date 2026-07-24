@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections import Counter
 from collections.abc import Mapping
@@ -324,8 +325,11 @@ def _stable_value(value: object) -> str:
 
 def _score(value: object) -> float:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        numeric = float(value)
-        if numeric == numeric and numeric not in {float("inf"), float("-inf")}:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if math.isfinite(numeric):
             return numeric
     return 0.0
 
@@ -474,35 +478,44 @@ def merge_recall_items(
             Mapping,
         ):
             continue
-        positions = {
-            namespace: position
-            for namespace, position in source.namespace_order
-            if isinstance(namespace, str)
-            and type(position) is int
-            and position >= 0
-        }
+        try:
+            positions = {
+                namespace: position
+                for namespace, position in source.namespace_order
+                if isinstance(namespace, str)
+                and type(position) is int
+                and position >= 0
+            }
+            results = source.response.get("results")
+            facts = source.response.get("facts")
+        except Exception:
+            continue
         original_order = 0
-        results = source.response.get("results")
         if isinstance(results, list):
             for document in results:
                 if isinstance(document, Mapping):
-                    candidate = _document_candidate(
-                        document,
-                        connection_order=source.connection_order,
-                        namespace_positions=positions,
-                        result_order=original_order,
-                    )
+                    try:
+                        candidate = _document_candidate(
+                            document,
+                            connection_order=source.connection_order,
+                            namespace_positions=positions,
+                            result_order=original_order,
+                        )
+                    except Exception:
+                        candidate = None
                     if candidate is not None:
                         candidates.append(candidate)
                 original_order += 1
-        facts = source.response.get("facts")
         if isinstance(facts, list):
-            candidate = _facts_candidate(
-                facts,
-                connection_order=source.connection_order,
-                namespace_positions=positions,
-                result_order=original_order,
-            )
+            try:
+                candidate = _facts_candidate(
+                    facts,
+                    connection_order=source.connection_order,
+                    namespace_positions=positions,
+                    result_order=original_order,
+                )
+            except Exception:
+                candidate = None
             if candidate is not None:
                 candidates.append(candidate)
 

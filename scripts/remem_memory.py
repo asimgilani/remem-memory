@@ -1389,9 +1389,14 @@ def _doctor_checks() -> list[dict[str, str]]:
         elif all(record["status"] == "ok" for record in health):
             checks["namespace_readability"] = ("ok", "authorized")
         else:
+            failure_status = next(
+                record["status"]
+                for record in health
+                if record["status"] != "ok"
+            )
             checks["namespace_readability"] = (
                 "failed",
-                "authorization_error",
+                failure_status,
             )
         if config.deprecations or config.migration_write_blocked:
             checks["migration"] = ("info", "attention_required")

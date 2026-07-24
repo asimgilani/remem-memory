@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import http.client
 import json
 import os
 import re
@@ -926,7 +927,13 @@ class RememAPI:
                     error.close()
                 except Exception:
                     pass
-            except (urllib_error.URLError, TimeoutError, socket.timeout, OSError):
+            except (
+                urllib_error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                socket.timeout,
+                OSError,
+            ):
                 kind = "transient"
             except RememAPIError as error:
                 kind = error.kind

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -c 'import os,runpy,sys;token=sys.argv.pop(1);harness=\"claude\" if os.path.isabs(token) else \"codex\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode user_prompt_submit",
+            "command": "python3 -I -c 'import os,re,runpy,sys;token=sys.argv.pop(1);unresolved=re.fullmatch(r\"\\$(?:[A-Za-z_][A-Za-z0-9_]*|\\{[A-Za-z_][A-Za-z0-9_]*\\})\",token) is not None;(os.path.isabs(token) or unresolved) or sys.exit(\"invalid plugin root\");harness=\"codex\" if unresolved else \"claude\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode user_prompt_submit",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -c 'import os,runpy,sys;token=sys.argv.pop(1);harness=\"claude\" if os.path.isabs(token) else \"codex\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode post_tool_use",
+            "command": "python3 -I -c 'import os,re,runpy,sys;token=sys.argv.pop(1);unresolved=re.fullmatch(r\"\\$(?:[A-Za-z_][A-Za-z0-9_]*|\\{[A-Za-z_][A-Za-z0-9_]*\\})\",token) is not None;(os.path.isabs(token) or unresolved) or sys.exit(\"invalid plugin root\");harness=\"codex\" if unresolved else \"claude\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode post_tool_use",
             "timeout": 30
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -c 'import os,runpy,sys;token=sys.argv.pop(1);harness=\"claude\" if os.path.isabs(token) else \"codex\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode stop",
+            "command": "python3 -I -c 'import os,re,runpy,sys;token=sys.argv.pop(1);unresolved=re.fullmatch(r\"\\$(?:[A-Za-z_][A-Za-z0-9_]*|\\{[A-Za-z_][A-Za-z0-9_]*\\})\",token) is not None;(os.path.isabs(token) or unresolved) or sys.exit(\"invalid plugin root\");harness=\"codex\" if unresolved else \"claude\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode stop",
             "timeout": 30
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -c 'import os,runpy,sys;token=sys.argv.pop(1);harness=\"claude\" if os.path.isabs(token) else \"codex\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode pre_compact",
+            "command": "python3 -I -c 'import os,re,runpy,sys;token=sys.argv.pop(1);unresolved=re.fullmatch(r\"\\$(?:[A-Za-z_][A-Za-z0-9_]*|\\{[A-Za-z_][A-Za-z0-9_]*\\})\",token) is not None;(os.path.isabs(token) or unresolved) or sys.exit(\"invalid plugin root\");harness=\"codex\" if unresolved else \"claude\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode pre_compact",
             "timeout": 60
           }
         ]
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -c 'import os,runpy,sys;token=sys.argv.pop(1);harness=\"claude\" if os.path.isabs(token) else \"codex\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode session_end",
+            "command": "python3 -I -c 'import os,re,runpy,sys;token=sys.argv.pop(1);unresolved=re.fullmatch(r\"\\$(?:[A-Za-z_][A-Za-z0-9_]*|\\{[A-Za-z_][A-Za-z0-9_]*\\})\",token) is not None;(os.path.isabs(token) or unresolved) or sys.exit(\"invalid plugin root\");harness=\"codex\" if unresolved else \"claude\";root=token if harness==\"claude\" else os.environ.get(\"PLUGIN_ROOT\") or os.getcwd();root=os.path.abspath(root);scripts=os.path.join(root,\"scripts\");entry=os.path.join(scripts,\"remem_memory_hook.py\");sys.path.insert(0,scripts);sys.argv=[entry,*sys.argv[1:],\"--harness\",harness];runpy.run_path(entry,run_name=\"__main__\")' \"${CLAUDE_PLUGIN_ROOT}\" --mode session_end",
             "timeout": 3
           }
         ]

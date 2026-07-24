@@ -489,6 +489,33 @@ class RoutingStorageTests(unittest.TestCase):
 
 
 class RouteHealthStorageTests(unittest.TestCase):
+    def test_health_storage_accepts_request_error_and_rejects_unknown_status(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            request_error = remem_routing.RouteHealthRecord(
+                client="codex",
+                behavior="recall",
+                connection_id="primary",
+                namespace="@readable",
+                status="request_error",
+                detail_code="request_invalid",
+                observed_at="2026-07-24T12:34:56Z",
+            )
+
+            remem_routing.record_route_health(request_error, data_dir)
+
+            self.assertEqual(
+                remem_routing.load_route_health(data_dir),
+                (request_error,),
+            )
+            with self.assertRaises(ValueError):
+                remem_routing.record_route_health(
+                    replace(request_error, status="requestish"),
+                    data_dir,
+                )
+
     def test_health_records_are_bounded_non_secret_and_do_not_change_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)

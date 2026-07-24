@@ -1176,6 +1176,44 @@ class RoutingCliTests(unittest.TestCase):
         self.assertNotIn("connection:", stdout)
         self.assertNotIn("keychain_account", stdout)
 
+    def test_status_reports_permanent_request_health_as_request_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            data_dir = Path(directory)
+            remem_memory.remem_routing.load_or_initialize_routing(
+                data_dir,
+                environment,
+            )
+            remem_memory.remem_routing.record_route_health(
+                remem_memory.remem_routing.RouteHealthRecord(
+                    "codex",
+                    "recall",
+                    "primary",
+                    "@readable",
+                    "request_error",
+                    "request_invalid",
+                    "2026-07-24T12:34:56Z",
+                ),
+                data_dir,
+            )
+            with mock.patch.object(
+                remem_memory.remem_api,
+                "resolve_connection_api_key",
+                return_value=None,
+            ):
+                result, stdout, stderr = self._run(
+                    ["status"],
+                    environment=environment,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(
+            "last API result: primary/@readable recall (codex): "
+            "request_error [request_invalid]\n",
+            stdout,
+        )
+
     def test_status_orders_fractional_rfc3339_timestamps_chronologically(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {"REMEM_MEMORY_DATA_DIR": directory}
@@ -1731,6 +1769,60 @@ class RoutingCliTests(unittest.TestCase):
                         "detail_code": "no_prior_read",
                         "name": "namespace_readability",
                         "status": "info",
+                    },
+                )
+
+    def test_doctor_distinguishes_recall_failure_categories(self):
+        cases = (
+            "auth_error",
+            "permission_error",
+            "namespace_error",
+            "request_error",
+            "transient_error",
+        )
+        for status in cases:
+            with self.subTest(status=status):
+                with tempfile.TemporaryDirectory() as directory:
+                    data_dir = Path(directory)
+                    remem_memory.remem_routing.load_or_initialize_routing(
+                        data_dir,
+                        {},
+                    )
+                    remem_memory.remem_routing.record_route_health(
+                        remem_memory.remem_routing.RouteHealthRecord(
+                            "codex",
+                            "recall",
+                            "primary",
+                            "@readable",
+                            status,
+                            "fixed_detail",
+                            "2026-07-24T12:34:56Z",
+                        ),
+                        data_dir,
+                    )
+                    with mock.patch.object(
+                        remem_memory.remem_api,
+                        "resolve_connection_api_key",
+                        return_value="available",
+                    ):
+                        with mock.patch("shutil.which", return_value=None):
+                            result = self._run(
+                                ["doctor", "--json"],
+                                environment={
+                                    "REMEM_MEMORY_DATA_DIR": str(data_dir)
+                                },
+                            )
+
+                checks = {
+                    item["name"]: item
+                    for item in json.loads(result[1])["checks"]
+                }
+                self.assertEqual(
+                    checks["namespace_readability"],
+                    {
+                        "detail_code": status,
+                        "name": "namespace_readability",
+                        "status": "failed",
                     },
                 )
 

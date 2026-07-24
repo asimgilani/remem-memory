@@ -36,6 +36,7 @@ _HEALTH_STATUSES = frozenset(
         "auth_error",
         "permission_error",
         "namespace_error",
+        "request_error",
         "transient_error",
     )
 )

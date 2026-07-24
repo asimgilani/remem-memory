@@ -149,7 +149,9 @@ class PluginContractTests(unittest.TestCase):
                             environment["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
                             environment.pop("PLUGIN_ROOT", None)
                         else:
-                            environment.pop("CLAUDE_PLUGIN_ROOT", None)
+                            environment["CLAUDE_PLUGIN_ROOT"] = (
+                                "${CLAUDE_PLUGIN_ROOT}"
+                            )
                             environment["PLUGIN_ROOT"] = str(plugin_root)
 
                         completed = subprocess.run(
@@ -176,10 +178,10 @@ class PluginContractTests(unittest.TestCase):
                             harness,
                         ])
 
-    def test_unresolved_claude_root_token_selects_codex_before_fallback(self):
+    def test_valid_unresolved_root_tokens_select_codex_before_fallback(self):
         hooks = load_json("plugins/remem-memory/hooks/hooks.json")["hooks"]
         command = hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
-        arguments = shlex.split(command)
+        base_arguments = shlex.split(command)
 
         with tempfile.TemporaryDirectory() as directory:
             plugin_root = Path(directory) / "plugin"
@@ -196,21 +198,66 @@ class PluginContractTests(unittest.TestCase):
             environment.pop("CLAUDE_PLUGIN_ROOT", None)
             environment["PLUGIN_ROOT"] = str(plugin_root)
 
-            completed = subprocess.run(
-                arguments,
-                cwd=plugin_root,
-                env=environment,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            for token in ("${CLAUDE_PLUGIN_ROOT}", "$UNRESOLVED_ROOT"):
+                with self.subTest(token=token):
+                    arguments = list(base_arguments)
+                    arguments[4] = token
+                    completed = subprocess.run(
+                        arguments,
+                        cwd=plugin_root,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        observed = json.loads(completed.stdout)
-        self.assertEqual(
-            observed["argv"][-2:],
-            ["--harness", "codex"],
-        )
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        completed.stderr,
+                    )
+                    observed = json.loads(completed.stdout)
+                    self.assertEqual(
+                        observed["argv"][-2:],
+                        ["--harness", "codex"],
+                    )
+
+    def test_hook_bootstrap_rejects_empty_relative_and_malformed_roots(self):
+        hooks = load_json("plugins/remem-memory/hooks/hooks.json")["hooks"]
+        command = hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+        base_arguments = shlex.split(command)
+
+        for token in (
+            "",
+            ".",
+            "relative/root",
+            "$",
+            "$9BROKEN",
+            "${BROKEN",
+            "prefix$BROKEN",
+        ):
+            with self.subTest(token=token):
+                arguments = list(base_arguments)
+                arguments[4] = token
+                environment = os.environ.copy()
+                environment["PLUGIN_ROOT"] = (
+                    "/tmp/vlt_secret-plugin-root-canary"
+                )
+
+                completed = subprocess.run(
+                    arguments,
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    completed.stderr.strip(),
+                    "invalid plugin root",
+                )
+                self.assertNotIn("secret", completed.stderr)
 
 
 if __name__ == "__main__":

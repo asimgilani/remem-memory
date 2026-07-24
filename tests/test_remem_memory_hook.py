@@ -1,5 +1,6 @@
 import contextlib
 import ctypes
+import http.client
 import importlib.util
 import io
 import json
@@ -591,6 +592,104 @@ class RememAPITests(unittest.TestCase):
             },
             {"stable-write-id"},
         )
+
+    def test_incomplete_response_reads_retry_with_stable_ingest_request(
+        self,
+    ) -> None:
+        attempts = []
+        sleeps = []
+
+        class IncompleteResponse(FakeResponse):
+            def read(self, amount=None):
+                if len(attempts) < 3:
+                    raise http.client.IncompleteRead(
+                        b"vlt_secret-partial-canary",
+                        100,
+                    )
+                return super().read(amount)
+
+        def opener(request, timeout):
+            attempts.append(
+                (
+                    request.data,
+                    {
+                        key.lower(): value
+                        for key, value in request.headers.items()
+                    },
+                    timeout,
+                )
+            )
+            return IncompleteResponse({"ok": True})
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "test-key",
+            opener=opener,
+            sleep=sleeps.append,
+            idempotency_factory=lambda: "stable-read-retry",
+        )
+
+        response = api.ingest(
+            {
+                "title": "Durable context",
+                "source_id": "stable-source",
+            },
+            "explicit-memory",
+            timeout=2.0,
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual({attempt[0] for attempt in attempts}, {attempts[0][0]})
+        self.assertEqual(
+            {
+                attempt[1].get("idempotency-key")
+                for attempt in attempts
+            },
+            {"stable-read-retry"},
+        )
+        bodies = [
+            json.loads(attempt[0].decode("utf-8"))
+            for attempt in attempts
+        ]
+        self.assertEqual(
+            {body["namespace"] for body in bodies},
+            {"explicit-memory"},
+        )
+        self.assertEqual(
+            {body["source_id"] for body in bodies},
+            {"stable-source"},
+        )
+
+    def test_malformed_decoded_json_is_request_error_without_retry(
+        self,
+    ) -> None:
+        attempts = []
+
+        class MalformedResponse(FakeResponse):
+            def read(self, amount=None):
+                del amount
+                return b'{"vlt_secret-canary":'
+
+        def opener(request, timeout):
+            attempts.append((request.data, timeout))
+            return MalformedResponse({})
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "test-key",
+            opener=opener,
+            sleep=lambda delay: self.fail(f"unexpected sleep {delay}"),
+        )
+
+        with self.assertRaises(_API.RememAPIError) as caught:
+            api.query("history", ["alpha"], timeout=2.0)
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(getattr(caught.exception, "kind", None), "request")
+        self.assertEqual(str(caught.exception), "Remem request failed")
+        self.assertNotIn("secret-canary", str(caught.exception))
 
     def test_network_timeout_is_transient_and_bounded_to_three_attempts(
         self,
@@ -1276,6 +1375,42 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertIn("routing_resolver", names)
         self.assertIn("connection_credential_resolver", names)
 
+    def test_unknown_harness_fails_open_without_route_or_credential_calls(
+        self,
+    ) -> None:
+        for harness, mode, payload in (
+            ("", "user_prompt_submit", prompt_payload("What did we decide?")),
+            (
+                "unknown",
+                "user_prompt_submit",
+                prompt_payload("What is my history?"),
+            ),
+            ("CODEX", "user_prompt_submit", prompt_payload("Recall history")),
+        ):
+            with self.subTest(harness=harness, mode=mode):
+                calls = []
+                with tempfile.TemporaryDirectory() as directory:
+                    output = _HOOK.handle_event(
+                        payload,
+                        harness=harness,
+                        mode=mode,
+                        dependencies=self._dependencies(
+                            directory,
+                            None,
+                            routing_resolver=lambda behavior, client: (
+                                calls.append(("route", behavior, client))
+                            ),
+                            connection_credential_resolver=(
+                                lambda connection: calls.append(
+                                    ("credential", connection.id)
+                                )
+                            ),
+                        ),
+                    )
+
+                self.assertEqual(output, {})
+                self.assertEqual(calls, [])
+
     def test_user_prompt_submit_uses_builtin_readable_route_and_injects_context(
         self,
     ) -> None:
@@ -1502,6 +1637,39 @@ class RememMemoryHookTests(unittest.TestCase):
                 ("primary", "transient_error"),
                 (secondary.id, "ok"),
             ],
+        )
+
+    def test_permanent_request_failure_records_request_error_health(
+        self,
+    ) -> None:
+        api = RoutedAPI(
+            "primary",
+            query_error=_HOOK.RememAPIError(
+                "Remem request failed",
+                kind="request",
+            ),
+        )
+        health = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = _HOOK.handle_event(
+                prompt_payload("What did we decide last time?"),
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=self._dependencies(
+                    directory,
+                    None,
+                    routing_resolver=routed(routing_config()),
+                    connection_credential_resolver=lambda connection: "key",
+                    api_factory=lambda connection, credential: api,
+                    health_recorder=health.append,
+                ),
+            )
+
+        self.assertEqual(output, {})
+        self.assertEqual(
+            [(record.status, record.detail_code) for record in health],
+            [("request_error", "request_invalid")],
         )
 
     def test_client_override_selects_only_its_recall_route(self) -> None:
