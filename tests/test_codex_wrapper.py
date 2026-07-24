@@ -568,6 +568,76 @@ class CodexWrapperTests(unittest.TestCase):
         checkpoint.assert_not_called()
         rollup.assert_not_called()
 
+    def test_wrapper_reloads_route_after_final_privacy_refresh(
+        self,
+    ) -> None:
+        initial = _MODULE.SessionsRouteSnapshot(
+            route_revision=3,
+            connection_id="primary",
+            write_namespace=None,
+            credential="vlt_initial-canary",
+        )
+        changed = _MODULE.SessionsRouteSnapshot(
+            route_revision=4,
+            connection_id="conn_" + ("d" * 32),
+            write_namespace="sessions",
+            credential="vlt_changed-canary",
+        )
+
+        for phase in ("checkpoint", "rollup"):
+            with self.subTest(phase=phase):
+                control_calls = 0
+                route_changed = False
+
+                def engineering_control(_session_id):
+                    nonlocal control_calls
+                    nonlocal route_changed
+                    control_calls += 1
+                    trigger = 3 if phase == "checkpoint" else 6
+                    if control_calls == trigger:
+                        route_changed = True
+                    return _MODULE.EngineeringControl(
+                        mode_auto=not (
+                            phase == "checkpoint"
+                            and control_calls > trigger
+                        ),
+                        off_record=False,
+                        off_record_seen=False,
+                        state_available=True,
+                    )
+
+                def resolve_route(*_args, **_kwargs):
+                    return changed if route_changed else initial
+
+                with tempfile.TemporaryDirectory() as directory:
+                    with mock.patch.object(
+                        _MODULE,
+                        "_engineering_control",
+                        side_effect=engineering_control,
+                    ):
+                        with mock.patch.object(
+                            _MODULE,
+                            "_resolve_live_sessions_route",
+                            side_effect=resolve_route,
+                        ):
+                            result, checkpoint, rollup, popen = (
+                                self._run_wrapper_main(
+                                    directory,
+                                    ingest=True,
+                                    checkpoint_on_start=(
+                                        phase == "checkpoint"
+                                    ),
+                                )
+                            )
+
+                self.assertEqual(result, 0)
+                popen.assert_called_once()
+                if phase == "checkpoint":
+                    checkpoint.assert_not_called()
+                else:
+                    checkpoint.assert_called_once()
+                rollup.assert_not_called()
+
     def test_wrapper_startup_off_and_recall_only_skip_all_engineering(
         self,
     ) -> None:

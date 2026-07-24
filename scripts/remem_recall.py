@@ -24,7 +24,10 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
 import remem_api  # noqa: E402
 
 try:
-    from scripts.remem_checkpoint import _consume_route_descriptor
+    from scripts.remem_checkpoint import (
+        _consume_local_dev_capability,
+        _consume_route_descriptor,
+    )
 except ModuleNotFoundError:
     _CHECKPOINT_PATH = Path(__file__).resolve().with_name(
         "remem_checkpoint.py"
@@ -36,6 +39,9 @@ except ModuleNotFoundError:
     _MODULE = importlib.util.module_from_spec(_SPEC)
     assert _SPEC and _SPEC.loader
     _SPEC.loader.exec_module(_MODULE)
+    _consume_local_dev_capability = (
+        _MODULE._consume_local_dev_capability
+    )
     _consume_route_descriptor = _MODULE._consume_route_descriptor
 
 _MODE_CHOICES = ("fast", "rich")
@@ -193,14 +199,25 @@ def main(argv: list[str] | None = None) -> int:
                 expected_client=args.client,
                 expected_behavior="recall",
             )
+            allow_local_dev = _consume_local_dev_capability(
+                os.environ,
+                route,
+            )
             api_url = remem_api.normalize_api_origin(
                 args.api_url,
-                allow_local_dev=True,
+                allow_local_dev=allow_local_dev,
             )
             api_key = remem_api.consume_explicit_api_key(os.environ)
         except Exception:
             print("error: invalid route descriptor", file=sys.stderr)
             return 1
+    elif "REMEM_MEMORY_LOCAL_DEV_FD" in os.environ:
+        try:
+            _consume_local_dev_capability(os.environ, {})
+        except Exception:
+            pass
+        print("error: invalid route descriptor", file=sys.stderr)
+        return 1
     else:
         try:
             api_url, api_key = remem_api.resolve_api_access(args.api_url)

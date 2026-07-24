@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -191,6 +192,61 @@ class ManualHelperTransportTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     os.read(read_descriptor, 1)
 
+    def test_local_dev_capability_is_one_use_and_route_bound(
+        self,
+    ) -> None:
+        route = {
+            "schema_version": 1,
+            "client": "codex",
+            "behavior": "sessions",
+            "route_revision": 7,
+            "connection_id": "primary",
+            "read_namespaces": None,
+            "write_namespace": None,
+        }
+        payload = remem_checkpoint._local_dev_capability_payload(route)
+        read_descriptor, write_descriptor = os.pipe()
+        os.write(write_descriptor, payload)
+        os.close(write_descriptor)
+        environment = {
+            "REMEM_MEMORY_LOCAL_DEV_FD": str(read_descriptor),
+        }
+
+        self.assertTrue(
+            remem_checkpoint._consume_local_dev_capability(
+                environment,
+                route,
+            )
+        )
+        self.assertNotIn("REMEM_MEMORY_LOCAL_DEV_FD", environment)
+        with self.assertRaises(OSError):
+            os.read(read_descriptor, 1)
+        self.assertFalse(
+            remem_checkpoint._consume_local_dev_capability(
+                environment,
+                route,
+            )
+        )
+
+        changed_route = dict(route, route_revision=8)
+        changed_read, changed_write = os.pipe()
+        os.write(changed_write, payload)
+        os.close(changed_write)
+        changed_environment = {
+            "REMEM_MEMORY_LOCAL_DEV_FD": str(changed_read),
+        }
+        with self.assertRaises(ValueError):
+            remem_checkpoint._consume_local_dev_capability(
+                changed_environment,
+                changed_route,
+            )
+        self.assertNotIn(
+            "REMEM_MEMORY_LOCAL_DEV_FD",
+            changed_environment,
+        )
+        with self.assertRaises(OSError):
+            os.read(changed_read, 1)
+
     def test_canonical_write_routing_honors_client_off_and_explicit_to(
         self,
     ) -> None:
@@ -290,6 +346,88 @@ class ManualHelperTransportTests(unittest.TestCase):
         self.assertEqual(credential, "vlt_secondary-canary")
         self.assertEqual(len(pass_fds), 2)
         self.assertNotIn("vlt_primary-canary", repr(observed))
+
+    def test_canonical_primary_loopback_mints_bound_capability(
+        self,
+    ) -> None:
+        config = self._routing_config()
+        observed = []
+
+        def run_helper(_arguments, **kwargs):
+            environment = kwargs["env"]
+            route = json.loads(
+                os.read(
+                    int(environment["REMEM_MEMORY_ROUTE_FD"]),
+                    4096,
+                ).decode("utf-8")
+            )
+            credential = os.read(
+                int(environment["REMEM_API_KEY_FD"]),
+                4096,
+            ).decode("utf-8")
+            capability_environment = {
+                "REMEM_MEMORY_LOCAL_DEV_FD": environment[
+                    "REMEM_MEMORY_LOCAL_DEV_FD"
+                ],
+            }
+            authorized = (
+                remem_checkpoint._consume_local_dev_capability(
+                    capability_environment,
+                    route,
+                )
+            )
+            observed.append(
+                (
+                    route,
+                    credential,
+                    authorized,
+                    tuple(kwargs["pass_fds"]),
+                    environment["REMEM_API_URL"],
+                )
+            )
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": directory,
+                    "REMEM_API_KEY": "vlt_primary-override-canary",
+                    "REMEM_API_URL": "http://127.0.0.1:8765",
+                    "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+                    "REMEM_MEMORY_DATA_DIR": directory,
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    remem_memory,
+                    "_load_or_initialize_routing",
+                    return_value=config,
+                ):
+                    with mock.patch.object(
+                        remem_memory.subprocess,
+                        "run",
+                        side_effect=run_helper,
+                    ):
+                        result = remem_memory.run_command(
+                            "checkpoint",
+                            [
+                                "--ingest",
+                                "--project",
+                                "remem",
+                                "--session-id",
+                                "s1",
+                            ],
+                        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(observed), 1)
+        route, credential, authorized, pass_fds, api_url = observed[0]
+        self.assertEqual(route["connection_id"], "primary")
+        self.assertEqual(credential, "vlt_primary-override-canary")
+        self.assertTrue(authorized)
+        self.assertEqual(len(pass_fds), 3)
+        self.assertEqual(api_url, "http://127.0.0.1:8765")
 
     def test_multi_connection_recall_uses_isolated_children_and_global_merge(
         self,
@@ -678,6 +816,60 @@ class ManualHelperTransportTests(unittest.TestCase):
                         except OSError:
                             pass
 
+    def test_manual_aliases_reject_credential_without_route(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "remem-memory-checkpoint",
+                ["--client", "claude", "--ingest"],
+            ),
+            (
+                "remem-memory-rollup",
+                ["--client", "claude", "--ingest"],
+            ),
+            (
+                "remem-memory-recall",
+                ["--client", "claude", "--query", "history"],
+            ),
+        )
+        for program, arguments in cases:
+            with self.subTest(program=program):
+                key_fd, key_write = os.pipe()
+                os.write(key_write, b"vlt_inherited-canary")
+                os.close(key_write)
+                try:
+                    with tempfile.TemporaryDirectory() as directory:
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                "REMEM_API_KEY_FD": str(key_fd),
+                                "REMEM_MEMORY_DATA_DIR": directory,
+                            },
+                            clear=True,
+                        ):
+                            with mock.patch.object(
+                                remem_memory.subprocess,
+                                "run",
+                                return_value=mock.Mock(returncode=0),
+                            ) as run:
+                                with contextlib.redirect_stderr(
+                                    io.StringIO()
+                                ):
+                                    result = remem_memory.main(
+                                        arguments,
+                                        program=program,
+                                    )
+                    self.assertEqual(result, 1)
+                    run.assert_not_called()
+                    with self.assertRaises(OSError):
+                        os.read(key_fd, 1)
+                finally:
+                    try:
+                        os.close(key_fd)
+                    except OSError:
+                        pass
+
     def test_recall_capture_kills_and_reaps_noisy_or_stalled_child(
         self,
     ) -> None:
@@ -749,6 +941,121 @@ class ManualHelperTransportTests(unittest.TestCase):
                                         capture_output=True,
                                     )
                     self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_recall_timeout_kills_descendant_process_group(
+        self,
+    ) -> None:
+        descriptor = {
+            "schema_version": 1,
+            "client": "codex",
+            "behavior": "recall",
+            "route_revision": 7,
+            "connection_id": "primary",
+            "read_namespaces": None,
+            "write_namespace": None,
+        }
+        descendant_pid = None
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "descendant.pid"
+            script = Path(directory) / "spawn-descendant.py"
+            descendant = (
+                "import os, time\n"
+                f"open({str(pid_path)!r}, 'w').write(str(os.getpid()))\n"
+                "time.sleep(60)\n"
+            )
+            script.write_text(
+                (
+                    "import subprocess, sys\n"
+                    f"subprocess.Popen([sys.executable, '-c', {descendant!r}])\n"
+                ),
+                encoding="utf-8",
+            )
+            try:
+                with mock.patch.object(
+                    remem_memory,
+                    "_RECALL_CHILD_TIMEOUT_SECONDS",
+                    0.15,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        remem_memory._run_routed_child(
+                            script_path=script,
+                            forwarded_args=[],
+                            child_environment={},
+                            route_descriptor=descriptor,
+                            credential="vlt_selected-canary",
+                            capture_output=True,
+                        )
+                descendant_pid = int(
+                    pid_path.read_text(encoding="utf-8")
+                )
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("descendant process escaped recall containment")
+            finally:
+                if descendant_pid is not None:
+                    try:
+                        os.kill(descendant_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_named_routed_helper_cannot_enable_loopback_directly(
+        self,
+    ) -> None:
+        route = {
+            "schema_version": 1,
+            "client": "codex",
+            "behavior": "sessions",
+            "route_revision": 7,
+            "connection_id": "conn_" + ("a" * 32),
+            "read_namespaces": None,
+            "write_namespace": "private",
+        }
+        route_environment, _route_fd = self._descriptor_pipe(
+            json.dumps(route).encode("utf-8")
+        )
+        key_fd, key_write = os.pipe()
+        os.write(key_write, b"vlt_named-keychain-canary")
+        os.close(key_write)
+        with mock.patch.dict(
+            os.environ,
+            {
+                **route_environment,
+                "REMEM_API_KEY_FD": str(key_fd),
+                "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+            },
+            clear=True,
+        ):
+            with mock.patch.object(
+                remem_checkpoint,
+                "ingest_checkpoint",
+                return_value={"document_id": "must-not-run"},
+            ) as ingest:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    result = remem_checkpoint.main(
+                        [
+                            "--client",
+                            "codex",
+                            "--api-url",
+                            "http://127.0.0.1:8765",
+                            "--project",
+                            "remem",
+                            "--session-id",
+                            "s1",
+                            "--summary",
+                            "safe",
+                            "--ingest",
+                            "--no-log",
+                        ]
+                    )
+
+        self.assertEqual(result, 1)
+        ingest.assert_not_called()
 
     def test_routed_checkpoint_log_never_persists_response_body(
         self,

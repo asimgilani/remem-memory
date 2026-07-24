@@ -1762,6 +1762,18 @@ def main(argv: list[str] | None = None) -> int:
             with lock:
                 last_snapshot = changed
             return False
+        route_final = (
+            resolve_live_route()
+            if ingest
+            else None
+        )
+        if ingest and (
+            route_final is None
+            or not _same_sessions_route(route_after, route_final)
+        ):
+            with lock:
+                last_snapshot = changed
+            return False
         ok = _run_checkpoint(
             cwd=cwd,
             env=memory_env,
@@ -1778,13 +1790,13 @@ def main(argv: list[str] | None = None) -> int:
             open_questions=open_questions,
             next_actions=next_actions,
             credential=(
-                route_after.credential
-                if route_after is not None
+                route_final.credential
+                if route_final is not None
                 else None
             ),
             namespace=(
-                route_after.write_namespace
-                if route_after is not None
+                route_final.write_namespace
+                if route_final is not None
                 else None
             ),
         )
@@ -1870,6 +1882,15 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             )
             final_rollup_gate = refresh_engineering_gate()
+            rollup_route_final = (
+                resolve_live_route()
+                if (
+                    ingest
+                    and final_rollup_gate.writes_allowed
+                    and not final_rollup_gate.privacy_suppressed
+                )
+                else None
+            )
             if (
                 final_rollup_gate.writes_allowed
                 and not final_rollup_gate.privacy_suppressed
@@ -1881,6 +1902,11 @@ def main(argv: list[str] | None = None) -> int:
                         and _same_sessions_route(
                             rollup_route_before,
                             rollup_route_after,
+                        )
+                        and rollup_route_final is not None
+                        and _same_sessions_route(
+                            rollup_route_after,
+                            rollup_route_final,
                         )
                     )
                 )
@@ -1895,13 +1921,13 @@ def main(argv: list[str] | None = None) -> int:
                     ingest=ingest,
                     dry_run=args.dry_run,
                     credential=(
-                        rollup_route_after.credential
-                        if rollup_route_after is not None
+                        rollup_route_final.credential
+                        if rollup_route_final is not None
                         else None
                     ),
                     namespace=(
-                        rollup_route_after.write_namespace
-                        if rollup_route_after is not None
+                        rollup_route_final.write_namespace
+                        if rollup_route_final is not None
                         else None
                     ),
                 )

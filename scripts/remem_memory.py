@@ -9,6 +9,7 @@ import json
 import os
 import re
 import selectors
+import signal
 import shutil
 import subprocess
 import sys
@@ -35,9 +36,17 @@ import remem_mcp_launcher  # noqa: E402
 import remem_routing  # noqa: E402
 from memory_policy import RecallSource, merge_recall_items  # noqa: E402
 try:  # noqa: E402
-    from scripts.remem_checkpoint import _consume_route_descriptor
+    from scripts.remem_checkpoint import (
+        _consume_local_dev_capability,
+        _consume_route_descriptor,
+        _local_dev_capability_payload,
+    )
 except ImportError:  # pragma: no cover - isolated script execution
-    from remem_checkpoint import _consume_route_descriptor  # type: ignore
+    from remem_checkpoint import (  # type: ignore
+        _consume_local_dev_capability,
+        _consume_route_descriptor,
+        _local_dev_capability_payload,
+    )
 
 
 _COMMAND_TO_SCRIPT = {
@@ -67,6 +76,7 @@ _DEFAULT_SETTINGS = {
 _DEFAULT_API_URL = "https://api.remem.io"
 _CREDENTIAL_FD_ENV = "REMEM_API_KEY_FD"
 _ROUTE_FD_ENV = "REMEM_MEMORY_ROUTE_FD"
+_LOCAL_DEV_FD_ENV = "REMEM_MEMORY_LOCAL_DEV_FD"
 _RUNTIME_ENV_FD = "REMEM_MEMORY_RUNTIME_ENV_FD"
 _MAX_PIPE_PAYLOAD_BYTES = 8 * 1024
 _MAX_ROUTE_DESCRIPTOR_BYTES = 4096
@@ -352,16 +362,33 @@ def _run_routed_child(
     route_descriptor: Mapping[str, Any],
     credential: str,
     capture_output: bool,
+    allow_local_dev: bool = False,
 ) -> subprocess.CompletedProcess:
     route_fd = _write_route_descriptor(route_descriptor)
     credential_fd = -1
+    local_dev_fd = -1
     try:
         credential_fd = _write_anonymous_payload(
             credential.encode("utf-8")
         )
+        if allow_local_dev:
+            local_dev_fd = _write_anonymous_payload(
+                _local_dev_capability_payload(route_descriptor)
+            )
         environment = dict(child_environment)
         environment[_ROUTE_FD_ENV] = str(route_fd)
         environment[_CREDENTIAL_FD_ENV] = str(credential_fd)
+        if local_dev_fd >= 0:
+            environment[_LOCAL_DEV_FD_ENV] = str(local_dev_fd)
+        pass_fds = tuple(
+            descriptor
+            for descriptor in (
+                route_fd,
+                credential_fd,
+                local_dev_fd,
+            )
+            if descriptor >= 0
+        )
         invocation = [
             _python_executable(),
             "-I",
@@ -373,15 +400,15 @@ def _run_routed_child(
                 invocation,
                 env=environment,
                 check=False,
-                pass_fds=(route_fd, credential_fd),
+                pass_fds=pass_fds,
             )
         return _run_bounded_capture(
             invocation,
             environment=environment,
-            pass_fds=(route_fd, credential_fd),
+            pass_fds=pass_fds,
         )
     finally:
-        for descriptor in (route_fd, credential_fd):
+        for descriptor in (route_fd, credential_fd, local_dev_fd):
             if descriptor >= 0:
                 try:
                     os.close(descriptor)
@@ -403,7 +430,9 @@ def _run_bounded_capture(
         pass_fds=pass_fds,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+    process_group = process.pid
     selector = selectors.DefaultSelector()
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     streams = {
@@ -463,8 +492,7 @@ def _run_bounded_capture(
         )
     except Exception:
         try:
-            if process.poll() is None:
-                process.kill()
+            os.killpg(process_group, signal.SIGKILL)
         except OSError:
             pass
         try:
@@ -487,21 +515,31 @@ def _local_dev_enabled(environment: Mapping[str, str]) -> bool:
     )
 
 
+def _local_dev_allowed_for_connection(
+    connection: remem_routing.Connection,
+    environment: Mapping[str, str],
+) -> bool:
+    explicit = environment.get("REMEM_API_KEY", "")
+    primary_override = (
+        explicit.strip() if isinstance(explicit, str) else ""
+    )
+    return bool(
+        connection.id == "primary"
+        and primary_override
+        and _local_dev_enabled(environment)
+    )
+
+
 def _normalize_origin_for_connection(
     api_url: str,
     connection: remem_routing.Connection,
     environment: Mapping[str, str],
 ) -> str:
-    explicit = environment.get("REMEM_API_KEY", "")
-    primary_override = (
-        explicit.strip() if isinstance(explicit, str) else ""
-    )
     return remem_api.normalize_api_origin(
         api_url,
-        allow_local_dev=bool(
-            connection.id == "primary"
-            and primary_override
-            and _local_dev_enabled(environment)
+        allow_local_dev=_local_dev_allowed_for_connection(
+            connection,
+            environment,
         ),
     )
 
@@ -582,6 +620,10 @@ def _run_manual_routed_command(
                 route_descriptor=descriptor,
                 credential=credential,
                 capture_output=False,
+                allow_local_dev=_local_dev_allowed_for_connection(
+                    connection,
+                    parent_environment,
+                ),
             )
         except Exception:
             print(
@@ -675,6 +717,10 @@ def _run_manual_routed_command(
                 route_descriptor=descriptor,
                 credential=credential,
                 capture_output=True,
+                allow_local_dev=_local_dev_allowed_for_connection(
+                    connection,
+                    parent_environment,
+                ),
             )
         except Exception:
             continue
@@ -763,11 +809,17 @@ def _run_inherited_descriptor_command(
 
     route_present = _ROUTE_FD_ENV in parent_environment
     credential_present = _CREDENTIAL_FD_ENV in parent_environment
-    if not route_present and not credential_present:
+    local_dev_present = _LOCAL_DEV_FD_ENV in parent_environment
+    if (
+        not route_present
+        and not credential_present
+        and not local_dev_present
+    ):
         return None
 
     credential: Optional[str] = None
     route: Optional[dict[str, Any]] = None
+    allow_local_dev = False
     valid = True
     if credential_present:
         credential_environment = {
@@ -781,10 +833,16 @@ def _run_inherited_descriptor_command(
         )
         valid = bool(credential)
 
+    manual_command = command in {"checkpoint", "rollup", "recall"}
+    if manual_command and not (route_present and credential_present):
+        valid = False
+    if command == "codex" and (route_present or local_dev_present):
+        valid = False
+
     if route_present:
         client = _forwarded_option(forwarded_args, "--client") or "codex"
         behavior = "recall" if command == "recall" else "sessions"
-        if command not in {"checkpoint", "rollup", "recall"}:
+        if not manual_command:
             valid = False
             client = "codex"
         try:
@@ -805,6 +863,14 @@ def _run_inherited_descriptor_command(
             )
         except Exception:
             valid = False
+    if local_dev_present:
+        try:
+            allow_local_dev = _consume_local_dev_capability(
+                parent_environment,
+                route or {},
+            )
+        except Exception:
+            valid = False
     if not valid:
         print("error: invalid inherited descriptor", file=sys.stderr)
         return 1
@@ -815,14 +881,10 @@ def _run_inherited_descriptor_command(
         or _DEFAULT_API_URL
     )
     if route is not None:
-        validation_environment = dict(parent_environment)
-        if credential and route["connection_id"] == "primary":
-            validation_environment["REMEM_API_KEY"] = credential
         try:
-            configured_api_url = _normalize_origin_for_connection(
+            configured_api_url = remem_api.normalize_api_origin(
                 configured_api_url,
-                connection,
-                validation_environment,
+                allow_local_dev=allow_local_dev,
             )
         except Exception:
             print("error: invalid Remem API URL", file=sys.stderr)
@@ -836,6 +898,7 @@ def _run_inherited_descriptor_command(
     sanitized.pop("REMEM_API_KEY", None)
     sanitized.pop(_ROUTE_FD_ENV, None)
     sanitized.pop(_CREDENTIAL_FD_ENV, None)
+    sanitized.pop(_LOCAL_DEV_FD_ENV, None)
     sanitized.pop(_RUNTIME_ENV_FD, None)
     if command == "codex":
         child_environment = sanitized
@@ -864,6 +927,12 @@ def _run_inherited_descriptor_command(
                 credential.encode("utf-8")
             )
             child_environment[_CREDENTIAL_FD_ENV] = str(descriptor)
+            descriptors.append(descriptor)
+        if allow_local_dev and route is not None:
+            descriptor = _write_anonymous_payload(
+                _local_dev_capability_payload(route)
+            )
+            child_environment[_LOCAL_DEV_FD_ENV] = str(descriptor)
             descriptors.append(descriptor)
         result = subprocess.run(
             [

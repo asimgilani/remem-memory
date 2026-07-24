@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -12,7 +14,7 @@ import sys
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, MutableMapping
+from typing import Any, Mapping, MutableMapping
 
 _PLUGIN_SCRIPTS = (
     Path(__file__).resolve().parents[1]
@@ -29,7 +31,9 @@ _SOURCE_CHOICES = ("api", "quick_capture", "folder_sync", "gmail")
 _KIND_CHOICES = ("interval", "milestone", "final", "manual")
 _DEFAULT_API_URL = "https://api.remem.io"
 _ROUTE_FD_ENV = "REMEM_MEMORY_ROUTE_FD"
+_LOCAL_DEV_FD_ENV = "REMEM_MEMORY_LOCAL_DEV_FD"
 _MAX_ROUTE_DESCRIPTOR_BYTES = 4096
+_MAX_LOCAL_DEV_CAPABILITY_BYTES = 512
 _ROUTE_FIELDS = frozenset(
     (
         "schema_version",
@@ -42,6 +46,7 @@ _ROUTE_FIELDS = frozenset(
     )
 )
 _CONNECTION_ID = re.compile(r"conn_[0-9a-f]{32}\Z")
+_ROUTE_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _slug(value: str) -> str:
@@ -169,6 +174,103 @@ def _consume_route_descriptor(
     ):
         raise ValueError("invalid route descriptor")
     return parsed
+
+
+def _route_descriptor_digest(route: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(route),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _local_dev_capability_payload(
+    route: Mapping[str, Any],
+) -> bytes:
+    """Build a non-secret capability bound to one exact primary route."""
+
+    if route.get("connection_id") != "primary":
+        raise ValueError("invalid local development capability")
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "route_sha256": _route_descriptor_digest(route),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _consume_local_dev_capability(
+    environment: MutableMapping[str, str],
+    route: Mapping[str, Any],
+) -> bool:
+    """Consume a bounded one-use capability for an exact primary route."""
+
+    raw_descriptor = environment.pop(_LOCAL_DEV_FD_ENV, None)
+    if raw_descriptor is None:
+        return False
+    if (
+        not isinstance(raw_descriptor, str)
+        or not raw_descriptor.isdigit()
+        or int(raw_descriptor) < 3
+    ):
+        raise ValueError("invalid local development capability")
+    descriptor = int(raw_descriptor)
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total <= _MAX_LOCAL_DEV_CAPABILITY_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    512,
+                    _MAX_LOCAL_DEV_CAPABILITY_BYTES + 1 - total,
+                ),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        raise ValueError("invalid local development capability") from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    raw = b"".join(chunks)
+    if not raw or len(raw) > _MAX_LOCAL_DEV_CAPABILITY_BYTES:
+        raise ValueError("invalid local development capability")
+    try:
+        parsed = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, ValueError, TypeError):
+        raise ValueError("invalid local development capability") from None
+    digest = parsed.get("route_sha256") if isinstance(parsed, dict) else None
+    if (
+        not isinstance(parsed, dict)
+        or frozenset(parsed) != {
+            "schema_version",
+            "route_sha256",
+        }
+        or type(parsed["schema_version"]) is not int
+        or parsed["schema_version"] != 1
+        or not isinstance(digest, str)
+        or _ROUTE_DIGEST.fullmatch(digest) is None
+        or route.get("connection_id") != "primary"
+        or not hmac.compare_digest(
+            digest,
+            _route_descriptor_digest(route),
+        )
+    ):
+        raise ValueError("invalid local development capability")
+    return True
 
 
 def _git_branch(repo_root: str) -> str | None:
@@ -386,14 +488,25 @@ def main(argv: list[str] | None = None) -> int:
                     expected_client=args.client,
                     expected_behavior="sessions",
                 )
+                allow_local_dev = _consume_local_dev_capability(
+                    os.environ,
+                    route,
+                )
                 api_url = remem_api.normalize_api_origin(
                     args.api_url,
-                    allow_local_dev=True,
+                    allow_local_dev=allow_local_dev,
                 )
                 api_key = remem_api.consume_explicit_api_key(os.environ)
             except Exception:
                 print("error: invalid route descriptor", file=sys.stderr)
                 return 1
+        elif _LOCAL_DEV_FD_ENV in os.environ:
+            try:
+                _consume_local_dev_capability(os.environ, {})
+            except Exception:
+                pass
+            print("error: invalid route descriptor", file=sys.stderr)
+            return 1
         else:
             try:
                 api_url, api_key = remem_api.resolve_api_access(
