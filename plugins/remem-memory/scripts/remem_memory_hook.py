@@ -1458,19 +1458,20 @@ def _enqueue_background(
     store: BackgroundQueueStore,
     session_id: str,
     new_events: list[dict[str, Any]],
-) -> bool:
+) -> tuple[str, ...] | None:
     with store.locked(session_id):
         events = store.load(session_id)
         normalized_new = _normalize_background_queue(new_events)
         if len(normalized_new) != len(new_events):
-            return False
+            return None
         if len(events) + len(normalized_new) > _MAX_BACKGROUND_QUEUE:
-            return False
+            return None
+        queued = [*events, *normalized_new]
         try:
-            store.save(session_id, [*events, *normalized_new])
+            store.save(session_id, queued)
         except Exception:
-            return False
-    return True
+            return None
+    return tuple(event["connection_id"] for event in queued)
 
 
 def _background_event(
@@ -1873,11 +1874,12 @@ def _spawn_background(
     if not new_events:
         return output
     queue = BackgroundQueueStore(dependencies.state_dir)
-    if not _enqueue_background(
+    queued_connections = _enqueue_background(
         queue,
         session_id,
         new_events,
-    ):
+    )
+    if queued_connections is None:
         return output
 
     environment = _worker_environment(
@@ -1885,7 +1887,11 @@ def _spawn_background(
         harness,
         summaries_allowed=not current["off_record_seen"],
     )
-    credential = os.environ.get("REMEM_API_KEY", "").strip()
+    credential = (
+        os.environ.get("REMEM_API_KEY", "").strip()
+        if "primary" in queued_connections
+        else ""
+    )
     descriptor: int | None = None
     try:
         if credential:

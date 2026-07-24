@@ -3600,6 +3600,142 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertNotIn(canary, json.dumps(observed["arguments"]))
         self.assertNotIn(canary, json.dumps(worker_environment))
 
+    def test_dispatcher_selects_primary_override_from_entire_queued_batch(
+        self,
+    ) -> None:
+        canary = "vlt_primary-batch-canary"
+        secondary_hex = "4" * 32
+        secondary = _ROUTING.Connection(
+            f"conn_{secondary_hex}",
+            "Sessions",
+            f"connection:{secondary_hex}",
+            True,
+        )
+        config = routing_config(
+            connections=(
+                _ROUTING.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                secondary,
+            ),
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "durable-memory"),
+                ),
+                "sessions": (
+                    _ROUTING.RouteTarget(
+                        secondary.id,
+                        "session-history",
+                    ),
+                ),
+            },
+            revision=12,
+        )
+
+        for existing_primary, expected_fds in ((False, 0), (True, 1)):
+            with self.subTest(existing_primary=existing_primary):
+                launches = []
+
+                def launch(arguments, **kwargs):
+                    del arguments
+                    launches.append(
+                        (
+                            dict(kwargs["env"]),
+                            tuple(kwargs["pass_fds"]),
+                        )
+                    )
+                    process = mock.Mock()
+                    process.stdin = mock.Mock()
+                    return process
+
+                with tempfile.TemporaryDirectory() as directory:
+                    if existing_primary:
+                        payload = _HOOK._background_payload(
+                            {
+                                "hook_event_name": "Stop",
+                                "session_id": "s1",
+                                "turn_id": "t1",
+                                "last_assistant_message": "Saved.",
+                                "_turn_state": {
+                                    "current_prompt": "Remember this.",
+                                    "turn_id": "t1",
+                                    "off_record": False,
+                                    "off_record_seen": False,
+                                },
+                            },
+                            "stop",
+                        )
+                        assert payload is not None
+                        event = _HOOK._background_event(
+                            client="codex",
+                            behavior="memory",
+                            lifecycle_mode="stop",
+                            target=_ROUTING.RouteTarget(
+                                "primary",
+                                "durable-memory",
+                            ),
+                            route_revision=12,
+                            session_id="s1",
+                            payload=payload,
+                            off_record_seen=False,
+                        )
+                        assert event is not None
+                        _HOOK.BackgroundQueueStore(
+                            Path(directory)
+                        ).save("s1", [event])
+
+                    dependencies = self._dependencies(
+                        directory,
+                        None,
+                        background_writes=True,
+                        routing_resolver=routed(config),
+                    )
+                    with mock.patch.dict(
+                        os.environ,
+                        {"REMEM_API_KEY": canary},
+                        clear=False,
+                    ):
+                        with mock.patch.object(
+                            _HOOK.subprocess,
+                            "Popen",
+                            side_effect=launch,
+                        ):
+                            _HOOK.handle_event(
+                                {
+                                    "hook_event_name": "PostToolUse",
+                                    "session_id": "s1",
+                                    "tool_name": "Write",
+                                },
+                                harness="codex",
+                                mode="post_tool_use",
+                                dependencies=dependencies,
+                            )
+
+                    queued = _HOOK.BackgroundQueueStore(
+                        Path(directory)
+                    ).load("s1")
+
+                self.assertEqual(len(launches), 1)
+                environment, descriptors = launches[0]
+                self.assertNotIn("REMEM_API_KEY", environment)
+                self.assertEqual(len(descriptors), expected_fds)
+                self.assertEqual(
+                    "REMEM_API_KEY_FD" in environment,
+                    bool(expected_fds),
+                )
+                self.assertEqual(
+                    {event["connection_id"] for event in queued},
+                    (
+                        {"primary", secondary.id}
+                        if existing_primary
+                        else {secondary.id}
+                    ),
+                )
+                self.assertNotIn(canary, json.dumps(environment))
+
     def test_worker_drain_consumes_primary_override_into_local_state(
         self,
     ) -> None:
