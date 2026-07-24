@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _PLUGIN_SCRIPTS = (
     Path(__file__).resolve().parents[1]
@@ -1313,6 +1313,7 @@ def _run_checkpoint(
     next_actions: list[str],
     credential: str | None = None,
     namespace: str | None = None,
+    pre_ingest_check: Callable[[], bool] | None = None,
 ) -> bool:
     if contains_explicit_secret(str(cwd)):
         return False
@@ -1377,6 +1378,11 @@ def _run_checkpoint(
             }
             if namespace is not None:
                 ingest_options["namespace"] = namespace
+            if (
+                pre_ingest_check is not None
+                and not pre_ingest_check()
+            ):
+                return False
             response = helper.ingest_checkpoint(**ingest_options)
         record: dict[str, Any] = {
             "timestamp": helper._utc_now_iso(),
@@ -1401,6 +1407,7 @@ def _run_rollup(
     dry_run: bool,
     credential: str | None = None,
     namespace: str | None = None,
+    pre_ingest_check: Callable[[], bool] | None = None,
 ) -> bool:
     if contains_explicit_secret(str(cwd)):
         return False
@@ -1453,6 +1460,11 @@ def _run_rollup(
             }
             if namespace is not None:
                 ingest_options["namespace"] = namespace
+            if (
+                pre_ingest_check is not None
+                and not pre_ingest_check()
+            ):
+                return False
             response = helper.ingest_checkpoint(**ingest_options)
         helper.append_checkpoint_log(
             log_file,
@@ -1599,6 +1611,21 @@ def main(argv: list[str] | None = None) -> int:
             primary_override=primary_override,
             api_url=api_url,
         )
+
+    def live_ingest_validator(
+        expected: SessionsRouteSnapshot,
+    ) -> Callable[[], bool]:
+        def validate() -> bool:
+            gate = refresh_engineering_gate()
+            if not gate.writes_allowed:
+                return False
+            live = resolve_live_route()
+            return bool(
+                live is not None
+                and _same_sessions_route(expected, live)
+            )
+
+        return validate
 
     in_git_repo = _is_git_repo(cwd, safe_environment)
     summary_enabled = _summary_enabled(resolved_codex)
@@ -1799,6 +1826,11 @@ def main(argv: list[str] | None = None) -> int:
                 if route_final is not None
                 else None
             ),
+            pre_ingest_check=(
+                live_ingest_validator(route_final)
+                if route_final is not None
+                else None
+            ),
         )
         if ok:
             with lock:
@@ -1927,6 +1959,11 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     namespace=(
                         rollup_route_final.write_namespace
+                        if rollup_route_final is not None
+                        else None
+                    ),
+                    pre_ingest_check=(
+                        live_ingest_validator(rollup_route_final)
                         if rollup_route_final is not None
                         else None
                     ),

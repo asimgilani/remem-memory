@@ -30,6 +30,8 @@ class CodexWrapperTests(unittest.TestCase):
         summary_enabled=False,
         ingest=False,
         checkpoint_on_start=True,
+        real_checkpoint=False,
+        real_rollup=False,
     ):
         class FakeChild:
             def __init__(self, environment):
@@ -46,8 +48,16 @@ class CodexWrapperTests(unittest.TestCase):
                     on_wait(self.environment)
                 return 0
 
-        checkpoint = mock.Mock(return_value=True)
-        rollup = mock.Mock(return_value=True)
+        checkpoint = (
+            mock.Mock(wraps=_MODULE._run_checkpoint)
+            if real_checkpoint
+            else mock.Mock(return_value=True)
+        )
+        rollup = (
+            mock.Mock(wraps=_MODULE._run_rollup)
+            if real_rollup
+            else mock.Mock(return_value=True)
+        )
 
         def launch(_command, **kwargs):
             return FakeChild(dict(kwargs["env"]))
@@ -637,6 +647,227 @@ class CodexWrapperTests(unittest.TestCase):
                 else:
                     checkpoint.assert_called_once()
                 rollup.assert_not_called()
+
+    def _assert_late_helper_mutation_is_rejected(
+        self,
+        *,
+        phase: str,
+        mutation: str,
+        blocker: str,
+        expect_rejected: bool = True,
+    ) -> None:
+        initial = _MODULE.SessionsRouteSnapshot(
+            route_revision=3,
+            connection_id="primary",
+            write_namespace=None,
+            credential="vlt_initial-canary",
+        )
+        control = {
+            "mode_auto": True,
+            "off_record": False,
+        }
+        route = {"current": initial}
+        mutated = False
+
+        def apply_mutation() -> None:
+            nonlocal mutated
+            if mutated:
+                return
+            mutated = True
+            if mutation == "revision":
+                route["current"] = _MODULE.SessionsRouteSnapshot(
+                    route_revision=4,
+                    connection_id="primary",
+                    write_namespace=None,
+                    credential="vlt_initial-canary",
+                )
+            elif mutation == "target":
+                route["current"] = _MODULE.SessionsRouteSnapshot(
+                    route_revision=3,
+                    connection_id="conn_" + ("d" * 32),
+                    write_namespace="sessions",
+                    credential="vlt_initial-canary",
+                )
+            elif mutation == "credential":
+                route["current"] = _MODULE.SessionsRouteSnapshot(
+                    route_revision=3,
+                    connection_id="primary",
+                    write_namespace=None,
+                    credential="vlt_changed-canary",
+                )
+            elif mutation == "mode":
+                control["mode_auto"] = False
+            elif mutation == "off_record":
+                control["off_record"] = True
+            elif mutation != "none":
+                self.fail(f"unsupported mutation: {mutation}")
+
+        helper = mock.Mock()
+        helper._utc_now_iso.return_value = (
+            "2026-07-24T00:00:00+00:00"
+        )
+        checkpoint_payload = {
+            "title": "Safe checkpoint",
+            "content": "Safe summary.",
+            "metadata": {},
+            "source": "quick_capture",
+            "source_id": "checkpoint:safe",
+            "source_path": str(Path.cwd()),
+            "mime_type": "text/markdown",
+            "return_id": False,
+        }
+        rollup_payload = {
+            "title": "Safe rollup",
+            "content": "Safe rollup summary.",
+            "metadata": {},
+            "source": "quick_capture",
+            "source_id": "rollup:safe",
+            "source_path": str(Path.cwd()),
+            "mime_type": "text/markdown",
+            "return_id": False,
+        }
+
+        def build_checkpoint_payload(_args):
+            if blocker == "payload":
+                apply_mutation()
+            return checkpoint_payload
+
+        def load_checkpoint_log(_path):
+            if blocker == "log":
+                apply_mutation()
+            return []
+
+        helper.build_checkpoint_payload.side_effect = (
+            build_checkpoint_payload
+        )
+        helper.load_checkpoint_log.side_effect = load_checkpoint_log
+        helper.filter_records.return_value = []
+        helper.build_rollup_payload.return_value = rollup_payload
+
+        def load_helper(_name):
+            if blocker == "module":
+                apply_mutation()
+            return helper
+
+        def current_branch(_cwd, _environment):
+            if blocker == "git":
+                apply_mutation()
+            return "main"
+
+        def engineering_control(_session_id):
+            return _MODULE.EngineeringControl(
+                mode_auto=control["mode_auto"],
+                off_record=control["off_record"],
+                off_record_seen=control["off_record"],
+                state_available=True,
+            )
+
+        def suppress_exit_checkpoint(_environment):
+            if phase == "checkpoint":
+                control["mode_auto"] = False
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                _MODULE,
+                "_load_helper_module",
+                side_effect=load_helper,
+            ):
+                with mock.patch.object(
+                    _MODULE,
+                    "_current_branch",
+                    side_effect=current_branch,
+                ):
+                    with mock.patch.object(
+                        _MODULE,
+                        "_engineering_control",
+                        side_effect=engineering_control,
+                    ):
+                        with mock.patch.object(
+                            _MODULE,
+                            "_resolve_live_sessions_route",
+                            side_effect=lambda *_args, **_kwargs: route[
+                                "current"
+                            ],
+                        ):
+                            result, checkpoint, rollup, popen = (
+                                self._run_wrapper_main(
+                                    directory,
+                                    on_wait=suppress_exit_checkpoint,
+                                    ingest=True,
+                                    checkpoint_on_start=(
+                                        phase == "checkpoint"
+                                    ),
+                                    real_checkpoint=(
+                                        phase == "checkpoint"
+                                    ),
+                                    real_rollup=(phase == "rollup"),
+                                )
+                            )
+
+        self.assertEqual(result, 0)
+        popen.assert_called_once()
+        if expect_rejected:
+            self.assertTrue(mutated)
+            helper.ingest_checkpoint.assert_not_called()
+            helper.append_checkpoint_log.assert_not_called()
+        else:
+            self.assertFalse(mutated)
+            helper.ingest_checkpoint.assert_called_once()
+            helper.append_checkpoint_log.assert_called_once()
+        if phase == "checkpoint":
+            checkpoint.assert_called_once()
+            rollup.assert_not_called()
+        else:
+            checkpoint.assert_called_once()
+            rollup.assert_called_once()
+
+    def test_checkpoint_revalidates_after_internal_blocking_work(
+        self,
+    ) -> None:
+        self._assert_late_helper_mutation_is_rejected(
+            phase="checkpoint",
+            mutation="none",
+            blocker="none",
+            expect_rejected=False,
+        )
+        cases = (
+            ("revision", "module"),
+            ("target", "git"),
+            ("credential", "payload"),
+            ("mode", "git"),
+            ("off_record", "payload"),
+        )
+        for mutation, blocker in cases:
+            with self.subTest(mutation=mutation, blocker=blocker):
+                self._assert_late_helper_mutation_is_rejected(
+                    phase="checkpoint",
+                    mutation=mutation,
+                    blocker=blocker,
+                )
+
+    def test_rollup_revalidates_after_internal_blocking_work(
+        self,
+    ) -> None:
+        self._assert_late_helper_mutation_is_rejected(
+            phase="rollup",
+            mutation="none",
+            blocker="none",
+            expect_rejected=False,
+        )
+        cases = (
+            ("revision", "module"),
+            ("target", "log"),
+            ("credential", "log"),
+            ("mode", "module"),
+            ("off_record", "log"),
+        )
+        for mutation, blocker in cases:
+            with self.subTest(mutation=mutation, blocker=blocker):
+                self._assert_late_helper_mutation_is_rejected(
+                    phase="rollup",
+                    mutation=mutation,
+                    blocker=blocker,
+                )
 
     def test_wrapper_startup_off_and_recall_only_skip_all_engineering(
         self,
