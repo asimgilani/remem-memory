@@ -1,11 +1,13 @@
 import importlib
 import json
+import multiprocessing
 import stat
 import sys
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 
 _SCRIPTS = (
@@ -45,6 +47,10 @@ def routing_config(
         migration_write_blocked=False,
         deprecations=(),
     )
+
+
+def _concurrent_noop_update(data_dir: str) -> None:
+    remem_routing.update_routing(lambda config: config, Path(data_dir))
 
 
 class RoutingResolutionTests(unittest.TestCase):
@@ -169,6 +175,27 @@ class RoutingValidationTests(unittest.TestCase):
 
 
 class RoutingStorageTests(unittest.TestCase):
+    def test_loaded_configuration_mappings_cannot_be_mutated_in_place(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_routing.store_routing(
+                routing_config(
+                    global_routes={"memory": (target("primary", "default"),)},
+                    client_routes={"claude": {"sessions": ()}},
+                    mcp_connections={"claude": "primary"},
+                ),
+                data_dir,
+            )
+            loaded = remem_routing.load_routing(data_dir)
+
+            with self.assertRaises(TypeError):
+                loaded.global_routes.routes["memory"] = ()
+            with self.assertRaises(TypeError):
+                loaded.client_routes["codex"] = remem_routing.RouteLayer({})
+            with self.assertRaises(TypeError):
+                loaded.mcp_connections["codex"] = "primary"
+            self.assertEqual(0, remem_routing.load_routing(data_dir).revision)
+
     def test_store_writes_deterministic_private_json(self):
         config = routing_config(
             global_routes={"recall": (target("primary", "project-a"),)},
@@ -221,6 +248,25 @@ class RoutingStorageTests(unittest.TestCase):
             self.assertEqual(1, updated.revision)
             self.assertEqual(updated, remem_routing.load_routing(data_dir))
 
+    def test_concurrent_updates_preserve_every_revision_increment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_routing.store_routing(routing_config(), data_dir)
+            workers = [
+                multiprocessing.Process(
+                    target=_concurrent_noop_update,
+                    args=(str(data_dir),),
+                )
+                for _ in range(4)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(10)
+                self.assertEqual(0, worker.exitcode)
+
+            self.assertEqual(4, remem_routing.load_routing(data_dir).revision)
+
     def test_load_rejects_oversized_and_partially_written_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -232,6 +278,77 @@ class RoutingStorageTests(unittest.TestCase):
             route_path.write_text('{"schema_version":', encoding="utf-8")
             with self.assertRaises(ValueError):
                 remem_routing.load_routing(data_dir)
+
+    def test_load_rejects_duplicate_configuration_object_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            remem_routing.store_routing(routing_config(), data_dir)
+            encoded = (data_dir / "routes.json").read_text(encoding="utf-8")
+            duplicate = '{"schema_version":1,"schema_version":1,' + encoded[1:]
+            (data_dir / "routes.json").write_text(duplicate, encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                remem_routing.load_routing(data_dir)
+
+    def test_load_rejects_schema_mismatch_and_unknown_route_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            config = routing_config()
+            remem_routing.store_routing(config, data_dir)
+            route_path = data_dir / "routes.json"
+            encoded = json.loads(route_path.read_text(encoding="utf-8"))
+            encoded["schema_version"] = 2
+            route_path.write_text(json.dumps(encoded), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                remem_routing.load_routing(data_dir)
+
+            remem_routing.store_routing(config, data_dir)
+            encoded = json.loads(route_path.read_text(encoding="utf-8"))
+            encoded["global_routes"] = {
+                "memory": [
+                    {
+                        "connection_id": "conn_0123456789abcdef0123456789abcdef",
+                        "namespace": "default",
+                    }
+                ]
+            }
+            route_path.write_text(json.dumps(encoded), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                remem_routing.load_routing(data_dir)
+
+    def test_load_refuses_a_routing_file_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "state"
+            target_path = Path(directory) / "outside.json"
+            target_path.write_text("{}", encoding="utf-8")
+            data_dir.mkdir(mode=0o700)
+            (data_dir / "routes.json").symlink_to(target_path)
+
+            with self.assertRaises(ValueError):
+                remem_routing.load_routing(data_dir)
+
+    def test_atomic_store_never_chmods_a_path_swapped_for_a_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "state"
+            outside = Path(directory) / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            outside.chmod(0o644)
+            real_replace = remem_routing.os.replace
+
+            def replace_then_swap(source, destination):
+                real_replace(source, destination)
+                Path(destination).unlink()
+                Path(destination).symlink_to(outside)
+
+            with mock.patch.object(
+                remem_routing.os,
+                "replace",
+                side_effect=replace_then_swap,
+            ):
+                remem_routing.store_routing(routing_config(), data_dir)
+
+            self.assertEqual(0o644, stat.S_IMODE(outside.stat().st_mode))
+            self.assertTrue((data_dir / "routes.json").is_symlink())
 
 
 class RouteHealthStorageTests(unittest.TestCase):
@@ -276,6 +393,115 @@ class RouteHealthStorageTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 remem_routing.record_route_health(unsafe, data_dir)
+
+    def test_health_load_rejects_duplicate_object_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            health_path = data_dir / "route-health.json"
+            health_path.write_text(
+                """[{"client":"codex","client":"claude","behavior":"recall","connection_id":"primary","namespace":"@readable","status":"ok","detail_code":"ok","observed_at":"2026-07-24T12:34:56Z"}]""",
+                encoding="utf-8",
+            )
+            health_path.chmod(0o600)
+
+            with self.assertRaises(ValueError):
+                remem_routing.load_route_health(data_dir)
+
+
+class RoutingLimitsTests(unittest.TestCase):
+    def test_store_rejects_more_than_sixteen_connections(self):
+        connections = [
+            remem_routing.Connection("primary", "Primary", "default", True)
+        ]
+        for index in range(16):
+            token = f"{index:032x}"
+            connections.append(
+                remem_routing.Connection(
+                    f"conn_{token}",
+                    f"Connection {index}",
+                    f"connection:{token}",
+                    True,
+                )
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                remem_routing.store_routing(
+                    routing_config(connections=connections), Path(directory)
+                )
+
+    def test_store_rejects_more_than_sixteen_recall_targets(self):
+        config = routing_config(
+            global_routes={
+                "recall": tuple(
+                    target("primary", f"namespace-{index}")
+                    for index in range(17)
+                )
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                remem_routing.store_routing(config, Path(directory))
+
+    def test_store_rejects_out_of_range_labels_and_control_namespaces(self):
+        named_id = "conn_0123456789abcdef0123456789abcdef"
+        cases = (
+            routing_config(
+                connections=(
+                    remem_routing.Connection("primary", "Primary", "default", True),
+                    remem_routing.Connection(
+                        named_id,
+                        "",
+                        "connection:0123456789abcdef0123456789abcdef",
+                        True,
+                    ),
+                )
+            ),
+            routing_config(
+                connections=(
+                    remem_routing.Connection("primary", "Primary", "default", True),
+                    remem_routing.Connection(
+                        named_id,
+                        "x" * 65,
+                        "connection:0123456789abcdef0123456789abcdef",
+                        True,
+                    ),
+                )
+            ),
+            routing_config(
+                global_routes={"memory": (target("primary", "x" * 101),)}
+            ),
+            routing_config(
+                global_routes={"memory": (target("primary", "bad\u0085name"),)}
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for config in cases:
+                with self.subTest(config=config):
+                    with self.assertRaises(ValueError):
+                        remem_routing.store_routing(config, Path(directory))
+
+    def test_store_rejects_unknown_clients_behaviors_and_bad_connection_pairing(self):
+        named_id = "conn_0123456789abcdef0123456789abcdef"
+        cases = (
+            routing_config(global_routes={"unknown": ()}),
+            routing_config(client_routes={"unknown": {"memory": ()}}),
+            routing_config(
+                connections=(
+                    remem_routing.Connection("primary", "Primary", "default", True),
+                    remem_routing.Connection(
+                        named_id,
+                        "Named",
+                        "connection:ffffffffffffffffffffffffffffffff",
+                        True,
+                    ),
+                )
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for config in cases:
+                with self.subTest(config=config):
+                    with self.assertRaises(ValueError):
+                        remem_routing.store_routing(config, Path(directory))
 
 
 class DefaultRoutesTests(unittest.TestCase):

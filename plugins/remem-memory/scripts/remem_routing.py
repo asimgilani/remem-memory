@@ -7,11 +7,13 @@ import os
 import re
 import stat
 import tempfile
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal, Mapping
+from types import MappingProxyType
 
 try:
     import fcntl
@@ -64,6 +66,9 @@ class RouteTarget:
 class RouteLayer:
     routes: Mapping[str, tuple[RouteTarget, ...]]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "routes", MappingProxyType(dict(self.routes)))
+
 
 @dataclass(frozen=True)
 class RoutingConfig:
@@ -76,6 +81,20 @@ class RoutingConfig:
     legacy_namespace_migration_completed: bool
     migration_write_blocked: bool
     deprecations: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "connections", tuple(self.connections))
+        object.__setattr__(
+            self,
+            "client_routes",
+            MappingProxyType(dict(self.client_routes)),
+        )
+        object.__setattr__(
+            self,
+            "mcp_connections",
+            MappingProxyType(dict(self.mcp_connections)),
+        )
+        object.__setattr__(self, "deprecations", tuple(self.deprecations))
 
 
 @dataclass(frozen=True)
@@ -118,11 +137,13 @@ def _primary_connection() -> Connection:
 
 
 def built_in_routes() -> Mapping[str, tuple[RouteTarget, ...]]:
-    return {
-        "recall": (RouteTarget("primary", "@readable"),),
-        "memory": (RouteTarget("primary", "@default"),),
-        "sessions": (RouteTarget("primary", "@default"),),
-    }
+    return MappingProxyType(
+        {
+            "recall": (RouteTarget("primary", "@readable"),),
+            "memory": (RouteTarget("primary", "@default"),),
+            "sessions": (RouteTarget("primary", "@default"),),
+        }
+    )
 
 
 def _empty_config() -> RoutingConfig:
@@ -174,7 +195,7 @@ def _validate_namespace(value: object, *, behavior: str) -> str:
         if behavior not in {"memory", "sessions"}:
             raise ValueError("@default is valid only for writes")
         return value
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if any(unicodedata.category(character) == "Cc" for character in value):
         raise ValueError("Invalid routing namespace")
     return value
 
@@ -363,15 +384,32 @@ def use_default_routes(config: RoutingConfig) -> RoutingConfig:
 def _ensure_data_dir(data_dir: Path) -> None:
     try:
         data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        metadata = data_dir.lstat()
     except OSError as error:
         raise ValueError("Routing storage is unavailable") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("Routing storage must not be a symlink")
+    descriptor = _open_directory(data_dir)
     try:
-        os.chmod(data_dir, 0o700)
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+
+
+def _open_directory(data_dir: Path) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(data_dir, flags)
     except OSError as error:
         raise ValueError("Routing storage is unavailable") from error
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError("Routing storage must be a directory")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def _secure_file_path(data_dir: Path, filename: str) -> Path:
@@ -438,8 +476,7 @@ def _atomic_write(data_dir: Path, filename: str, content: bytes) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         temporary = ""
-        os.chmod(path, 0o600)
-        directory_descriptor = os.open(data_dir, os.O_RDONLY)
+        directory_descriptor = _open_directory(data_dir)
         try:
             os.fsync(directory_descriptor)
         finally:
@@ -622,12 +659,30 @@ def _encode(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _reject_duplicate_object_names(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    object_value: dict[str, object] = {}
+    for key, value in pairs:
+        if key in object_value:
+            raise ValueError("Duplicate JSON object name")
+        object_value[key] = value
+    return object_value
+
+
+def _decode_json(content: bytes) -> object:
+    return json.loads(
+        content.decode("utf-8"),
+        object_pairs_hook=_reject_duplicate_object_names,
+    )
+
+
 def load_routing(data_dir: Path | None = None) -> RoutingConfig:
     selected = _selected_data_dir(data_dir)
     _ensure_data_dir(selected)
     try:
         content = _read_bounded(selected, _ROUTES_FILE, _MAX_CONFIG_BYTES)
-        decoded = json.loads(content.decode("utf-8"))
+        decoded = _decode_json(content)
     except FileNotFoundError:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
@@ -777,7 +832,7 @@ def load_route_health(data_dir: Path | None = None) -> tuple[RouteHealthRecord, 
     except FileNotFoundError:
         return ()
     try:
-        decoded = json.loads(content.decode("utf-8"))
+        decoded = _decode_json(content)
         if not isinstance(decoded, list) or len(decoded) > _MAX_HEALTH_RECORDS:
             raise ValueError("Invalid route health storage")
         return tuple(_data_to_health(item) for item in decoded)
