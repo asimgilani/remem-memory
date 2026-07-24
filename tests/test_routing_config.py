@@ -619,6 +619,63 @@ class LegacyNamespaceMigrationTests(unittest.TestCase):
         self.assertTrue(first.legacy_namespace_migration_completed)
         self.assertFalse(outcome.initialized)
 
+    def test_existing_unmigrated_configuration_is_migrated_once(self):
+        original = routing_config(
+            global_routes={"recall": (target("primary", "shared"),)},
+            client_routes={"claude": {"memory": ()}},
+            mcp_connections={"claude": "primary"},
+        )
+        remem_routing.store_routing(original, self.data_dir)
+
+        migrated, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {
+                "REMEM_MEMORY_PERSONAL_NAMESPACE": "personal",
+                "REMEM_MEMORY_ENGINEERING_NAMESPACE": "engineering",
+            },
+        )
+        repeated, repeated_outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "changed"},
+        )
+
+        self.assertTrue(migrated.legacy_namespace_migration_completed)
+        self.assertFalse(outcome.initialized)
+        self.assertEqual(
+            (target("primary", "shared"),),
+            migrated.global_routes.routes["recall"],
+        )
+        self.assertEqual(original.client_routes, migrated.client_routes)
+        self.assertEqual(original.mcp_connections, migrated.mcp_connections)
+        self.assertEqual(
+            (target("primary", "personal"),),
+            migrated.global_routes.routes["memory"],
+        )
+        self.assertEqual(
+            (target("primary", "engineering"),),
+            migrated.global_routes.routes["sessions"],
+        )
+        self.assertEqual(migrated, remem_routing.load_routing(self.data_dir))
+        self.assertEqual(migrated, repeated)
+        self.assertFalse(repeated_outcome.initialized)
+
+    def test_existing_completed_configuration_is_an_immediate_no_op(self):
+        completed = replace(
+            routing_config(
+                global_routes={"memory": (target("primary", "saved"),)}
+            ),
+            legacy_namespace_migration_completed=True,
+        )
+        remem_routing.store_routing(completed, self.data_dir)
+
+        loaded, outcome = remem_routing.initialize_routing(
+            self.data_dir,
+            {"REMEM_MEMORY_PERSONAL_NAMESPACE": "changed"},
+        )
+
+        self.assertEqual(completed, loaded)
+        self.assertFalse(outcome.initialized)
+
     def test_use_default_does_not_allow_legacy_environment_to_reapply(self):
         original, _ = remem_routing.initialize_routing(
             self.data_dir,
@@ -683,25 +740,73 @@ class LegacyNamespaceMigrationTests(unittest.TestCase):
             ),
         )
 
-    def test_use_default_and_complete_global_routes_unblock_writes(self):
+    def test_client_only_edit_does_not_unblock_imported_ambiguous_routes(self):
+        blocked, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {
+                "REMEM_MEMORY_PERSONAL_NAMESPACE": "personal",
+                "REMEM_MEMORY_ENGINEERING_NAMESPACE": "engineering",
+            },
+            remem_routing.LegacyDiscovery(
+                2,
+                {
+                    "memory": ("personal",),
+                    "sessions": ("engineering",),
+                },
+            ),
+        )
+        self.assertTrue(blocked.migration_write_blocked)
+
+        updated = remem_routing.update_routing(
+            lambda config: replace(
+                config,
+                client_routes={"codex": remem_routing.RouteLayer({"memory": ()})},
+            ),
+            self.data_dir,
+        )
+        self.assertTrue(updated.migration_write_blocked)
+
+    def test_partial_global_edit_does_not_unblock_ambiguity(self):
         blocked, _ = remem_routing.initialize_routing(
             self.data_dir,
             {},
             remem_routing.LegacyDiscovery(2, {}),
         )
-        self.assertTrue(blocked.migration_write_blocked)
 
-        partial = remem_routing.update_routing(
+        updated = remem_routing.update_routing(
             lambda config: replace(
                 config,
-                client_routes={"codex": remem_routing.RouteLayer({"memory": ()})},
                 global_routes=remem_routing.RouteLayer(
                     {"memory": (target("primary", "memory"),)}
                 ),
             ),
             self.data_dir,
         )
-        self.assertTrue(partial.migration_write_blocked)
+
+        self.assertTrue(blocked.migration_write_blocked)
+        self.assertTrue(updated.migration_write_blocked)
+
+    def test_generic_update_cannot_directly_clear_ambiguity_block(self):
+        blocked, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(2, {}),
+        )
+
+        updated = remem_routing.update_routing(
+            lambda config: replace(config, migration_write_blocked=False),
+            self.data_dir,
+        )
+
+        self.assertTrue(blocked.migration_write_blocked)
+        self.assertTrue(updated.migration_write_blocked)
+
+    def test_explicit_complete_global_write_update_unblocks_ambiguity(self):
+        blocked, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(2, {}),
+        )
 
         complete = remem_routing.update_routing(
             lambda config: replace(
@@ -714,8 +819,17 @@ class LegacyNamespaceMigrationTests(unittest.TestCase):
                 ),
             ),
             self.data_dir,
+            resolve_migration_write_block=True,
         )
+        self.assertTrue(blocked.migration_write_blocked)
         self.assertFalse(complete.migration_write_blocked)
+
+    def test_use_default_unblocks_ambiguity(self):
+        blocked, _ = remem_routing.initialize_routing(
+            self.data_dir,
+            {},
+            remem_routing.LegacyDiscovery(2, {}),
+        )
 
         reset = remem_routing.use_default_routes(blocked)
         self.assertFalse(reset.migration_write_blocked)

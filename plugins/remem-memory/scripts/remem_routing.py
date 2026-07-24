@@ -726,17 +726,23 @@ def store_routing(config: RoutingConfig, data_dir: Path | None = None) -> None:
 def update_routing(
     mutator: Callable[[RoutingConfig], RoutingConfig],
     data_dir: Path | None = None,
+    *,
+    resolve_migration_write_block: bool = False,
 ) -> RoutingConfig:
     if not callable(mutator):
         raise ValueError("Routing update must be callable")
+    if type(resolve_migration_write_block) is not bool:
+        raise ValueError("Invalid migration write-block resolution")
     selected = _selected_data_dir(data_dir)
     with _locked(selected, "routes.lock"):
         current = load_routing(selected)
         updated = _validate_config(mutator(current))
-        if updated.migration_write_blocked and _has_explicit_global_write_routes(
-            updated
-        ):
+        if resolve_migration_write_block:
+            if not _has_explicit_global_write_routes(updated):
+                raise ValueError("Global write routes are incomplete")
             updated = replace(updated, migration_write_blocked=False)
+        elif current.migration_write_blocked:
+            updated = replace(updated, migration_write_blocked=True)
         updated = replace(updated, revision=current.revision + 1)
         store_routing(updated, selected)
         return updated
@@ -800,27 +806,38 @@ def _legacy_default_deprecations(environment: Mapping[str, str]) -> tuple[str, .
 def _migrate_legacy_routing(
     discovery: LegacyDiscovery,
     environment: Mapping[str, str],
+    base: RoutingConfig | None = None,
+    *,
+    initialized: bool,
 ) -> tuple[RoutingConfig, MigrationOutcome]:
     checked = _checked_legacy_discovery(discovery)
-    routes: dict[str, tuple[RouteTarget, ...]] = {}
+    prior = _empty_config() if base is None else _validate_config(base)
+    routes = dict(prior.global_routes.routes)
     destination_ambiguous = False
     for behavior, candidates in checked.destination_candidates.items():
         distinct_destinations = tuple(dict.fromkeys(candidates))
         if len(distinct_destinations) > 1:
             destination_ambiguous = True
             continue
-        routes[behavior] = (RouteTarget("primary", distinct_destinations[0]),)
+        if behavior not in routes:
+            routes[behavior] = (RouteTarget("primary", distinct_destinations[0]),)
     credential_ambiguous = checked.distinct_credentials > 1
-    deprecations = _legacy_default_deprecations(environment)
+    deprecations = tuple(
+        dict.fromkeys(prior.deprecations + _legacy_default_deprecations(environment))
+    )
     config = replace(
-        _empty_config(),
+        prior,
         global_routes=RouteLayer(routes),
         legacy_namespace_migration_completed=True,
-        migration_write_blocked=(credential_ambiguous or destination_ambiguous),
+        migration_write_blocked=(
+            prior.migration_write_blocked
+            or credential_ambiguous
+            or destination_ambiguous
+        ),
         deprecations=deprecations,
     )
     return config, MigrationOutcome(
-        initialized=True,
+        initialized=initialized,
         distinct_credentials=checked.distinct_credentials,
         credential_ambiguous=credential_ambiguous,
         destination_ambiguous=destination_ambiguous,
@@ -836,19 +853,25 @@ def initialize_routing(
     selected = _selected_data_dir(data_dir)
     with _locked(selected, "routes.lock"):
         try:
-            return load_routing(selected), MigrationOutcome(False)
+            current = load_routing(selected)
         except FileNotFoundError:
-            source = os.environ if environment is None else environment
-            if not isinstance(source, Mapping):
-                raise ValueError("Invalid legacy environment")
-            selected_discovery = (
-                discover_legacy_routing(source)
-                if discovery is None
-                else discovery
-            )
-            config, outcome = _migrate_legacy_routing(selected_discovery, source)
-            store_routing(config, selected)
-            return config, outcome
+            current = None
+        if current is not None and current.legacy_namespace_migration_completed:
+            return current, MigrationOutcome(False)
+        source = os.environ if environment is None else environment
+        if not isinstance(source, Mapping):
+            raise ValueError("Invalid legacy environment")
+        selected_discovery = (
+            discover_legacy_routing(source) if discovery is None else discovery
+        )
+        config, outcome = _migrate_legacy_routing(
+            selected_discovery,
+            source,
+            current,
+            initialized=current is None,
+        )
+        store_routing(config, selected)
+        return config, outcome
 
 
 def load_or_initialize_routing(
