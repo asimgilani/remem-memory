@@ -12,10 +12,10 @@ Automatic hooks can send:
 - a durable conversation capture containing the safe user prompt and assistant
   answer, plus hashed session/turn identifiers and the working-directory source
   path;
-- structured engineering checkpoints and rollups containing project/session
+- structured session checkpoints and rollups containing project/session
   identifiers, repository path, branch, files touched, safe tool summaries,
   decisions, open questions, and next actions; and
-- optional namespace names selected by the local environment.
+- namespace keys selected by the effective behavior route.
 
 Automatic recall asks for at most four results. The returned text is filtered
 and bounded to 6,000 characters before it is added to model context. Explicit
@@ -23,9 +23,11 @@ read-only MCP tools, write MCP tools such as `remem_ingest` and
 `remem_extract_facts`, or manual CLI operations send the supplied fields and
 are not a second automatic safety boundary.
 
-Remem cloud storage, retention, account access, and namespace authorization are
-controlled by the Remem account and API key. Use a least-privilege key and
-separate accounts or keys for hosts that should not share memory.
+Remem cloud storage, retention, account access, namespace authorization, and
+the key's default write namespace are controlled by Remem and its API keys.
+The plugin selects a connection and namespace route; it never grants access.
+Use a least-privilege key and separate accounts or keys for hosts that should
+not share memory.
 
 ## Bounded untrusted recall
 
@@ -54,13 +56,13 @@ arguments, so the canonical skill prohibits secret-bearing explicit calls.
 
 ## Local state and logs
 
-Automatic personal-hook state and settings live under
+Automatic hook state and settings live under
 `~/.config/remem-memory/` by default. The plugin creates its state directories
 with owner-only access and state/settings files with owner read/write
 permissions. Its private ordered worker queue lives below that same directory.
 Session and queue filenames use a hash rather than the raw session ID.
 
-Engineering automation keeps project-local files under `.remem/`, normally:
+Session automation keeps project-local files under `.remem/`, normally:
 
 - `.remem/auto-memory-state.json`;
 - `.remem/session-checkpoints.ndjson`; and
@@ -77,7 +79,7 @@ for the current turn. It does not delete content stored before that turn.
 
 ## Optional transcript summary provider
 
-Engineering checkpoints can use an optional summary provider. Depending on
+Session checkpoints can use an optional summary provider. Depending on
 configuration, bounded transcript-derived text may be sent to a local Claude
 CLI, a local Codex CLI, the Anthropic API, or the OpenAI API. That provider has
 its own data policy and credential boundary.
@@ -106,6 +108,11 @@ The canonical credential is a macOS Keychain generic password:
 - service: `io.remem.memory`
 - account: `default`
 
+That item backs the implicit `primary` connection. Additional named
+connections use separate opaque Keychain accounts; their labels are non-secret
+local metadata. Route files contain labels and opaque identifiers, never API
+keys.
+
 `remem-memory auth` uses a hidden terminal prompt. `remem-memory status` reports
 only `configured` or `missing`, never the value or a fingerprint. Runtime
 credential precedence is:
@@ -113,8 +120,9 @@ credential precedence is:
 1. a non-empty `REMEM_API_KEY` environment variable;
 2. the canonical macOS Keychain item.
 
-Environment precedence supports deliberate process-local overrides, but an old
-shell export can unexpectedly shadow Keychain. The installer never edits shell
+Environment precedence supports deliberate process-local overrides for
+`primary` only, but an old shell export can unexpectedly shadow Keychain. It
+does not replace additional named connections. The installer never edits shell
 startup files or `PATH`. The CLI is installed at
 `~/.local/bin/remem-memory`; use that full path if
 `command -v remem-memory` cannot find it. Verify Keychain without the override
@@ -152,15 +160,36 @@ below also ignores ambient proxy and custom-CA configuration. Those environment
 settings are therefore outside the Remem transport trust boundary and do not
 receive its authorization header or payload by default.
 
-## Namespace scope
+## Routing and authorization
 
-- `REMEM_DEFAULT_NAMESPACE` controls the MCP server default.
-- `REMEM_MEMORY_PERSONAL_NAMESPACE` controls automatic conversation writes.
-- `REMEM_MEMORY_ENGINEERING_NAMESPACE` controls checkpoint and rollup writes.
+The neutral routes are:
 
-Unset write namespaces use the Remem account's default/catch-all behavior.
-Automatic recall searches the namespaces available to the configured key.
-Explicit MCP queries should narrow scope when broad access is unnecessary.
+- `recall`: read from zero or more configured sources;
+- `memory`: write selected durable conversation memory to one destination or
+  turn that automatic behavior off; and
+- `sessions`: write checkpoints and rollups to one destination or turn that
+  automatic behavior off.
+
+The simple built-in routes use `primary/@readable` for recall and
+`primary/@default` for both writes. `@readable` delegates readable namespace
+scope to the selected key. `@default` omits an explicit namespace so Remem
+uses that key's current server default.
+
+API-key grants and the server default are configured in Remem. Local routes
+can narrow intent but cannot expand a key's access. A `401` or `403` remains a
+credential or API-key scope error and never causes a write to fall back to
+another namespace or connection.
+
+Setting an automatic write route to `off`, using `recall-only`, or selecting a
+different route changes plugin behavior; none is a permission boundary. True
+read-only isolation requires a separate read-only Remem API key stored as a
+separate connection and selected for that client's recall and explicit MCP
+process. Remem then enforces the restriction.
+
+Routing configuration is versioned, non-secret, and atomically replaced.
+Inspect it with `remem-memory routes show`, restore the simple behavior with
+`remem-memory routes use-default`, and check the complete local setup with
+`remem-memory doctor`.
 
 ## Bundled MCP execution
 
@@ -205,11 +234,11 @@ as a host-launched stdio process while the client uses it.
 
 The persistent automatic modes are:
 
-- `auto`: bounded recall plus selective personal and engineering writes;
+- `auto`: bounded recall plus selective `memory` and `sessions` writes;
 - `recall-only`: recall with no automatic writes; and
 - `off`: no automatic recall or writes.
 
-Sensitivity controls only automatic personal durable capture. Explicit
+Sensitivity controls only automatic durable capture. Explicit
 checkpoint, rollup, and recall helpers plus explicit MCP calls are separate
 operations and do not mechanically inherit all automatic controls. The skill
 therefore requires a `remem-memory status` preflight before explicit/manual
@@ -242,7 +271,7 @@ Update only a clean checkout with `git pull --ff-only`; preserve and report a
 dirty checkout instead of forcing it. The installer verifies the new plugin
 before legacy cleanup and stops on credential conflicts.
 
-The verified rollback boundary in 0.3.2 is non-destructive: pause memory and
+The verified rollback boundary in 0.4.0 is non-destructive: pause memory and
 keep the current checkout, Keychain item, Remem cloud data, project `.remem/`
 logs, and both client registrations. Version downgrade is intentionally not
 automated. An older checkout's installer can update an existing canonical Git

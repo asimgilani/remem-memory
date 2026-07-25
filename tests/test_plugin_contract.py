@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 _ROOT = Path(__file__).resolve().parents[1]
+_RELEASE_VERSION = "0.4.0"
 
 
 def load_json(relative_path: str):
@@ -36,11 +37,14 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(codex_market["name"], "remem-memory")
         self.assertEqual(claude_market["plugins"][0]["name"], "remem-memory")
         self.assertEqual(codex_market["plugins"][0]["name"], "remem-memory")
-        self.assertEqual(claude_market["plugins"][0]["version"], "0.3.2")
+        self.assertEqual(
+            claude_market["plugins"][0]["version"],
+            _RELEASE_VERSION,
+        )
         self.assertEqual(claude_plugin["name"], "remem-memory")
         self.assertEqual(codex_plugin["name"], "remem-memory")
-        self.assertEqual(claude_plugin["version"], "0.3.2")
-        self.assertEqual(codex_plugin["version"], "0.3.2")
+        self.assertEqual(claude_plugin["version"], _RELEASE_VERSION)
+        self.assertEqual(codex_plugin["version"], _RELEASE_VERSION)
 
     def test_codex_manifest_uses_default_hook_discovery(self):
         manifest = load_json(
@@ -53,7 +57,7 @@ class PluginContractTests(unittest.TestCase):
             (_ROOT / "plugins/remem-memory/hooks/hooks.json").is_file()
         )
 
-    def test_shared_hooks_cover_recall_capture_and_engineering(self):
+    def test_shared_hooks_cover_recall_memory_and_sessions(self):
         hooks = load_json("plugins/remem-memory/hooks/hooks.json")["hooks"]
         expected_modes = {
             "UserPromptSubmit": "user_prompt_submit",

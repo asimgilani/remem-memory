@@ -71,7 +71,7 @@ The setup:
 - uses standard-library-only local helpers and prepares the private,
   content-addressed MCP cache;
 - installs the canonical command and compatibility aliases;
-- installs and verifies `remem-memory` version `0.3.2` in available Codex and
+- installs and verifies `remem-memory` version `0.4.0` in available Codex and
   Claude Code clients;
 - keeps the older Claude plugin active until the replacement is verified;
 - can bridge one narrowly recognized legacy Codex credential to Keychain; and
@@ -122,12 +122,13 @@ Run:
 
 ```bash
 remem-memory status
+remem-memory doctor
 codex plugin list --json
 claude plugin list --json
 ```
 
 Skip a client-specific command if that client is not installed. Confirm that
-each installed client reports `remem-memory` enabled at `0.3.2`. Confirm the
+each installed client reports `remem-memory` enabled at `0.4.0`. Confirm the
 old Claude identity is absent or disabled and the old Codex Remem MCP block is
 absent only after the verified bridge.
 
@@ -146,7 +147,7 @@ The agent may verify plugin state with the commands above, but may not approve
 Codex hooks for the user. Codex approval is local to that
 installation/configuration and bound to the exact hook hash. Codex skips those
 hooks until they are trusted, so automatic recall, durable capture, and
-engineering checkpoints do not run before approval. MCP tools, skills, and
+session checkpoints do not run before approval. MCP tools, skills, and
 manual CLI commands can still work before hook trust. After any new or changed
 hook version, run `/hooks` and re-review it.
 
@@ -168,9 +169,9 @@ value. The bundled server consumes and closes it before third-party imports.
 HTTP redirects and ambient proxies are disabled. MCP runs as a host-launched
 stdio child. There is no setup wizard, no local web server, and no daemon.
 
-## 6. Set behavior and namespaces
+## 6. Confirm simple behavior
 
-Default behavior is `auto` with `balanced` personal capture:
+Default behavior is `auto` with `balanced` durable capture:
 
 ```bash
 remem-memory mode auto
@@ -179,30 +180,76 @@ remem-memory mode off
 remem-memory sensitivity conservative
 remem-memory sensitivity balanced
 remem-memory sensitivity aggressive
+remem-memory routes show
 ```
 
-Optional namespace variables are:
+Most users need no routing configuration. The built-in routes read through
+`primary/@readable` and send the `memory` and `sessions` behaviors through
+`primary/@default`.
 
-- `REMEM_DEFAULT_NAMESPACE` for MCP, defaulting to `default`;
-- `REMEM_MEMORY_PERSONAL_NAMESPACE` for automatic conversational writes; and
-- `REMEM_MEMORY_ENGINEERING_NAMESPACE` for checkpoints and rollups.
+API-key grants and the server default are configured in Remem. The plugin
+selects a connection and namespace route; it never grants access. Do not change
+Remem grants, defaults, namespaces, or cloud data during installation.
 
-Unset write namespaces retain the Remem account's default/catch-all behavior.
-No namespace migration is performed.
+Advanced routing is optional and CLI-only:
+
+```bash
+remem-memory routes use-default
+remem-memory routes set recall --from primary/@readable
+remem-memory routes set memory --to primary/@default
+remem-memory routes set sessions --to primary/@default
+remem-memory routes show --client codex
+remem-memory routes show --client claude
+```
+
+Custom namespace destinations use their exact Remem namespace keys after the
+connection label. Add `--client codex` or `--client claude` to set a client
+override. `off` is valid for automatic write routes:
+
+```bash
+remem-memory routes set memory --to off --client claude
+```
+
+Additional named connections use a hidden credential prompt:
+
+```bash
+remem-memory connections add secondary
+remem-memory connections list
+remem-memory connections use secondary --client codex
+```
+
+True read-only isolation requires a separate read-only Remem API key stored as
+a separate connection and selected for the client's recall and MCP process.
+`recall-only` is not a permission boundary.
 
 ## Surface boundary
 
 This local plugin works in Codex desktop/CLI and Claude Code on this Mac host.
 Codex Remote benefits when its task executes on this configured Mac host.
-Ordinary ChatGPT mobile chat and an IDE extension do not load the plugin.
+Ordinary ChatGPT mobile chat, native Claude mobile chat, and an IDE extension
+do not load the plugin.
 Codex Cloud or a different SSH host needs its own installation and credential.
 The installed plugin may appear in the desktop Plugins list.
 
 ## Update and rollback
 
 For future updates, require a clean checkout, run `git pull --ff-only`, rerun
-`./install-codex-skill.sh`, and re-verify both clients. Never discard local
-changes to force an update.
+`./install-codex-skill.sh`, and re-verify both clients with `status` and
+`doctor`. Never discard local changes to force an update.
+
+Claude Code must fetch and install a new plugin version before reload. The
+installer does this. When managing Claude directly, use marketplace update and
+plugin update, or reinstall when the plugin is absent:
+
+```bash
+claude plugin marketplace update remem-memory
+claude plugin update remem-memory@remem-memory
+```
+
+If the plugin is absent, use
+`claude plugin install remem-memory@remem-memory` instead of the update
+command. Then run `/reload-plugins` or restart Claude Code. Restarting alone
+does not fetch a new version.
 
 To pause without uninstalling:
 
@@ -210,7 +257,7 @@ To pause without uninstalling:
 remem-memory mode off
 ```
 
-The verified rollback boundary in 0.3.2 is `remem-memory mode off`. Keep Remem
+The verified rollback boundary in 0.4.0 is `remem-memory mode off`. Keep Remem
 cloud data, Keychain data, project `.remem/` logs, the current checkout, and
 both client registrations intact. Version downgrade is intentionally not
 automated: an older checkout's installer can update an existing canonical Git

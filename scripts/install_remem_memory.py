@@ -33,7 +33,7 @@ KEYCHAIN_SERVICE = _remem_api.KEYCHAIN_SERVICE
 KEYCHAIN_ACCOUNT = _remem_api.KEYCHAIN_ACCOUNT
 PLUGIN_NAME = "remem-memory"
 PLUGIN_ID = "remem-memory@remem-memory"
-PLUGIN_VERSION = "0.3.2"
+PLUGIN_VERSION = "0.4.0"
 LEGACY_PLUGIN_NAME = "remem-dev-sessions"
 LEGACY_PLUGIN_ID = "remem-dev-sessions@remem-dev-sessions"
 CANONICAL_REPOSITORY = "asimgilani/remem-memory"
@@ -1255,7 +1255,16 @@ def _activation_guidance(installed: _InstalledClients) -> str:
                 ),
             )
         )
-    final_verification = "3. Confirm credential: configured, plugin enabled"
+    lines.extend(
+        (
+            (
+                "3. Verify state: env -u REMEM_API_KEY "
+                "~/.local/bin/remem-memory status"
+            ),
+            "4. Diagnose: ~/.local/bin/remem-memory doctor",
+        )
+    )
+    final_verification = "5. Confirm credential: configured, plugin enabled"
     if installed.codex:
         final_verification += ", and Codex hooks trusted."
     else:

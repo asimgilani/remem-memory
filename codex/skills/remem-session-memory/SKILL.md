@@ -5,8 +5,7 @@ description: Use when an older Codex workflow refers to remem-session-memory or 
 
 # Remem Session Memory (compatibility alias)
 
-This legacy skill name is a compatibility redirect. Use the canonical
-`remem-memory` skill for automatic personal recall, durable capture, controls,
-MCP guidance, engineering checkpoints, and rollups.
-
-Do not create or run a second memory engine for this alias.
+This legacy name is a compatibility alias, not a separate product or memory
+engine. Use the canonical `remem-memory` skill for setup, neutral
+`recall`/`memory`/`sessions` routes, controls, MCP guidance, checkpoints, and
+rollups.

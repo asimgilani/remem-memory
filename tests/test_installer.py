@@ -693,6 +693,7 @@ class SecureInstallerTests(unittest.TestCase):
                     output,
                 )
                 self.assertIn("~/.local/bin/remem-memory auth", output)
+                self.assertIn("~/.local/bin/remem-memory doctor", output)
                 for phrase in included:
                     self.assertIn(phrase, output)
                 for phrase in excluded:
@@ -737,6 +738,9 @@ class SecureInstallerTests(unittest.TestCase):
                     for command in runner.commands
                 )
             )
+
+    def test_installer_declares_the_exact_release_version(self) -> None:
+        self.assertEqual(install_remem_memory.PLUGIN_VERSION, "0.4.0")
 
     def test_does_not_manage_an_existing_repository_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1694,7 +1698,7 @@ class SecureInstallerTests(unittest.TestCase):
                 {
                     "name": "remem-memory",
                     "marketplace": "remem-memory",
-                    "version": "0.3.2",
+                    "version": install_remem_memory.PLUGIN_VERSION,
                     "enabled": False,
                 },
                 (

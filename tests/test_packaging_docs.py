@@ -29,6 +29,12 @@ LEGACY_SKILL_PATHS = (
     "codex/skills/remem-dev-sessions/SKILL.md",
     "codex/skills/remem-session-memory/SKILL.md",
 )
+MANIFEST_PATHS = (
+    ".claude-plugin/marketplace.json",
+    "plugins/remem-memory/.claude-plugin/plugin.json",
+    "plugins/remem-memory/.codex-plugin/plugin.json",
+)
+RELEASE_VERSION = "0.4.0"
 
 
 def read(path: str) -> str:
@@ -140,7 +146,7 @@ class PackagingDocsTests(unittest.TestCase):
             ),
             normalized,
         )
-        self.assertIn("enabled at version `0.3.2`", normalized)
+        self.assertIn("enabled at version `0.4.0`", normalized)
         self.assertIn("if codex is installed", normalized)
         self.assertIn("all five remem memory hooks trusted", normalized)
         self.assertIn(
@@ -150,6 +156,7 @@ class PackagingDocsTests(unittest.TestCase):
         self.assertIn("keychain", normalized)
         self.assertIn("rerun the installer", normalized)
         self.assertIn("reload-plugins", normalized)
+        self.assertIn("remem-memory doctor", normalized)
 
     def test_docs_use_one_product_name_and_keep_install_url(self) -> None:
         readme = read("README.md")
@@ -157,7 +164,7 @@ class PackagingDocsTests(unittest.TestCase):
 
         self.assertTrue(readme.startswith("# Remem Memory\n"))
         self.assertIn(
-            "Automatic personal and engineering memory for Claude Code and Codex.",
+            "Automatic recall, durable memory, and session continuity for Claude Code and Codex.",
             readme,
         )
         self.assertIn(EXACT_RAW_INSTALL_URL, readme)
@@ -175,6 +182,8 @@ class PackagingDocsTests(unittest.TestCase):
 
         self.assertNotIn("remem-dev-sessions", before_transition)
         self.assertIn("remem-dev-sessions", transition)
+        self.assertIn("`remem-session-memory`", transition)
+        self.assertIn("`session-memory`", transition)
 
     def test_docs_state_supported_surfaces_without_overclaiming(self) -> None:
         docs = read_public_docs()
@@ -237,15 +246,19 @@ class PackagingDocsTests(unittest.TestCase):
             "io.remem.memory",
             "remem-memory auth",
             "remem-memory status",
+            "remem-memory doctor",
             "remem-memory mode",
             "remem-memory sensitivity",
+            "remem-memory routes show",
+            "remem-memory routes set recall --from",
+            "remem-memory routes set memory --to",
+            "remem-memory routes set sessions --to",
+            "remem-memory connections add",
+            "remem-memory connections use",
             "uv",
             "standard library",
             "git pull --ff-only",
             "clean checkout",
-            "remem_default_namespace",
-            "remem_memory_personal_namespace",
-            "remem_memory_engineering_namespace",
             "remem_memory_project",
             "remem_memory_interval_seconds",
             "remem_memory_min_events",
@@ -399,7 +412,7 @@ class PackagingDocsTests(unittest.TestCase):
             lowered,
         )
 
-    def test_canonical_skill_covers_memory_and_engineering_contract(
+    def test_canonical_skill_covers_neutral_memory_contract(
         self,
     ) -> None:
         for path in CANONICAL_SKILL_PATHS:
@@ -409,7 +422,10 @@ class PackagingDocsTests(unittest.TestCase):
                 "automatic recall",
                 "durable capture",
                 "off the record",
-                "engineering checkpoint",
+                "session checkpoint",
+                "`recall` route",
+                "`memory` route",
+                "`sessions` route",
                 "untrusted",
                 "recall-only",
                 "remem_query",
@@ -428,6 +444,8 @@ class PackagingDocsTests(unittest.TestCase):
             self.assertIn("~/.local/bin/remem-memory", skill, path)
             self.assertIn("before any explicit mcp call", skill, path)
             self.assertIn("run `remem-memory status`", skill, path)
+            self.assertIn("run `remem-memory routes show`", skill, path)
+            self.assertIn("separate read-only remem api key", skill, path)
             self.assertIn(
                 "before running any `remem-memory` command",
                 normalized_skill,
@@ -446,13 +464,28 @@ class PackagingDocsTests(unittest.TestCase):
                 ),
                 path,
             )
+            for legacy_assumption in (
+                "remem_default_namespace",
+                "remem_memory_personal_namespace",
+                "remem_memory_engineering_namespace",
+                "engineering namespace",
+                "personal namespace",
+            ):
+                self.assertNotIn(legacy_assumption, skill, path)
 
     def test_skill_identity_and_legacy_alias_contracts(self) -> None:
+        for path in (*CANONICAL_SKILL_PATHS, *LEGACY_SKILL_PATHS):
+            parsed = parse_frontmatter(path)
+            frontmatter = read(path).split("---", 2)[1]
+            self.assertEqual(set(parsed), {"name", "description"}, path)
+            self.assertRegex(parsed["name"], r"\A[a-z0-9-]+\Z", path)
+            self.assertTrue(parsed["description"].startswith("Use when"))
+            self.assertLessEqual(len(frontmatter), 1024, path)
+            self.assertLessEqual(len(parsed["description"]), 500, path)
         for path in CANONICAL_SKILL_PATHS:
             parsed = parse_frontmatter(path)
             self.assertEqual(Path(path).parent.name, "remem-memory")
             self.assertEqual(parsed["name"], "remem-memory")
-            self.assertTrue(parsed["description"].startswith("Use when"))
         for path in LEGACY_SKILL_PATHS:
             content = read(path)
             parsed = parse_frontmatter(path)
@@ -461,7 +494,7 @@ class PackagingDocsTests(unittest.TestCase):
             self.assertIn("remem-memory", content)
             self.assertLessEqual(len(content.splitlines()), 24, path)
 
-    def test_plugin_descriptions_cover_personal_and_engineering_memory(
+    def test_plugin_descriptions_use_neutral_behavior_vocabulary(
         self,
     ) -> None:
         for path in (
@@ -470,10 +503,129 @@ class PackagingDocsTests(unittest.TestCase):
         ):
             manifest = json.loads(read(path))
             description = manifest["description"].lower()
-            self.assertIn("personal", description, path)
-            self.assertIn("engineering", description, path)
+            self.assertIn("recall", description, path)
+            self.assertIn("memory", description, path)
+            self.assertIn("session", description, path)
             self.assertEqual(manifest["name"], "remem-memory")
-            self.assertEqual(manifest["version"], "0.3.2")
+            self.assertEqual(manifest["version"], RELEASE_VERSION)
+
+    def test_release_version_is_exact_everywhere_it_is_declared(self) -> None:
+        marketplace = json.loads(read(MANIFEST_PATHS[0]))
+        claude = json.loads(read(MANIFEST_PATHS[1]))
+        codex = json.loads(read(MANIFEST_PATHS[2]))
+        declared = (
+            marketplace["plugins"][0]["version"],
+            claude["version"],
+            codex["version"],
+        )
+        self.assertEqual(declared, (RELEASE_VERSION,) * len(declared))
+        installer = read("scripts/install_remem_memory.py")
+        self.assertIn(
+            f'PLUGIN_VERSION = "{RELEASE_VERSION}"',
+            installer,
+        )
+        for old_version in ("0.3.2", "0.3.1", "0.3.0"):
+            for path in (*PUBLIC_DOC_PATHS, *MANIFEST_PATHS):
+                self.assertNotIn(old_version, read(path), path)
+
+    def test_readme_leads_with_simple_mode_before_advanced_routing(self) -> None:
+        readme = read("README.md")
+        simple = readme.index("## Quick install")
+        activation = readme.index("## Finish activation")
+        self.assertIn("## Advanced routing", readme)
+        advanced = readme.index("## Advanced routing")
+        self.assertLess(simple, activation)
+        self.assertLess(activation, advanced)
+        onboarding = " ".join(readme[simple:advanced].lower().split())
+        self.assertIn("most users need no routing configuration", onboarding)
+        self.assertLess(
+            onboarding.index("remem-memory status"),
+            onboarding.index("remem-memory doctor"),
+        )
+
+    def test_docs_publish_parser_backed_neutral_routing_examples(self) -> None:
+        docs = read_public_docs()
+        normalized = " ".join(docs.split())
+        for command in (
+            "remem-memory routes use-default",
+            "remem-memory routes show",
+            "remem-memory routes show --client codex",
+            "remem-memory routes show --client claude",
+            "remem-memory routes set recall --from primary/@readable",
+            "remem-memory routes set memory --to primary/@default",
+            "remem-memory routes set sessions --to primary/@default",
+            "remem-memory routes set memory --to off --client claude",
+            (
+                "remem-memory routes set recall --from "
+                "secondary/@readable --client codex"
+            ),
+            (
+                "remem-memory routes set sessions --to "
+                "secondary/NAMESPACE_KEY --client codex"
+            ),
+            "remem-memory connections list",
+            "remem-memory connections add secondary",
+            "remem-memory connections use secondary --client codex",
+        ):
+            self.assertIn(command, normalized)
+        for behavior in ("recall", "memory", "sessions"):
+            self.assertIn(f"`{behavior}`", docs)
+
+    def test_docs_define_remem_authority_and_read_only_isolation(self) -> None:
+        docs = " ".join(read_public_docs().lower().split())
+        self.assertIn(
+            "api-key grants and the server default are configured in remem",
+            docs,
+        )
+        self.assertIn(
+            "plugin selects a connection and namespace route",
+            docs,
+        )
+        self.assertIn("never grants access", docs)
+        self.assertIn("separate read-only remem api key", docs)
+        self.assertIn("separate connection", docs)
+        self.assertIn("recall-only", docs)
+        self.assertIn("not a permission boundary", docs)
+        self.assertNotIn("plugin-side permission flag", docs)
+
+    def test_docs_explain_claude_update_fetch_and_codex_trust(self) -> None:
+        docs = " ".join(read_public_docs().lower().split())
+        self.assertIn("claude plugin marketplace update remem-memory", docs)
+        self.assertIn(
+            "claude plugin update remem-memory@remem-memory",
+            docs,
+        )
+        self.assertIn(
+            "claude plugin install remem-memory@remem-memory",
+            docs,
+        )
+        self.assertIn("reinstall", docs)
+        self.assertIn("restarting alone does not fetch", docs)
+        self.assertIn("codex desktop", docs)
+        self.assertIn("trust", docs)
+        self.assertIn("codex cli", docs)
+        self.assertIn("/hooks", docs)
+
+    def test_public_copy_has_no_private_or_legacy_route_assumptions(self) -> None:
+        public = "\n".join(
+            read(path)
+            for path in (
+                *PUBLIC_DOC_PATHS,
+                *CANONICAL_SKILL_PATHS,
+                *LEGACY_SKILL_PATHS,
+                *MANIFEST_PATHS,
+            )
+        ).lower()
+        for forbidden in (
+            "maya",
+            "hermes",
+            "remem_default_namespace",
+            "remem_memory_personal_namespace",
+            "remem_memory_engineering_namespace",
+        ):
+            self.assertNotIn(forbidden, public)
+        self.assertNotRegex(public, r"namespace (?:named|called) `?engineering")
+        self.assertNotRegex(public, r"namespace (?:named|called) `?personal")
 
     def test_security_doc_covers_full_boundary(self) -> None:
         security = read("docs/SECURITY.md").lower()

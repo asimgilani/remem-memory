@@ -1,17 +1,16 @@
 # Remem Memory
 
-Automatic personal and engineering memory for Claude Code and Codex.
+Automatic recall, durable memory, and session continuity for Claude Code and Codex.
 
-Remem Memory is one plugin with one secure credential path. On a configured
-Mac, its hooks recall useful personal or project context, selectively retain
-durable preferences and decisions, and preserve engineering checkpoints and
-session rollups.
+Remem Memory is one plugin with one secure credential model. On a configured
+Mac, its hooks recall useful context, selectively retain durable preferences
+and decisions, and preserve session checkpoints and rollups.
 
 ```text
 Claude Code or Codex on your Mac
         │
         ├─ prompt ──> bounded, safe recall ──> answer context
-        └─ events ──> durable capture + engineering continuity
+        └─ events ──> durable memory + session continuity
                               │
                          Remem cloud
 ```
@@ -74,13 +73,23 @@ activation steps:
 Codex approval is local to that installation/configuration and bound to the
 exact hook hash. Review again on a new Mac/configuration or after hook content
 changes. Codex skips those hooks until they are trusted, so automatic recall,
-durable capture, and engineering checkpoints do not run before approval. MCP
+durable capture, and session checkpoints do not run before approval. MCP
 tools, skills, and manual CLI commands can still work before hook trust. After
 any new or changed hook version, run `/hooks` and re-review it.
 
+3. Run the non-destructive checks in this order:
+
+   ```bash
+   ~/.local/bin/remem-memory status
+   ~/.local/bin/remem-memory doctor
+   ```
+
+Most users need no routing configuration. One key, the namespaces it can read,
+and its server default are enough.
+
 Setup is active when the canonical status command above reports the intended
 mode and sensitivity plus `credential: configured`; every installed client
-reports Remem Memory enabled at version `0.3.2`; if Codex is installed, it
+reports Remem Memory enabled at version `0.4.0`; if Codex is installed, it
 shows all five Remem Memory hooks trusted; and a fresh supported-client session
 can use automatic memory.
 
@@ -89,11 +98,12 @@ If activation does not work:
 - Missing credential: run the hidden `auth` prompt above.
 - Plugin not listed: update a clean checkout and rerun the installer.
 - Codex automation absent: review its local hook trust.
-- Claude still shows old plugin state: run `/reload-plugins` or restart it.
+- Claude still shows old plugin state: fetch and install the update as
+  described under **Updating** below, then run `/reload-plugins`.
 
 The installer detects Codex and Claude Code, installs the same
 `remem-memory` plugin into each available harness, and verifies version
-`0.3.2` before retiring an older active identity.
+`0.4.0` before retiring an older active identity.
 
 ## Requirements
 
@@ -165,7 +175,7 @@ The default mode is `auto`:
 
 - relevant prompts can receive bounded automatic recall;
 - lasting preferences and decisions can receive selective durable capture;
-- meaningful engineering activity creates checkpoints and session rollups; and
+- meaningful work creates session checkpoints and rollups; and
 - “off the record” or `/remem off-record` suppresses memory for that turn.
 
 Use the CLI to change persistent behavior:
@@ -182,12 +192,12 @@ remem-memory sensitivity aggressive
 remem-memory status
 ```
 
-`recall-only` permits automatic reads but disables automatic personal and
-engineering writes. `off` disables automatic reads and writes. Sensitivity
-changes personal capture selectivity, not recall or checkpoint cadence.
+`recall-only` permits automatic reads but disables the automatic `memory` and
+`sessions` writes. `off` disables automatic reads and writes. Sensitivity
+changes durable-capture selectivity, not recall or checkpoint cadence.
 
-Explicit engineering helpers remain available for a boundary or a host
-without hooks:
+Explicit session helpers remain available for a boundary or a host without
+hooks:
 
 ```bash
 remem-memory checkpoint --help
@@ -217,7 +227,7 @@ Use a write tool only for explicit user intent when automatic Stop capture is
 unavailable, and never duplicate a successful automatic write. Off-record
 overrides every mode for that turn.
 
-## Engineering continuity
+## Session continuity
 
 The installed hooks preserve the existing coding workflow: meaningful
 write/edit/shell activity feeds interval checkpoints, Stop and PreCompact
@@ -228,7 +238,7 @@ milestone; PreCompact creates a versioned rolling rollup, and the optional
 exits. This avoids a duplicate rollup on every Codex turn. Defaults are four
 meaningful tool events and a 20-minute interval target.
 
-Optional engineering tuning remains available:
+Optional session tuning remains available:
 
 ```bash
 export REMEM_MEMORY_PROJECT="my-project"
@@ -244,32 +254,74 @@ only when `REMEM_MEMORY_SUMMARY_PROVIDER` explicitly selects `claude_cli`,
 `codex_cli`, `anthropic`, or `openai`. See the security guide before sending
 transcript-derived material across that boundary.
 
-## Namespaces
+## Advanced routing
 
-One API key can access the namespaces granted to its Remem account. Namespace
-settings are optional:
+The plugin has three neutral behavior routes:
+
+| Route | Direction | Purpose |
+| --- | --- | --- |
+| `recall` | read | Context searched before an answer |
+| `memory` | write | Durable preferences, decisions, facts, and other selected conversation memory |
+| `sessions` | write | Checkpoints, milestone summaries, and rollups |
+
+The built-in simple routes are `primary/@readable` for `recall` and
+`primary/@default` for both writes. `@readable` means every namespace the
+selected key can read. `@default` delegates the write destination to that
+key's current server default. Restore this simple behavior or inspect it with:
 
 ```bash
-export REMEM_DEFAULT_NAMESPACE="default"
-export REMEM_MEMORY_PERSONAL_NAMESPACE="default"
-export REMEM_MEMORY_ENGINEERING_NAMESPACE="engineering"
+remem-memory routes use-default
+remem-memory routes show
+remem-memory routes show --client codex
+remem-memory routes show --client claude
 ```
 
-- `REMEM_DEFAULT_NAMESPACE` is the MCP server's default namespace.
-- `REMEM_MEMORY_PERSONAL_NAMESPACE` selects automatic conversational writes.
-- `REMEM_MEMORY_ENGINEERING_NAMESPACE` selects checkpoint and rollup writes.
-- Unset write namespaces use the Remem account's default/catch-all behavior.
-- Automatic recall searches the namespaces available to the configured key;
-  explicit MCP calls can narrow a query.
+Advanced users can replace individual global routes. Substitute actual
+namespace keys from Remem when using explicit destinations:
 
-Use separate least-privilege keys when people or hosts should not share the
-same memory scope.
+```bash
+remem-memory routes set recall --from primary/@readable
+remem-memory routes set memory --to primary/@default
+remem-memory routes set sessions --to primary/@default
+remem-memory routes set recall --from primary/NAMESPACE_KEY primary/OTHER_NAMESPACE_KEY
+```
+
+Add `--client codex` or `--client claude` to create an override. For example:
+
+```bash
+remem-memory routes set sessions --to primary/NAMESPACE_KEY --client codex
+remem-memory routes set memory --to off --client claude
+```
+
+An `off` route disables that automatic behavior; it does not restrict explicit
+MCP tools. Global routes otherwise apply to both clients.
+
+Most users never need another connection. For a second workspace, account, or
+least-privilege key, choose a local label and use the hidden prompt:
+
+```bash
+remem-memory connections add secondary
+remem-memory connections list
+remem-memory routes set recall --from secondary/@readable --client codex
+remem-memory routes set sessions --to secondary/NAMESPACE_KEY --client codex
+remem-memory connections use secondary --client codex
+```
+
+`connections use` selects that client's explicit MCP credential. Automatic
+routes change only through `routes set`.
+
+API-key grants and the server default are configured in Remem. The plugin
+selects a connection and namespace route; it never grants access. True
+read-only isolation requires a separate read-only Remem API key stored as a
+separate connection and selected for that client's recall and MCP process.
+Turning its automatic write routes off is useful defense in depth, but
+`recall-only` is not a permission boundary.
 
 ## Updating from remem-dev-sessions
 
 The repository and data stay in place; this is an update to one canonical
-product identity. Existing `remem-dev-sessions`, `remem-session-memory`, and
-`remem-codex` commands and skills remain compatibility aliases to
+product identity. Existing `remem-dev-sessions`, `remem-session-memory`,
+`session-memory`, and `remem-codex` commands and skills remain compatibility aliases to
 `remem-memory`. They do not run a second memory engine.
 
 For an existing clean checkout:
@@ -279,6 +331,7 @@ git status --short
 git pull --ff-only
 ./install-codex-skill.sh
 remem-memory status
+remem-memory doctor
 ```
 
 If `git status --short` shows changes, stop and preserve them. Never reset or
@@ -300,6 +353,25 @@ the active source.
 No Remem data is migrated, copied, renamed, or deleted. There are no Remem API
 changes and no Remem portal changes.
 
+For Claude Code, a restart or `/reload-plugins` loads an already-installed
+version; restarting alone does not fetch a new version. The installer performs
+the appropriate update. An operator managing Claude directly must update the
+marketplace and then update or reinstall the plugin as appropriate:
+
+```bash
+claude plugin marketplace update remem-memory
+claude plugin update remem-memory@remem-memory
+```
+
+If the plugin is not installed, use the documented marketplace install flow
+instead of the update command:
+
+```bash
+claude plugin install remem-memory@remem-memory
+```
+
+Then reload or restart Claude Code.
+
 ## Safe pause and rollback
 
 Pause all automatic memory immediately:
@@ -312,7 +384,7 @@ The verified rollback boundary in this release is the immediate `mode off`
 pause. Keep the current checkout, Keychain item, cloud data, `.remem/` files,
 and both client registrations intact while investigating.
 
-Version downgrade is intentionally not automated in 0.3.2. Running an older
+Version downgrade is intentionally not automated in 0.4.0. Running an older
 checkout's installer is not a pin: an existing canonical Git marketplace can
 update back to its current remote head. Replacing that marketplace source is
 client-specific and is not transactional across Codex and Claude Code. Do not

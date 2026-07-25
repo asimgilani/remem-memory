@@ -1,8 +1,7 @@
 # Remem Memory for Codex
 
-Remem Memory gives Codex on a configured Mac automatic personal recall,
-selective durable capture, and the existing engineering checkpoint/rollup
-workflow.
+Remem Memory gives Codex on a configured Mac automatic recall, selective
+durable capture, and session checkpoint/rollup continuity.
 
 ## Install
 
@@ -25,7 +24,8 @@ The installer does not edit `PATH` or shell startup files automatically.
 - Codex CLI and Codex desktop tasks on the configured Mac host load the local
   plugin.
 - Codex Remote uses it when execution remains on that configured Mac host.
-- Ordinary ChatGPT mobile chat does not load a Mac-local Codex plugin.
+- Ordinary ChatGPT mobile chat and native Claude mobile chat do not load a
+  Mac-local plugin.
 - An IDE extension, Codex Cloud, or a different SSH host needs separate,
   surface-specific support or its own installation and credential.
 
@@ -34,9 +34,9 @@ The installer does not edit `PATH` or shell startup files automatically.
 The installed hooks run without launching Codex through a wrapper:
 
 1. `UserPromptSubmit` can add bounded, untrusted Remem context.
-2. `PostToolUse`, `Stop`, and `PreCompact` preserve meaningful engineering
+2. `PostToolUse`, `Stop`, and `PreCompact` preserve meaningful session
    progress.
-3. `Stop` can capture a durable personal preference or decision once.
+3. `Stop` can capture a durable preference or decision once.
 4. On Codex versions without SessionEnd, `PreCompact` creates a versioned
    rolling rollup; `remem-memory codex` creates a final rollup when its wrapped
    Codex process exits. Stop checkpoints remain available even in a short
@@ -53,7 +53,7 @@ Finish activation in the Codex surface you use:
 - **Codex CLI:** start interactive Codex, enter `/hooks`, select
   **Remem Memory**, inspect the five hooks, and approve them.
 
-Codex skips automatic recall, capture, and engineering hooks until approval.
+Codex skips automatic recall, capture, and session hooks until approval.
 MCP tools and manual commands can still work. Approval is local to that Codex
 installation/configuration and bound to the exact hook hash. Run `/hooks` and
 re-review after a new or changed hook version.
@@ -62,6 +62,8 @@ Inspect or change the persistent controls:
 
 ```bash
 remem-memory status
+remem-memory doctor
+remem-memory routes show
 remem-memory mode auto
 remem-memory mode recall-only
 remem-memory mode off
@@ -83,7 +85,7 @@ Treat `remem_ingest` and `remem_extract_facts` as write MCP tools. Use either
 only in `auto`, for explicit user intent, when automatic Stop capture is
 unavailable. Do not duplicate successful automatic recall or durable capture.
 
-Manual engineering boundaries remain available:
+Manual session boundaries remain available:
 
 ```bash
 remem-memory checkpoint --help
@@ -121,16 +123,51 @@ The real API key reaches only the direct cached Python process through a one-use
 anonymous file descriptor and is consumed before third-party imports. HTTP
 redirects and ambient proxies are disabled.
 
-Optional routing:
+## Routing and connections
+
+Most users need no routing configuration. The built-in `recall` route uses
+`primary/@readable`; the `memory` and `sessions` routes use
+`primary/@default`. API-key grants and the server default are configured in
+Remem. The plugin selects a connection and namespace route; it never grants
+access.
+
+Inspect or restore the simple routes:
 
 ```bash
-export REMEM_DEFAULT_NAMESPACE="default"
-export REMEM_MEMORY_PERSONAL_NAMESPACE="default"
-export REMEM_MEMORY_ENGINEERING_NAMESPACE="engineering"
+remem-memory routes show
+remem-memory routes use-default
 ```
 
-Unset write namespaces use Remem's default/catch-all behavior. No Remem data
-is migrated, and there are no Remem API changes or Remem portal changes.
+Advanced users can set custom global routes and Codex overrides. Substitute
+actual namespace keys from Remem for explicit destinations:
+
+```bash
+remem-memory routes set recall --from primary/@readable
+remem-memory routes set memory --to primary/@default
+remem-memory routes set sessions --to primary/@default
+remem-memory routes set sessions --to primary/NAMESPACE_KEY --client codex
+remem-memory routes show --client codex
+```
+
+Additional named connections are useful for another account, workspace, or
+API-key scope:
+
+```bash
+remem-memory connections add secondary
+remem-memory connections list
+remem-memory routes set recall --from secondary/@readable --client codex
+remem-memory routes set sessions --to secondary/NAMESPACE_KEY --client codex
+remem-memory connections use secondary --client codex
+```
+
+The last command selects Codex's explicit MCP credential; automatic routes
+change only through `routes set`. True read-only isolation requires a separate
+read-only Remem API key stored as a separate connection and selected for both
+Codex recall and MCP. Disabling automatic writes is defense in depth;
+`recall-only` is not a permission boundary.
+
+No Remem data is migrated, and there are no Remem API changes or Remem portal
+changes.
 
 ## Update safely
 
@@ -141,6 +178,7 @@ git status --short
 git pull --ff-only
 ./install-codex-skill.sh
 remem-memory status
+remem-memory doctor
 ```
 
 If the checkout is dirty, preserve it and stop. The installer can perform a
@@ -150,7 +188,7 @@ runtime probe are verified.
 
 For rollback, first use `remem-memory mode off` and keep the checkout,
 credential, `.remem/` logs, and both registrations. That pause is the verified
-rollback boundary in 0.3.2; version downgrade is intentionally not automated.
+rollback boundary in 0.4.0; version downgrade is intentionally not automated.
 An older checkout's installer can update an existing canonical Git marketplace
 back to current remote head, while marketplace replacement is not
 transactional across both clients. Do not run an older installer or partially
