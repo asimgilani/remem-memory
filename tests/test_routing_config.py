@@ -178,6 +178,62 @@ class RoutingValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             remem_routing.parse_target("primary/@readable", direction="write")
 
+    def test_parse_and_store_reject_untrimmed_namespace_intent(self):
+        for namespace in (" private", "private ", " private "):
+            with self.subTest(namespace=namespace, boundary="parse"):
+                with self.assertRaises(ValueError):
+                    remem_routing.parse_target(
+                        f"primary/{namespace}",
+                        direction="write",
+                    )
+            with self.subTest(namespace=namespace, boundary="store"):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(ValueError):
+                        remem_routing.store_routing(
+                            routing_config(
+                                global_routes={
+                                    "memory": (target("primary", namespace),)
+                                }
+                            ),
+                            Path(directory),
+                        )
+
+    def test_health_records_reject_untrimmed_namespace_intent(self):
+        for namespace in (" private", "private ", " private "):
+            with self.subTest(namespace=namespace):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(ValueError):
+                        remem_routing.record_route_health(
+                            remem_routing.RouteHealthRecord(
+                                "codex",
+                                "memory",
+                                "primary",
+                                namespace,
+                                "ok",
+                                "ok",
+                                "2026-07-24T12:34:56Z",
+                            ),
+                            Path(directory),
+                        )
+
+    def test_legacy_routing_rejects_untrimmed_namespace_intent(self):
+        for namespace in (" private", "private ", " private ", "   "):
+            with self.subTest(namespace=namespace, boundary="environment"):
+                with self.assertRaises(ValueError):
+                    remem_routing.discover_legacy_routing(
+                        {"REMEM_MEMORY_PERSONAL_NAMESPACE": namespace}
+                    )
+            with self.subTest(namespace=namespace, boundary="staged"):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(ValueError):
+                        remem_routing.stage_legacy_routing(
+                            remem_routing.LegacyDiscovery(
+                                1,
+                                {"memory": (namespace,)},
+                            ),
+                            Path(directory),
+                        )
+
     def test_store_rejects_fan_out_write_routes(self):
         config = routing_config(
             global_routes={

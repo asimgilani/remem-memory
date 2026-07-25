@@ -1287,7 +1287,10 @@ def _find_connection(
     name: str,
 ) -> remem_routing.Connection:
     if name == "primary":
-        return config.connections[0]
+        for connection in config.connections:
+            if connection.id == "primary":
+                return connection
+        raise ValueError("Unknown routing connection")
     matches = [
         connection
         for connection in config.connections

@@ -219,7 +219,12 @@ def _validate_connection_id(value: object) -> str:
 
 
 def _validate_namespace(value: object, *, behavior: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > 100:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 100
+    ):
         raise ValueError("Invalid routing namespace")
     if value == "@readable":
         if behavior != "recall":
@@ -999,9 +1004,10 @@ def discover_legacy_routing(
         value = source.get(variable, "")
         if not isinstance(value, str):
             raise ValueError("Invalid legacy namespace")
-        value = value.strip()
         if value:
-            destinations[behavior] = (value,)
+            destinations[behavior] = (
+                _validate_namespace(value, behavior=behavior),
+            )
     return LegacyDiscovery(distinct_credentials, destinations)
 
 
@@ -1060,7 +1066,6 @@ def _checked_legacy_discovery(discovery: object) -> LegacyDiscovery:
         for candidate in candidates:
             if not isinstance(candidate, str):
                 raise ValueError("Invalid legacy namespace")
-            candidate = candidate.strip()
             if candidate:
                 nonempty.append(_validate_namespace(candidate, behavior=behavior))
                 candidate_count += 1

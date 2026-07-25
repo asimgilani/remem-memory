@@ -904,6 +904,74 @@ class RoutingCliTests(unittest.TestCase):
             },
         )
 
+    def test_route_set_rejects_untrimmed_namespace_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            results = [
+                self._run(
+                    ["routes", "set", "memory", "--to", namespace],
+                    environment=environment,
+                )
+                for namespace in (" private", "private ", " private ")
+            ]
+            stored = remem_memory.remem_routing.load_routing(Path(directory))
+
+        for result in results:
+            self.assertEqual(
+                result,
+                (2, "", "error: invalid routes command\n"),
+            )
+        self.assertNotIn("memory", stored.global_routes.routes)
+
+    def test_primary_route_name_matches_literal_id_in_reordered_config(self):
+        token = "0123456789abcdef0123456789abcdef"
+        named = remem_memory.remem_routing.Connection(
+            f"conn_{token}",
+            "Workspace",
+            f"connection:{token}",
+            True,
+        )
+        primary = remem_memory.remem_routing.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            environment = {"REMEM_MEMORY_DATA_DIR": directory}
+            remem_memory.remem_routing.store_routing(
+                remem_memory.remem_routing.RoutingConfig(
+                    schema_version=1,
+                    revision=0,
+                    connections=(named, primary),
+                    global_routes=remem_memory.remem_routing.RouteLayer({}),
+                    client_routes={},
+                    mcp_connections={},
+                    legacy_namespace_migration_completed=True,
+                    migration_write_blocked=False,
+                    deprecations=(),
+                ),
+                data_dir,
+            )
+            result = self._run(
+                [
+                    "routes",
+                    "set",
+                    "memory",
+                    "--to",
+                    "primary/private",
+                ],
+                environment=environment,
+            )
+            stored = remem_memory.remem_routing.load_routing(data_dir)
+
+        self.assertEqual(result, (0, "global memory: primary/private\n", ""))
+        self.assertEqual(
+            stored.global_routes.routes["memory"],
+            (remem_memory.remem_routing.RouteTarget("primary", "private"),),
+        )
+
     def test_global_write_choices_release_migration_block_only_when_complete(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {

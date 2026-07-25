@@ -1,6 +1,6 @@
 # Remem Memory Generic Namespace Routing Design
 
-Date: 2026-07-24  
+Date: 2026-07-24
 Status: Approved for implementation
 
 ## Problem
