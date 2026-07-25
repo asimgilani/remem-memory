@@ -292,70 +292,190 @@ class StateStore:
         return self.sessions_dir / f"{digest}.json"
 
     def load(self, session_id: str) -> dict[str, Any]:
-        path = self.path_for(session_id)
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return _default_state()
-        except (OSError, json.JSONDecodeError):
-            raise RuntimeError("memory state unavailable") from None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = -1
+        with self._session_directory() as directory_descriptor:
+            try:
+                descriptor = os.open(
+                    self.path_for(session_id).name,
+                    flags,
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                return _default_state()
+            except OSError:
+                raise RuntimeError("memory state unavailable") from None
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                ):
+                    raise RuntimeError("memory state unavailable")
+                with os.fdopen(
+                    descriptor,
+                    "r",
+                    encoding="utf-8",
+                ) as stream:
+                    descriptor = -1
+                    parsed = json.load(stream)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ):
+                raise RuntimeError("memory state unavailable") from None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
         if not isinstance(parsed, dict):
             raise RuntimeError("memory state unavailable")
         return _normalize_state(parsed)
 
     def save(self, session_id: str, state: dict[str, Any]) -> None:
-        self._ensure_directories()
         path = self.path_for(session_id)
         descriptor = -1
         temporary = ""
         try:
-            descriptor, temporary = tempfile.mkstemp(
-                prefix=f".{path.stem}.",
-                suffix=".tmp",
-                dir=str(self.sessions_dir),
-            )
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                descriptor = -1
-                json.dump(
-                    _normalize_state(state),
-                    stream,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if temporary:
+            encoded = json.dumps(
+                _normalize_state(state),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise RuntimeError("memory state unavailable") from None
+        with self._session_directory() as directory_descriptor:
+            try:
                 try:
-                    Path(temporary).unlink(missing_ok=True)
-                except OSError:
-                    pass
+                    existing = os.stat(
+                        path.name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    existing = None
+                if existing is not None and not stat.S_ISREG(
+                    existing.st_mode
+                ):
+                    raise RuntimeError("memory state unavailable")
+                temporary = f".{path.stem}.{uuid4().hex}.tmp"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(
+                    temporary,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(encoded)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(
+                    temporary,
+                    path.name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                temporary = ""
+                os.fsync(directory_descriptor)
+            except OSError:
+                raise RuntimeError("memory state unavailable") from None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                if temporary:
+                    try:
+                        os.unlink(
+                            temporary,
+                            dir_fd=directory_descriptor,
+                        )
+                    except OSError:
+                        pass
 
     def _ensure_directories(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.data_dir, 0o700)
-        os.chmod(self.sessions_dir, 0o700)
+        with self._session_directory():
+            pass
+
+    @contextmanager
+    def _session_directory(self):
+        data_descriptor = -1
+        session_descriptor = -1
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            self.data_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+                mode=0o700,
+            )
+            data_descriptor = os.open(self.data_dir, flags)
+            if not stat.S_ISDIR(os.fstat(data_descriptor).st_mode):
+                raise OSError
+            os.fchmod(data_descriptor, 0o700)
+            try:
+                os.mkdir("sessions", 0o700, dir_fd=data_descriptor)
+            except FileExistsError:
+                pass
+            session_descriptor = os.open(
+                "sessions",
+                flags,
+                dir_fd=data_descriptor,
+            )
+            if not stat.S_ISDIR(
+                os.fstat(session_descriptor).st_mode
+            ):
+                raise OSError
+            os.fchmod(session_descriptor, 0o700)
+            yield session_descriptor
+        except OSError:
+            raise RuntimeError("memory state unavailable") from None
+        finally:
+            if session_descriptor >= 0:
+                os.close(session_descriptor)
+            if data_descriptor >= 0:
+                os.close(data_descriptor)
 
     @contextmanager
     def locked(self, session_id: str):
-        self._ensure_directories()
-        lock_path = self.path_for(session_id).with_suffix(".lock")
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            os.fchmod(descriptor, 0o600)
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        lock_name = self.path_for(session_id).with_suffix(".lock").name
+        with self._session_directory() as directory_descriptor:
+            try:
+                descriptor = os.open(
+                    lock_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError:
+                raise RuntimeError("memory state unavailable") from None
+            locked = False
+            try:
+                try:
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise RuntimeError("memory state unavailable")
+                    os.fchmod(descriptor, 0o600)
+                    if fcntl is not None:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                        locked = True
+                except OSError:
+                    raise RuntimeError("memory state unavailable") from None
+                yield
+            finally:
+                if locked and fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
 
 def _unique_json_object(
@@ -702,16 +822,35 @@ def _connection_credential(
     )
 
 
+def _uses_explicit_primary_override(
+    dependencies: Dependencies,
+    connection: Connection,
+    credential: str,
+) -> bool:
+    override = dependencies.primary_credential_override
+    normalized = (
+        override.strip() if isinstance(override, str) else ""
+    )
+    return bool(
+        connection.id == "primary"
+        and normalized
+        and hmac.compare_digest(credential, normalized)
+    )
+
+
 def _default_routed_api(
     connection: Connection,
     credential: str,
+    *,
+    allow_local_dev: bool,
 ) -> object:
-    del connection
     raw_url = os.environ.get("REMEM_API_URL", _DEFAULT_API_URL)
-    policy_environment = {"REMEM_API_KEY": credential}
-    allow_local = os.environ.get("REMEM_MEMORY_ALLOW_LOCAL_DEV")
-    if allow_local is not None:
-        policy_environment["REMEM_MEMORY_ALLOW_LOCAL_DEV"] = allow_local
+    policy_environment: dict[str, str] = {}
+    if allow_local_dev and connection.id == "primary":
+        policy_environment["REMEM_API_KEY"] = credential
+        allow_local = os.environ.get("REMEM_MEMORY_ALLOW_LOCAL_DEV")
+        if allow_local is not None:
+            policy_environment["REMEM_MEMORY_ALLOW_LOCAL_DEV"] = allow_local
     normalized_url = normalize_api_origin_for_environment(
         raw_url,
         policy_environment,
@@ -719,7 +858,9 @@ def _default_routed_api(
     return RememAPI(
         normalized_url,
         credential,
-        allow_local_dev=normalized_url != _DEFAULT_API_URL,
+        allow_local_dev=(
+            allow_local_dev and normalized_url != _DEFAULT_API_URL
+        ),
     )
 
 
@@ -741,7 +882,15 @@ def _routed_api(
         return dependencies.api_factory(connection, credential)
     if dependencies.api is not None:
         return dependencies.api
-    return _default_routed_api(connection, credential)
+    return _default_routed_api(
+        connection,
+        credential,
+        allow_local_dev=_uses_explicit_primary_override(
+            dependencies,
+            connection,
+            credential,
+        ),
+    )
 
 
 def _health_failure(error: Exception) -> tuple[str, str]:
@@ -1130,6 +1279,7 @@ def _handle_stop(
     turn_state: dict[str, Any] | None = None,
     *,
     invoke_engineering: bool = True,
+    write_gate: Callable[[dict[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     output = {"continue": True} if harness == "codex" else {}
     if settings.mode != "auto":
@@ -1222,6 +1372,13 @@ def _handle_stop(
                 str(payload.get("cwd") or ""),
                 harness,
             )
+            if write_gate is not None:
+                try:
+                    allowed = write_gate(state)
+                except Exception:
+                    return output
+                if not allowed:
+                    return output
             api.ingest(
                 memory,
                 namespace,
@@ -1722,7 +1879,11 @@ def _consume_credential_descriptor(raw_descriptor: str) -> str | None:
 
 
 @contextmanager
-def _worker_credential_scope(mode: str):
+def _worker_credential_scope(
+    mode: str,
+    *,
+    primary_override_origin: bool = False,
+):
     if mode not in _WORKER_CREDENTIAL_MODES:
         yield
         return
@@ -1743,7 +1904,7 @@ def _worker_credential_scope(mode: str):
     )
     raw_url = os.environ.get("REMEM_API_URL", _DEFAULT_API_URL)
     policy_environment: dict[str, str] = {}
-    if explicit_credential and credential:
+    if explicit_credential and credential and primary_override_origin:
         policy_environment["REMEM_API_KEY"] = credential
         if previous_allow_local is not None:
             policy_environment["REMEM_MEMORY_ALLOW_LOCAL_DEV"] = (
@@ -1777,7 +1938,11 @@ def _worker_credential_scope(mode: str):
 
 
 @contextmanager
-def _selected_credential_scope(credential: str):
+def _selected_credential_scope(
+    credential: str,
+    *,
+    primary_override_origin: bool,
+):
     previous_key = os.environ.get("REMEM_API_KEY")
     previous_descriptor = os.environ.get("REMEM_API_KEY_FD")
     previous_url = os.environ.get("REMEM_API_URL")
@@ -1785,7 +1950,10 @@ def _selected_credential_scope(credential: str):
     try:
         descriptor = _credential_descriptor(credential)
         os.environ["REMEM_API_KEY_FD"] = str(descriptor)
-        with _worker_credential_scope("worker_stop"):
+        with _worker_credential_scope(
+            "worker_stop",
+            primary_override_origin=primary_override_origin,
+        ):
             yield os.environ.get("REMEM_API_KEY")
         descriptor = None
     finally:
@@ -1969,7 +2137,9 @@ def _spawn_background(
         summaries_allowed=not current["off_record_seen"],
     )
     credential = (
-        os.environ.get("REMEM_API_KEY", "").strip()
+        (
+            dependencies.primary_credential_override or ""
+        ).strip()
         if "primary" in queued_claim.connection_ids
         else ""
     )
@@ -2019,15 +2189,17 @@ def _background_write_is_current(
     event: dict[str, Any],
     dependencies: Dependencies,
     expected_credential: str,
+    live_state: dict[str, Any] | None = None,
 ) -> bool:
     if _settings(dependencies).mode != "auto":
         return False
     if event["behavior"] == "sessions" and not _engineering_enabled():
         return False
-    live_state = _read_current_state(
-        StateStore(dependencies.state_dir),
-        event["session_id"],
-    )
+    if live_state is None:
+        live_state = _read_current_state(
+            StateStore(dependencies.state_dir),
+            event["session_id"],
+        )
     if live_state is None or live_state["off_record"]:
         return False
     try:
@@ -2105,7 +2277,14 @@ def _process_background_event(
     off_record_seen = bool(
         event["off_record_seen"] or live_state["off_record_seen"]
     )
-    with _selected_credential_scope(credential) as selected_credential:
+    with _selected_credential_scope(
+        credential,
+        primary_override_origin=_uses_explicit_primary_override(
+            dependencies,
+            connection,
+            credential,
+        ),
+    ) as selected_credential:
         if not selected_credential:
             return
         namespace = (
@@ -2169,6 +2348,12 @@ def _process_background_event(
             settings,
             turn_state=turn_state,
             invoke_engineering=False,
+            write_gate=lambda live_state: _background_write_is_current(
+                event,
+                dependencies,
+                selected_credential,
+                live_state,
+            ),
         )
 
 
@@ -2244,6 +2429,13 @@ def handle_event(
     selected_dependencies = dependencies or Dependencies(
         background_writes=True
     )
+    if selected_dependencies.primary_credential_override is None:
+        ambient_primary = os.environ.get("REMEM_API_KEY", "").strip()
+        if ambient_primary:
+            selected_dependencies = replace(
+                selected_dependencies,
+                primary_credential_override=ambient_primary,
+            )
     selected_harness = harness
     fallback = (
         {"continue": True}
@@ -2442,7 +2634,10 @@ def _consume_dispatcher_primary_credential(mode: str) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     primary_override = _consume_dispatcher_primary_credential(args.mode)
-    with _worker_credential_scope(args.mode):
+    with _worker_credential_scope(
+        args.mode,
+        primary_override_origin=args.mode in _WORKER_CREDENTIAL_MODES,
+    ):
         result = handle_event(
             _read_stdin_json(args.mode),
             harness=args.harness,

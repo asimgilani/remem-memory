@@ -1743,6 +1743,424 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertIn("primary", context)
         self.assertIn("secondary", context)
 
+    def test_automatic_recall_loopback_requires_exact_primary_override(
+        self,
+    ) -> None:
+        secondary = _ROUTING.Connection(
+            "conn_66666666666666666666666666666666",
+            "Secondary",
+            "connection:66666666666666666666666666666666",
+            True,
+        )
+        cases = (
+            ("named", secondary, "named-key", "ambient-primary-key", False),
+            (
+                "primary-keychain",
+                _ROUTING.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                "primary-keychain-key",
+                None,
+                False,
+            ),
+            (
+                "primary-explicit",
+                _ROUTING.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                "ignored-keychain-key",
+                "ambient-primary-key",
+                True,
+            ),
+        )
+        for label, selected, resolved_key, primary_override, allowed in cases:
+            with self.subTest(label=label):
+                config = routing_config(
+                    connections=(
+                        _ROUTING.Connection(
+                            "primary",
+                            "Primary",
+                            "default",
+                            True,
+                        ),
+                        secondary,
+                    ),
+                    global_routes={
+                        "recall": (
+                            _ROUTING.RouteTarget(
+                                selected.id,
+                                "recall-space",
+                            ),
+                        )
+                    },
+                )
+                api = FakeAPI(
+                    query_response={
+                        "results": [
+                            {
+                                "title": "Preference",
+                                "content": "Keep answers concise.",
+                            }
+                        ]
+                    }
+                )
+                constructions = []
+
+                def construct(url, credential, *, allow_local_dev=False):
+                    constructions.append(
+                        (url, credential, allow_local_dev)
+                    )
+                    return api
+
+                with tempfile.TemporaryDirectory() as directory:
+                    dependencies = self._dependencies(
+                        directory,
+                        None,
+                        routing_resolver=routed(config),
+                        connection_credential_resolver=(
+                            lambda connection: resolved_key
+                        ),
+                    )
+                    object.__setattr__(
+                        dependencies,
+                        "primary_credential_override",
+                        primary_override,
+                    )
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {
+                                "REMEM_API_URL": (
+                                    "http://127.0.0.1:8765"
+                                ),
+                                "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+                            },
+                            clear=False,
+                        ),
+                        mock.patch.object(
+                            _HOOK,
+                            "RememAPI",
+                            side_effect=construct,
+                        ),
+                    ):
+                        output = _HOOK.handle_event(
+                            prompt_payload(
+                                "What did we decide last time?"
+                            ),
+                            harness="codex",
+                            mode="user_prompt_submit",
+                            dependencies=dependencies,
+                        )
+
+                if allowed:
+                    self.assertEqual(
+                        constructions,
+                        [
+                            (
+                                "http://127.0.0.1:8765",
+                                "ambient-primary-key",
+                                True,
+                            )
+                        ],
+                    )
+                    self.assertEqual(len(api.queries), 1)
+                    self.assertIn("hookSpecificOutput", output)
+                else:
+                    self.assertEqual(constructions, [])
+                    self.assertEqual(api.queries, [])
+                    self.assertEqual(output, {})
+
+    def test_automatic_memory_loopback_requires_exact_primary_override(
+        self,
+    ) -> None:
+        secondary = _ROUTING.Connection(
+            "conn_77777777777777777777777777777777",
+            "Secondary",
+            "connection:77777777777777777777777777777777",
+            True,
+        )
+        cases = (
+            ("named", secondary, "named-key", "ambient-primary-key", False),
+            (
+                "primary-keychain",
+                _ROUTING.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                "primary-keychain-key",
+                None,
+                False,
+            ),
+            (
+                "primary-explicit",
+                _ROUTING.Connection(
+                    "primary",
+                    "Primary",
+                    "default",
+                    True,
+                ),
+                "ignored-keychain-key",
+                "ambient-primary-key",
+                True,
+            ),
+        )
+        for label, selected, resolved_key, primary_override, allowed in cases:
+            with self.subTest(label=label):
+                config = routing_config(
+                    connections=(
+                        _ROUTING.Connection(
+                            "primary",
+                            "Primary",
+                            "default",
+                            True,
+                        ),
+                        secondary,
+                    ),
+                    global_routes={
+                        "memory": (
+                            _ROUTING.RouteTarget(
+                                selected.id,
+                                "durable-memory",
+                            ),
+                        )
+                    },
+                )
+                api = FakeAPI()
+                constructions = []
+
+                def construct(url, credential, *, allow_local_dev=False):
+                    constructions.append(
+                        (url, credential, allow_local_dev)
+                    )
+                    return api
+
+                with tempfile.TemporaryDirectory() as directory:
+                    self._seed_durable_turn(directory)
+                    dependencies = self._dependencies(
+                        directory,
+                        None,
+                        engineering_handler=lambda mode, payload: 0,
+                        routing_resolver=routed(config),
+                        connection_credential_resolver=(
+                            lambda connection: resolved_key
+                        ),
+                    )
+                    object.__setattr__(
+                        dependencies,
+                        "primary_credential_override",
+                        primary_override,
+                    )
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {
+                                "REMEM_API_URL": (
+                                    "http://127.0.0.1:8765"
+                                ),
+                                "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+                            },
+                            clear=False,
+                        ),
+                        mock.patch.object(
+                            _HOOK,
+                            "RememAPI",
+                            side_effect=construct,
+                        ),
+                    ):
+                        _HOOK.handle_event(
+                            stop_payload(),
+                            harness="codex",
+                            mode="stop",
+                            dependencies=dependencies,
+                        )
+
+                if allowed:
+                    self.assertEqual(
+                        constructions,
+                        [
+                            (
+                                "http://127.0.0.1:8765",
+                                "ambient-primary-key",
+                                True,
+                            )
+                        ],
+                    )
+                    self.assertEqual(len(api.ingests), 1)
+                else:
+                    self.assertEqual(constructions, [])
+                    self.assertEqual(api.ingests, [])
+
+    def test_queued_jobs_never_authorize_named_or_keychain_loopback(
+        self,
+    ) -> None:
+        secondary = _ROUTING.Connection(
+            "conn_88888888888888888888888888888888",
+            "Secondary",
+            "connection:88888888888888888888888888888888",
+            True,
+        )
+        primary = _ROUTING.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        credential_cases = (
+            ("named", secondary, "named-key", "ambient-primary-key", False),
+            (
+                "primary-keychain",
+                primary,
+                "primary-keychain-key",
+                None,
+                False,
+            ),
+            (
+                "primary-explicit",
+                primary,
+                "ignored-keychain-key",
+                "ambient-primary-key",
+                True,
+            ),
+        )
+        for behavior in ("sessions", "memory"):
+            for (
+                label,
+                selected,
+                resolved_key,
+                primary_override,
+                allowed,
+            ) in credential_cases:
+                with self.subTest(behavior=behavior, label=label):
+                    target = _ROUTING.RouteTarget(
+                        selected.id,
+                        (
+                            "session-history"
+                            if behavior == "sessions"
+                            else "durable-memory"
+                        ),
+                    )
+                    config = routing_config(
+                        connections=(primary, secondary),
+                        global_routes={behavior: (target,)},
+                        revision=17,
+                    )
+                    if behavior == "sessions":
+                        event_payload = _HOOK._background_payload(
+                            {
+                                "hook_event_name": "PostToolUse",
+                                "session_id": "s1",
+                                "tool_name": "Write",
+                            },
+                            "post_tool_use",
+                        )
+                        lifecycle_mode = "post_tool_use"
+                    else:
+                        event_payload = _HOOK._background_payload(
+                            {
+                                "hook_event_name": "Stop",
+                                "session_id": "s1",
+                                "turn_id": "t1",
+                                "last_assistant_message": (
+                                    "I will keep future answers concise."
+                                ),
+                                "_turn_state": {
+                                    "current_prompt": (
+                                        "Remember that I prefer concise "
+                                        "answers."
+                                    ),
+                                    "turn_id": "t1",
+                                    "off_record": False,
+                                    "off_record_seen": False,
+                                },
+                            },
+                            "stop",
+                        )
+                        lifecycle_mode = "stop"
+                    assert event_payload is not None
+                    event = _HOOK._background_event(
+                        client="codex",
+                        behavior=behavior,
+                        lifecycle_mode=lifecycle_mode,
+                        target=target,
+                        route_revision=17,
+                        session_id="s1",
+                        payload=event_payload,
+                        off_record_seen=False,
+                    )
+                    assert event is not None
+                    engineering_writes = []
+                    api = FakeAPI()
+
+                    def engineering(mode, payload):
+                        del payload
+                        engineering_writes.append(
+                            (
+                                mode,
+                                os.environ.get("REMEM_API_URL"),
+                                os.environ.get("REMEM_API_KEY"),
+                            )
+                        )
+                        return 0
+
+                    with tempfile.TemporaryDirectory() as directory:
+                        self._seed_durable_turn(directory)
+                        dependencies = self._dependencies(
+                            directory,
+                            api if behavior == "memory" else None,
+                            engineering_handler=engineering,
+                            background_writes=True,
+                            routing_resolver=routed(config),
+                            connection_credential_resolver=(
+                                lambda connection: resolved_key
+                            ),
+                        )
+                        object.__setattr__(
+                            dependencies,
+                            "primary_credential_override",
+                            primary_override,
+                        )
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                "REMEM_API_URL": (
+                                    "http://127.0.0.1:8765"
+                                ),
+                                "REMEM_MEMORY_ALLOW_LOCAL_DEV": "1",
+                            },
+                            clear=False,
+                        ):
+                            _HOOK._process_background_event(
+                                event,
+                                dependencies,
+                                _HOOK.Settings(),
+                            )
+
+                    if allowed and behavior == "sessions":
+                        self.assertEqual(
+                            engineering_writes,
+                            [
+                                (
+                                    "post_tool_use",
+                                    "http://127.0.0.1:8765",
+                                    "ambient-primary-key",
+                                )
+                            ],
+                        )
+                    else:
+                        self.assertEqual(engineering_writes, [])
+                    self.assertEqual(
+                        len(api.ingests),
+                        1 if allowed and behavior == "memory" else 0,
+                    )
+
     def test_recall_uses_one_credential_per_connection_without_fallback(
         self,
     ) -> None:
@@ -2067,6 +2485,145 @@ class RememMemoryHookTests(unittest.TestCase):
                 "metrics",
             },
         )
+
+    def test_prompt_state_rejects_redirected_sessions_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "data"
+            redirected = root / "redirected"
+            data_dir.mkdir(mode=0o700)
+            redirected.mkdir(mode=0o700)
+            (data_dir / "sessions").symlink_to(
+                redirected,
+                target_is_directory=True,
+            )
+            store = _HOOK.StateStore(data_dir)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "memory state unavailable",
+            ):
+                store.save("s1", _HOOK._default_state())
+
+            self.assertEqual(list(redirected.iterdir()), [])
+
+    def test_prompt_state_rejects_redirected_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = _HOOK.StateStore(root / "data")
+            store._ensure_directories()
+            victim = root / "victim"
+            victim.write_text("must remain unchanged", encoding="utf-8")
+            os.chmod(victim, 0o644)
+            lock_path = store.path_for("s1").with_suffix(".lock")
+            lock_path.symlink_to(victim)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "memory state unavailable",
+            ):
+                with store.locked("s1"):
+                    self.fail("a symlink lock must never be acquired")
+
+            self.assertEqual(
+                victim.read_text(encoding="utf-8"),
+                "must remain unchanged",
+            )
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
+
+    def test_prompt_state_rejects_redirected_state_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = _HOOK.StateStore(root / "data")
+            store._ensure_directories()
+            victim = root / "victim.json"
+            victim.write_text(
+                json.dumps(_HOOK._default_state()),
+                encoding="utf-8",
+            )
+            os.chmod(victim, 0o600)
+            store.path_for("s1").symlink_to(victim)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "memory state unavailable",
+            ):
+                store.load("s1")
+
+    def test_prompt_state_rejects_redirected_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = _HOOK.StateStore(root / "data")
+            store._ensure_directories()
+            victim = root / "victim"
+            victim.write_text("must remain unchanged", encoding="utf-8")
+            os.chmod(victim, 0o644)
+            store.path_for("s1").symlink_to(victim)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "memory state unavailable",
+            ):
+                store.save("s1", _HOOK._default_state())
+
+            self.assertEqual(
+                victim.read_text(encoding="utf-8"),
+                "must remain unchanged",
+            )
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
+
+    def test_prompt_state_rejects_non_private_state_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = _HOOK.StateStore(Path(directory))
+            store.save("s1", _HOOK._default_state())
+            os.chmod(store.path_for("s1"), 0o644)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "memory state unavailable",
+            ):
+                store.load("s1")
+
+    def test_prompt_state_replace_never_chmods_swapped_destination(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = _HOOK.StateStore(root / "data")
+            victim = root / "victim"
+            victim.write_text("must remain unchanged", encoding="utf-8")
+            os.chmod(victim, 0o644)
+            real_replace = os.replace
+
+            def replace_then_redirect(source, destination, *args, **kwargs):
+                real_replace(source, destination, *args, **kwargs)
+                directory_descriptor = kwargs.get("dst_dir_fd")
+                if directory_descriptor is None:
+                    destination_path = Path(destination)
+                    destination_path.unlink()
+                    destination_path.symlink_to(victim)
+                    return
+                os.unlink(destination, dir_fd=directory_descriptor)
+                os.symlink(
+                    victim,
+                    destination,
+                    dir_fd=directory_descriptor,
+                )
+
+            with mock.patch.object(
+                _HOOK.os,
+                "replace",
+                side_effect=replace_then_redirect,
+            ):
+                store.save("s1", _HOOK._default_state())
+
+            self.assertEqual(
+                victim.read_text(encoding="utf-8"),
+                "must remain unchanged",
+            )
+            self.assertEqual(victim.stat().st_mode & 0o777, 0o644)
 
     def test_stop_captures_one_durable_memory_and_never_continues_agent(
         self,
@@ -3392,7 +3949,10 @@ class RememMemoryHookTests(unittest.TestCase):
             engineering_calls,
             [("task_completed", "s1", "sessions-key")],
         )
-        self.assertEqual(credential_calls, [secondary.id, "primary"])
+        self.assertEqual(
+            credential_calls,
+            [secondary.id, "primary", "primary"],
+        )
         self.assertEqual(factory_calls, [("primary", "memory-key")])
         self.assertEqual(len(memory_api.ingests), 1)
         self.assertEqual(
@@ -3694,6 +4254,181 @@ class RememMemoryHookTests(unittest.TestCase):
 
                 self.assertEqual(gate_results, [False])
                 self.assertEqual(writes, [])
+
+    def test_memory_write_gate_rechecks_immediately_before_ingest(
+        self,
+    ) -> None:
+        primary = _ROUTING.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        initial = routing_config(
+            connections=(primary,),
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "memory-a"),
+                )
+            },
+            revision=4,
+        )
+        changes = (
+            "mode",
+            "off-record",
+            "route",
+            "revision",
+            "target",
+            "credential",
+            "gate-exception",
+            "unchanged",
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                selected_config = [initial]
+                selected_credential = ["original-key"]
+                raise_live_route = [False]
+                api = FakeAPI()
+                factory_calls = []
+                health = []
+
+                def route(behavior, client):
+                    if raise_live_route[0]:
+                        raise RuntimeError("live route unavailable")
+                    config = selected_config[0]
+                    return (
+                        config,
+                        _ROUTING.resolve_routes(
+                            config,
+                            behavior=behavior,
+                            client=client,
+                        ),
+                    )
+
+                with tempfile.TemporaryDirectory() as directory:
+                    self._seed_durable_turn(directory)
+
+                    def mutate_before_capture() -> None:
+                        if change == "mode":
+                            object.__setattr__(
+                                dependencies,
+                                "settings",
+                                _HOOK.Settings(mode="off"),
+                            )
+                        elif change == "off-record":
+                            state = _HOOK.StateStore(Path(directory))
+                            current = state.load("s1")
+                            current["off_record"] = True
+                            state.save("s1", current)
+                        elif change == "route":
+                            selected_config[0] = routing_config(
+                                connections=(primary,),
+                                global_routes={"memory": ()},
+                                revision=4,
+                            )
+                        elif change == "revision":
+                            selected_config[0] = routing_config(
+                                connections=(primary,),
+                                global_routes={
+                                    "memory": (
+                                        _ROUTING.RouteTarget(
+                                            "primary",
+                                            "memory-a",
+                                        ),
+                                    )
+                                },
+                                revision=5,
+                            )
+                        elif change == "target":
+                            selected_config[0] = routing_config(
+                                connections=(primary,),
+                                global_routes={
+                                    "memory": (
+                                        _ROUTING.RouteTarget(
+                                            "primary",
+                                            "memory-b",
+                                        ),
+                                    )
+                                },
+                                revision=4,
+                            )
+                        elif change == "credential":
+                            selected_credential[0] = "replacement-key"
+                        elif change == "gate-exception":
+                            raise_live_route[0] = True
+
+                    def api_factory(connection, credential):
+                        factory_calls.append(
+                            (connection.id, credential)
+                        )
+                        mutate_before_capture()
+                        return api
+
+                    dependencies = self._dependencies(
+                        directory,
+                        None,
+                        background_writes=True,
+                        routing_resolver=route,
+                        connection_credential_resolver=(
+                            lambda connection: selected_credential[0]
+                        ),
+                        api_factory=api_factory,
+                        health_recorder=health.append,
+                    )
+                    event_payload = _HOOK._background_payload(
+                        {
+                            "hook_event_name": "Stop",
+                            "session_id": "s1",
+                            "turn_id": "t1",
+                            "last_assistant_message": (
+                                "I will keep future answers concise."
+                            ),
+                            "_turn_state": {
+                                "current_prompt": (
+                                    "Remember that I prefer concise answers."
+                                ),
+                                "turn_id": "t1",
+                                "off_record": False,
+                                "off_record_seen": False,
+                            },
+                        },
+                        "stop",
+                    )
+                    assert event_payload is not None
+                    event = _HOOK._background_event(
+                        client="codex",
+                        behavior="memory",
+                        lifecycle_mode="stop",
+                        target=_ROUTING.RouteTarget(
+                            "primary",
+                            "memory-a",
+                        ),
+                        route_revision=4,
+                        session_id="s1",
+                        payload=event_payload,
+                        off_record_seen=False,
+                    )
+                    assert event is not None
+
+                    _HOOK._process_background_event(
+                        event,
+                        dependencies,
+                        _HOOK.Settings(),
+                    )
+                    state = _HOOK.StateStore(Path(directory)).load("s1")
+
+                self.assertEqual(
+                    factory_calls,
+                    [("primary", "original-key")],
+                )
+                if change == "unchanged":
+                    self.assertEqual(len(api.ingests), 1)
+                    self.assertEqual(state["completed_turn_ids"], ["t1"])
+                    self.assertEqual(len(health), 1)
+                else:
+                    self.assertEqual(api.ingests, [])
+                    self.assertEqual(state["completed_turn_ids"], [])
+                    self.assertEqual(health, [])
 
     def test_sessions_off_suppresses_enqueue_before_credentials(self) -> None:
         calls = []
