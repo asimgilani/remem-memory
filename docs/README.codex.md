@@ -161,10 +161,21 @@ remem-memory connections use secondary --client codex
 ```
 
 The last command selects Codex's explicit MCP credential; automatic routes
-change only through `routes set`. True read-only isolation requires a separate
-read-only Remem API key stored as a separate connection and selected for both
-Codex recall and MCP. Disabling automatic writes is defense in depth;
-`recall-only` is not a permission boundary.
+change only through `routes set`. For a truly read-only Codex setup, enter a
+separate read-only Remem API key at the hidden prompt as a separate connection
+and configure the complete client override:
+
+```bash
+remem-memory connections add read-only
+remem-memory routes set recall --from read-only/@readable --client codex
+remem-memory routes set memory --to off --client codex
+remem-memory routes set sessions --to off --client codex
+remem-memory connections use read-only --client codex
+```
+
+The API key is the hard permission boundary for explicit calls. The two `off`
+routes are required: they prevent automatic writes from inheriting the
+writable global `primary` route. `recall-only` is not a permission boundary.
 
 No Remem data is migrated, and there are no Remem API changes or Remem portal
 changes.
@@ -185,6 +196,11 @@ If the checkout is dirty, preserve it and stop. The installer can perform a
 narrow, verified legacy Codex credential bridge, and it removes the old MCP
 configuration only after the replacement plugin, Keychain copy, and bundled
 runtime probe are verified.
+
+Command aliases: `remem-dev-sessions`, `remem-session-memory`, and
+`remem-codex`. Skill aliases: `remem-dev-sessions`, `remem-session-memory`,
+and `session-memory`. There is no `session-memory` command and no
+`remem-codex` skill.
 
 For rollback, first use `remem-memory mode off` and keep the checkout,
 credential, `.remem/` logs, and both registrations. That pause is the verified

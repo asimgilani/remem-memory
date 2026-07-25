@@ -180,11 +180,21 @@ can narrow intent but cannot expand a key's access. A `401` or `403` remains a
 credential or API-key scope error and never causes a write to fall back to
 another namespace or connection.
 
-Setting an automatic write route to `off`, using `recall-only`, or selecting a
-different route changes plugin behavior; none is a permission boundary. True
-read-only isolation requires a separate read-only Remem API key stored as a
-separate connection and selected for that client's recall and explicit MCP
-process. Remem then enforces the restriction.
+For a truly read-only Claude setup, enter a separate read-only Remem API key at
+the hidden prompt as a separate connection and configure the complete client
+override:
+
+```bash
+remem-memory connections add read-only
+remem-memory routes set recall --from read-only/@readable --client claude
+remem-memory routes set memory --to off --client claude
+remem-memory routes set sessions --to off --client claude
+remem-memory connections use read-only --client claude
+```
+
+The API key is the hard permission boundary for explicit calls. The two `off`
+routes are required: they prevent automatic writes from inheriting the
+writable global `primary` route. `recall-only` is not a permission boundary.
 
 Routing configuration is versioned, non-secret, and atomically replaced.
 Inspect it with `remem-memory routes show`, restore the simple behavior with

@@ -311,18 +311,30 @@ remem-memory connections use secondary --client codex
 routes change only through `routes set`.
 
 API-key grants and the server default are configured in Remem. The plugin
-selects a connection and namespace route; it never grants access. True
-read-only isolation requires a separate read-only Remem API key stored as a
-separate connection and selected for that client's recall and MCP process.
-Turning its automatic write routes off is useful defense in depth, but
-`recall-only` is not a permission boundary.
+selects a connection and namespace route; it never grants access. For a truly
+read-only Claude setup, enter a separate read-only Remem API key at the hidden
+prompt as a separate connection and configure the complete client override:
+
+```bash
+remem-memory connections add read-only
+remem-memory routes set recall --from read-only/@readable --client claude
+remem-memory routes set memory --to off --client claude
+remem-memory routes set sessions --to off --client claude
+remem-memory connections use read-only --client claude
+```
+
+The API key is the hard permission boundary for explicit calls. The two `off`
+routes are required: they prevent automatic writes from inheriting the
+writable global `primary` route. `recall-only` is not a permission boundary.
 
 ## Updating from remem-dev-sessions
 
 The repository and data stay in place; this is an update to one canonical
-product identity. Existing `remem-dev-sessions`, `remem-session-memory`,
-`session-memory`, and `remem-codex` commands and skills remain compatibility aliases to
-`remem-memory`. They do not run a second memory engine.
+product identity. Command aliases: `remem-dev-sessions`,
+`remem-session-memory`, and `remem-codex`. Skill aliases:
+`remem-dev-sessions`, `remem-session-memory`, and `session-memory`. There is no
+`session-memory` command and no `remem-codex` skill. All remain compatibility
+aliases to `remem-memory`; they do not run a second memory engine.
 
 For an existing clean checkout:
 

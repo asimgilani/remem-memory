@@ -588,6 +588,85 @@ class PackagingDocsTests(unittest.TestCase):
         self.assertIn("not a permission boundary", docs)
         self.assertNotIn("plugin-side permission flag", docs)
 
+    def test_each_maintained_guide_and_canonical_skill_has_complete_read_only_recipe(
+        self,
+    ) -> None:
+        clients = {
+            "README.md": "claude",
+            ".codex/INSTALL.md": "claude",
+            "docs/README.codex.md": "codex",
+            "docs/SECURITY.md": "claude",
+            "plugins/remem-memory/skills/remem-memory/SKILL.md": "claude",
+            "codex/skills/remem-memory/SKILL.md": "claude",
+        }
+        for path, client in clients.items():
+            content = " ".join(read(path).split())
+            with self.subTest(path=path):
+                for command in (
+                    "remem-memory connections add read-only",
+                    (
+                        "remem-memory routes set recall --from "
+                        f"read-only/@readable --client {client}"
+                    ),
+                    (
+                        "remem-memory routes set memory --to off "
+                        f"--client {client}"
+                    ),
+                    (
+                        "remem-memory routes set sessions --to off "
+                        f"--client {client}"
+                    ),
+                    (
+                        "remem-memory connections use read-only "
+                        f"--client {client}"
+                    ),
+                ):
+                    self.assertIn(command, content)
+                lowered = content.lower()
+                self.assertIn("hard permission boundary for explicit calls", lowered)
+                self.assertIn("`off` routes are required", lowered)
+                self.assertIn(
+                    "prevent automatic writes from inheriting the writable "
+                    "global `primary` route",
+                    lowered,
+                )
+
+    def test_install_guides_distinguish_command_and_skill_aliases(self) -> None:
+        command_aliases = (
+            "`remem-dev-sessions`",
+            "`remem-session-memory`",
+            "`remem-codex`",
+        )
+        skill_aliases = (
+            "`remem-dev-sessions`",
+            "`remem-session-memory`",
+            "`session-memory`",
+        )
+        for path in (
+            "README.md",
+            ".codex/INSTALL.md",
+            "docs/README.codex.md",
+        ):
+            content = " ".join(read(path).split())
+            with self.subTest(path=path):
+                command_line = (
+                    "Command aliases: "
+                    + ", ".join(command_aliases[:-1])
+                    + f", and {command_aliases[-1]}."
+                )
+                skill_line = (
+                    "Skill aliases: "
+                    + ", ".join(skill_aliases[:-1])
+                    + f", and {skill_aliases[-1]}."
+                )
+                self.assertIn(command_line, content)
+                self.assertIn(skill_line, content)
+                self.assertIn(
+                    "There is no `session-memory` command and no "
+                    "`remem-codex` skill.",
+                    content,
+                )
+
     def test_docs_explain_claude_update_fetch_and_codex_trust(self) -> None:
         docs = " ".join(read_public_docs().lower().split())
         self.assertIn("claude plugin marketplace update remem-memory", docs)

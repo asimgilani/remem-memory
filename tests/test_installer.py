@@ -742,6 +742,35 @@ class SecureInstallerTests(unittest.TestCase):
     def test_installer_declares_the_exact_release_version(self) -> None:
         self.assertEqual(install_remem_memory.PLUGIN_VERSION, "0.4.0")
 
+    def test_public_command_and_skill_alias_taxonomy_matches_installer(self) -> None:
+        command_aliases = {
+            "remem-dev-sessions",
+            "remem-session-memory",
+            "remem-codex",
+        }
+        skill_aliases = {
+            "remem-dev-sessions",
+            "remem-session-memory",
+            "session-memory",
+        }
+
+        self.assertLessEqual(
+            command_aliases,
+            set(install_remem_memory.COMMAND_ALIASES),
+        )
+        self.assertLessEqual(
+            skill_aliases - {"session-memory"},
+            set(install_remem_memory.SKILL_ALIASES),
+        )
+        self.assertNotIn(
+            "session-memory",
+            install_remem_memory.COMMAND_ALIASES,
+        )
+        self.assertNotIn(
+            "remem-codex",
+            install_remem_memory.SKILL_ALIASES,
+        )
+
     def test_does_not_manage_an_existing_repository_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = InstallerFixture(directory)

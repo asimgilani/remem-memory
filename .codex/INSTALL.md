@@ -78,6 +78,11 @@ The setup:
 - removes old Codex and Claude identities only after the Keychain copy, new
   plugin, and bundled MCP runtime are verified.
 
+Command aliases: `remem-dev-sessions`, `remem-session-memory`, and
+`remem-codex`. Skill aliases: `remem-dev-sessions`, `remem-session-memory`,
+and `session-memory`. There is no `session-memory` command and no
+`remem-codex` skill.
+
 Setup does not migrate Remem data and makes no Remem portal or Remem API
 changes.
 
@@ -218,9 +223,21 @@ remem-memory connections list
 remem-memory connections use secondary --client codex
 ```
 
-True read-only isolation requires a separate read-only Remem API key stored as
-a separate connection and selected for the client's recall and MCP process.
-`recall-only` is not a permission boundary.
+For a truly read-only Claude setup, enter a separate read-only Remem API key at
+the hidden prompt as a separate connection and configure the complete client
+override:
+
+```bash
+remem-memory connections add read-only
+remem-memory routes set recall --from read-only/@readable --client claude
+remem-memory routes set memory --to off --client claude
+remem-memory routes set sessions --to off --client claude
+remem-memory connections use read-only --client claude
+```
+
+The API key is the hard permission boundary for explicit calls. The two `off`
+routes are required: they prevent automatic writes from inheriting the
+writable global `primary` route. `recall-only` is not a permission boundary.
 
 ## Surface boundary
 
