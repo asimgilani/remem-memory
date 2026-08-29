@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 _ROOT = Path(__file__).resolve().parents[1]
-_RELEASE_VERSION = "0.4.0"
+_RELEASE_VERSION = "0.4.1"
 
 
 def load_json(relative_path: str):

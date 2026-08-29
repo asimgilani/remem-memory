@@ -1,7 +1,8 @@
 # Install Remem Memory
 
 Install one `remem-memory` plugin for the compatible clients present on this
-Mac. These instructions are for an agent operating the target host.
+macOS or Linux host. These instructions are for an agent operating the target
+host.
 
 ## Safety rules
 
@@ -16,9 +17,9 @@ Mac. These instructions are for an agent operating the target host.
 
 ## 1. Verify prerequisites
 
-This release supports macOS because it stores the credential in macOS
-Keychain. Require Git, Python 3.10+, and `uv`. At least one of Codex or Claude
-Code should also be installed.
+This release supports macOS Keychain and Linux Secret Service. Require Git,
+Python 3.10+, and `uv`. Linux also requires `secret-tool`. At least one of
+Codex or Claude Code should be installed.
 
 Run non-mutating version checks. If `uv` is missing, install it through the
 host's trusted package manager before continuing. For a Mac with Homebrew:
@@ -71,11 +72,12 @@ The setup:
 - uses standard-library-only local helpers and prepares the private,
   content-addressed MCP cache;
 - installs the canonical command and compatibility aliases;
-- installs and verifies `remem-memory` version `0.4.0` in available Codex and
+- installs and verifies `remem-memory` version `0.4.1` in available Codex and
   Claude Code clients;
 - keeps the older Claude plugin active until the replacement is verified;
-- can bridge one narrowly recognized legacy Codex credential to Keychain; and
-- removes old Codex and Claude identities only after the Keychain copy, new
+- can bridge one narrowly recognized legacy Codex credential to the platform
+  store; and
+- removes old Codex and Claude identities only after the credential copy, new
   plugin, and bundled MCP runtime are verified.
 
 Command aliases: `remem-dev-sessions`, `remem-session-memory`, and
@@ -93,8 +95,14 @@ automatically.
 
 ## 4. Configure the credential
 
-Check the canonical Keychain source without allowing an old environment
-override to mask it:
+Check the canonical platform store without allowing an old environment or
+systemd file override to mask it:
+
+```bash
+env -u REMEM_API_KEY -u REMEM_API_KEY_FILE ~/.local/bin/remem-memory status
+```
+
+Without a systemd file override, the shorter platform-store check remains:
 
 ```bash
 env -u REMEM_API_KEY ~/.local/bin/remem-memory status
@@ -104,22 +112,32 @@ If it reports `credential: missing`, run:
 
 ```bash
 ~/.local/bin/remem-memory auth
-env -u REMEM_API_KEY ~/.local/bin/remem-memory status
+env -u REMEM_API_KEY -u REMEM_API_KEY_FILE ~/.local/bin/remem-memory status
 ```
 
 Let the user enter the API key into the hidden terminal prompt. Do not capture
-or repeat it. The canonical macOS Keychain item is the generic password
-`io.remem.memory` / `default`.
+or repeat it. The canonical platform-store item uses service
+`io.remem.memory` and account `default`.
 
-Credential precedence is:
+Credential precedence is `FD > environment > file > platform store`:
 
-1. a non-empty `REMEM_API_KEY` in the current process environment;
-2. the canonical Keychain item.
+1. a one-use anonymous descriptor in `REMEM_API_KEY_FD`;
+2. a non-empty `REMEM_API_KEY` in the current process environment;
+3. `REMEM_API_KEY_FILE` when it names a protected direct child of
+   `CREDENTIALS_DIRECTORY`; and
+4. the canonical macOS Keychain or Linux Secret Service item.
+
+On Linux, unattended platform-store reads use `secret-tool search` without
+`--unlock`. The deliberate `auth` and `connections add` commands may invoke
+`secret-tool store`. For a headless systemd service, set
+`REMEM_API_KEY_FILE=%d/remem-api-key` after provisioning `remem-api-key` with
+`LoadCredential=` or `LoadCredentialEncrypted=`. Do not point the variable at
+an ordinary configuration file.
 
 The installer never edits shell startup files. If an existing startup file
-exports `REMEM_API_KEY`, it continues to override Keychain. After verifying
-Keychain, ask the user before removing that old export, then run
-`unset REMEM_API_KEY` in the current shell.
+exports `REMEM_API_KEY`, it continues to override the platform store. After
+verifying the platform store, ask the user before removing that old export,
+then run `unset REMEM_API_KEY` in the current shell.
 
 ## 5. Verify and restart
 
@@ -133,7 +151,7 @@ claude plugin list --json
 ```
 
 Skip a client-specific command if that client is not installed. Confirm that
-each installed client reports `remem-memory` enabled at `0.4.0`. Confirm the
+each installed client reports `remem-memory` enabled at `0.4.1`. Confirm the
 old Claude identity is absent or disabled and the old Codex Remem MCP block is
 absent only after the verified bridge.
 
@@ -241,8 +259,9 @@ writable global `primary` route. `recall-only` is not a permission boundary.
 
 ## Surface boundary
 
-This local plugin works in Codex desktop/CLI and Claude Code on this Mac host.
-Codex Remote benefits when its task executes on this configured Mac host.
+This local plugin works in Codex CLI and Claude Code on the configured macOS or
+Linux host, and in Codex desktop on macOS. Codex Remote benefits when its task
+executes on that configured host.
 Ordinary ChatGPT mobile chat, native Claude mobile chat, and an IDE extension
 do not load the plugin.
 Codex Cloud or a different SSH host needs its own installation and credential.
@@ -274,15 +293,15 @@ To pause without uninstalling:
 remem-memory mode off
 ```
 
-The verified rollback boundary in 0.4.0 is `remem-memory mode off`. Keep Remem
-cloud data, Keychain data, project `.remem/` logs, the current checkout, and
-both client registrations intact. Version downgrade is intentionally not
-automated: an older checkout's installer can update an existing canonical Git
-marketplace back to current remote head, and marketplace replacement is not
-transactional across both clients. Do not run an older installer or remove one
-registration. An older unified version requires a tested exact-source
-procedure that verifies both clients, MCP, commands, aliases, and matching
-skill identities before re-enabling it.
+The verified rollback boundary in 0.4.1 is `remem-memory mode off`. Keep Remem
+cloud data, platform credential data, project `.remem/` logs, the current
+checkout, and both client registrations intact. Version downgrade is
+intentionally not automated: an older checkout's installer can update an
+existing canonical Git marketplace back to current remote head, and
+marketplace replacement is not transactional across both clients. Do not run
+an older installer or remove one registration. An older unified version
+requires a tested exact-source procedure that verifies both clients, MCP,
+commands, aliases, and matching skill identities before re-enabling it.
 
 The pre-unification `remem-dev-sessions` hooks do not honor the new persisted
 `mode off`. Treat restoration of that implementation as manual legacy

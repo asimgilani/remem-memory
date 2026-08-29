@@ -103,39 +103,56 @@ the material.
 
 ## Credential handling and precedence
 
-The canonical credential is a macOS Keychain generic password:
+The canonical platform credential uses:
 
 - service: `io.remem.memory`
 - account: `default`
 
-That item backs the implicit `primary` connection. Additional named
-connections use separate opaque Keychain accounts; their labels are non-secret
-local metadata. Route files contain labels and opaque identifiers, never API
-keys.
+On macOS it is a Keychain generic password. On Linux it is a Secret Service
+item. That item backs the implicit `primary` connection. Additional named
+connections use separate opaque platform-store accounts; their labels are
+non-secret local metadata. Route files contain labels and opaque identifiers,
+never API keys.
 
 `remem-memory auth` uses a hidden terminal prompt. `remem-memory status` reports
 only `configured` or `missing`, never the value or a fingerprint. Runtime
 credential precedence is:
 
-1. a non-empty `REMEM_API_KEY` environment variable;
-2. the canonical macOS Keychain item.
+1. a one-use `REMEM_API_KEY_FD` descriptor;
+2. a non-empty `REMEM_API_KEY` environment variable;
+3. a systemd `REMEM_API_KEY_FILE`; and
+4. the canonical platform-store item.
+
+In short, this is `FD > environment > file > platform store`. The file source
+is accepted only as a protected direct child of `CREDENTIALS_DIRECTORY`.
+Directory traversal, symlinks, non-regular files, multiple hard links, loose
+permissions, unexpected ownership, invalid UTF-8, NUL bytes, and values over
+16 KiB fail closed. An explicitly requested but invalid file does not fall
+back to the platform store.
+
+Linux Secret Service reads call `secret-tool search` without `--unlock` so a
+runtime hook cannot ask to unlock a collection. `secret-tool store` is reserved
+for deliberate hidden-prompt authentication commands. A headless systemd unit
+can use `LoadCredential=` or `LoadCredentialEncrypted=` and set
+`REMEM_API_KEY_FILE=%d/remem-api-key`; the expanded file remains inside the
+manager-provided `CREDENTIALS_DIRECTORY`.
 
 Environment precedence supports deliberate process-local overrides for
-`primary` only, but an old shell export can unexpectedly shadow Keychain. It
-does not replace additional named connections. The installer never edits shell
-startup files or `PATH`. The CLI is installed at
-`~/.local/bin/remem-memory`; use that full path if
-`command -v remem-memory` cannot find it. Verify Keychain without the override
-using `env -u REMEM_API_KEY ~/.local/bin/remem-memory status`. Remove a
-pre-existing credential export only after that verification, then use
+`primary` only, but an old shell export can unexpectedly shadow the platform
+store. It does not replace additional named connections. The installer never
+edits shell startup files or `PATH`. The CLI is installed at
+`~/.local/bin/remem-memory`; use that full path if `command -v remem-memory`
+cannot find it. Verify the platform store without either override using
+`env -u REMEM_API_KEY -u REMEM_API_KEY_FILE ~/.local/bin/remem-memory status`.
+Remove a pre-existing credential export only after that verification, then use
 `unset REMEM_API_KEY` in the active shell.
 
 For the one-time legacy Codex bridge, setup parses only one exact basic-string
 `REMEM_API_KEY` assignment in the exact old Remem MCP environment table. It
-copies the value to Keychain, reads it back, and uses constant-time comparison.
-A malformed, duplicate, ambiguous, or different existing value fails closed.
-The legacy MCP block remains until the Keychain copy and canonical Codex plugin
-are verified.
+copies the value to the platform store, reads it back, and uses constant-time
+comparison. A malformed, duplicate, ambiguous, or different existing value
+fails closed. The legacy MCP block remains until the credential copy and
+canonical Codex plugin are verified.
 
 The installer removes `REMEM_API_KEY` from child setup environments and never
 places it in arguments, logs, plugin JSON, marketplace JSON, or new Codex
@@ -143,12 +160,13 @@ configuration.
 
 ### Host boundary
 
-Keychain protects at-rest configuration and reduces accidental exposure. It is
-not a sandbox from the logged-in user: a fully compromised same-user host or a
-user-authorized process may access credentials, process memory, local files,
-or recalled data using the user's authority. This plugin cannot promise
-secrecy against arbitrary local code. Protect the macOS account, approve client
-and hook access deliberately, and revoke the Remem key after a host compromise.
+The platform store protects at-rest configuration and reduces accidental
+exposure. It is not a sandbox from the logged-in user: a fully compromised
+same-user host or a user-authorized process may access credentials, process
+memory, local files, or recalled data using the user's authority. This plugin
+cannot promise secrecy against arbitrary local code. Protect the host account,
+approve client and hook access deliberately, and revoke the Remem key after a
+host compromise.
 
 ### Credential-bearing HTTP proxy and CA boundary
 
@@ -265,7 +283,7 @@ disables transcript/model summaries after an off-record marker within that
 wrapped session. A normal prompt can resume deterministic checkpoints after
 the private file baseline has been advanced.
 
-Hooks fail open: timeouts, missing credentials, Keychain failures, network
+Hooks fail open: timeouts, missing credentials, platform-store failures, network
 errors, invalid responses, or local state errors do not block the user's main
 Claude Code or Codex workflow. The tradeoff is that a recall, capture,
 checkpoint, or rollup may be skipped. `remem-memory status` checks local setup;
@@ -281,15 +299,15 @@ Update only a clean checkout with `git pull --ff-only`; preserve and report a
 dirty checkout instead of forcing it. The installer verifies the new plugin
 before legacy cleanup and stops on credential conflicts.
 
-The verified rollback boundary in 0.4.0 is non-destructive: pause memory and
-keep the current checkout, Keychain item, Remem cloud data, project `.remem/`
-logs, and both client registrations. Version downgrade is intentionally not
-automated. An older checkout's installer can update an existing canonical Git
-marketplace back to current remote head, and source replacement is not
-transactional across both clients. Do not run an older installer or manually
-remove one registration. A downgrade requires a tested exact-source procedure
-that verifies both clients, MCP, commands, aliases, and skill identities before
-re-enabling the plugin.
+The verified rollback boundary in 0.4.1 is non-destructive: pause memory and
+keep the current checkout, platform credential, Remem cloud data, project
+`.remem/` logs, and both client registrations. Version downgrade is
+intentionally not automated. An older checkout's installer can update an
+existing canonical Git marketplace back to current remote head, and source
+replacement is not transactional across both clients. Do not run an older
+installer or manually remove one registration. A downgrade requires a tested
+exact-source procedure that verifies both clients, MCP, commands, aliases, and
+skill identities before re-enabling the plugin.
 
 The pre-unification `remem-dev-sessions` hooks do not read the new persisted
 mode. Restoring that implementation is manual legacy recovery, not the unified

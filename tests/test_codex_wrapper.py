@@ -712,7 +712,7 @@ class CodexWrapperTests(unittest.TestCase):
             "metadata": {},
             "source": "quick_capture",
             "source_id": "checkpoint:safe",
-            "source_path": str(Path.cwd()),
+            "source_path": "/tmp/remem-checkpoint-source",
             "mime_type": "text/markdown",
             "return_id": False,
         }
@@ -722,7 +722,7 @@ class CodexWrapperTests(unittest.TestCase):
             "metadata": {},
             "source": "quick_capture",
             "source_id": "rollup:safe",
-            "source_path": str(Path.cwd()),
+            "source_path": "/tmp/remem-checkpoint-source",
             "mime_type": "text/markdown",
             "return_id": False,
         }
@@ -868,6 +868,45 @@ class CodexWrapperTests(unittest.TestCase):
                     mutation=mutation,
                     blocker=blocker,
                 )
+
+    def test_systemd_file_marker_is_kept_for_live_route_fail_closed(
+        self,
+    ) -> None:
+        credential_directory = "/run/credentials/remem.service"
+        credential_path = credential_directory + "/remem-api-key"
+        with mock.patch.object(
+            _MODULE,
+            "_resolve_live_sessions_route",
+            return_value=None,
+        ) as resolve:
+            with mock.patch.object(
+                _MODULE,
+                "_engineering_control",
+                return_value=_MODULE.EngineeringControl(
+                    mode_auto=True,
+                    off_record=False,
+                    off_record_seen=False,
+                    state_available=True,
+                ),
+            ):
+                result, _checkpoint, _rollup, popen = self._run_wrapper_main(
+                    "/tmp",
+                    extra_environment={
+                        "CREDENTIALS_DIRECTORY": credential_directory,
+                        "REMEM_API_KEY_FILE": credential_path,
+                    },
+                    ingest=True,
+                )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(resolve.called)
+        for call in resolve.call_args_list:
+            self.assertEqual(
+                call.args[0]["REMEM_API_KEY_FILE"],
+                credential_path,
+            )
+        child_environment = popen.call_args.kwargs["env"]
+        self.assertNotIn("REMEM_API_KEY_FILE", child_environment)
 
     def test_wrapper_startup_off_and_recall_only_skip_all_engineering(
         self,

@@ -75,6 +75,7 @@ _DEFAULT_SETTINGS = {
 }
 _DEFAULT_API_URL = "https://api.remem.io"
 _CREDENTIAL_FD_ENV = "REMEM_API_KEY_FD"
+_CREDENTIAL_FILE_ENV = "REMEM_API_KEY_FILE"
 _ROUTE_FD_ENV = "REMEM_MEMORY_ROUTE_FD"
 _LOCAL_DEV_FD_ENV = "REMEM_MEMORY_LOCAL_DEV_FD"
 _RUNTIME_ENV_FD = "REMEM_MEMORY_RUNTIME_ENV_FD"
@@ -896,6 +897,7 @@ def _run_inherited_descriptor_command(
         if not _is_process_injection_variable(name)
     }
     sanitized.pop("REMEM_API_KEY", None)
+    sanitized.pop(_CREDENTIAL_FILE_ENV, None)
     sanitized.pop(_ROUTE_FD_ENV, None)
     sanitized.pop(_CREDENTIAL_FD_ENV, None)
     sanitized.pop(_LOCAL_DEV_FD_ENV, None)
@@ -1029,6 +1031,7 @@ def run_command(command: str, forwarded_args: List[str]) -> int:
     if command == "codex":
         child_environment = sanitized_environment
     else:
+        sanitized_environment.pop(_CREDENTIAL_FILE_ENV, None)
         child_environment = {
             name: sanitized_environment[name]
             for name in _HELPER_ENVIRONMENT_KEYS
@@ -1943,7 +1946,7 @@ def _uv_available() -> bool:
 def _status() -> int:
     settings = load_settings()
     try:
-        credential = remem_api.resolve_api_key()
+        credential = remem_api.resolve_api_key(dict(os.environ))
     except Exception:
         credential = None
     print(f"mode: {settings['mode']}")
@@ -1953,6 +1956,7 @@ def _status() -> int:
         if credential
         else "credential: missing"
     )
+    print(f"platform store: {remem_api.credential_store_name()}")
     try:
         config = _load_or_initialize_routing()
     except Exception:

@@ -3,11 +3,12 @@
 Automatic recall, durable memory, and session continuity for Claude Code and Codex.
 
 Remem Memory is one plugin with one secure credential model. On a configured
-Mac, its hooks recall useful context, selectively retain durable preferences
-and decisions, and preserve session checkpoints and rollups.
+macOS or Linux host, its hooks recall useful context, selectively retain
+durable preferences and decisions, and preserve session checkpoints and
+rollups.
 
 ```text
-Claude Code or Codex on your Mac
+Claude Code or Codex on your host
         │
         ├─ prompt ──> bounded, safe recall ──> answer context
         └─ events ──> durable memory + session continuity
@@ -23,9 +24,10 @@ only while a compatible client needs it.
 
 | Surface | Support |
 | --- | --- |
-| Claude Code on the configured Mac | Plugin skills, hooks, commands, and MCP |
-| Codex CLI and the Codex desktop app on the configured Mac | Plugin skills, hooks, commands, and MCP |
-| Codex Remote | Works when the remote task executes on that configured Mac host |
+| Claude Code on the configured macOS or Linux host | Plugin skills, hooks, commands, and MCP |
+| Codex CLI on the configured macOS or Linux host | Plugin skills, hooks, commands, and MCP |
+| Codex desktop app on the configured Mac | Plugin skills, hooks, commands, and MCP |
+| Codex Remote | Works when the remote task executes on that configured host |
 | Ordinary ChatGPT mobile chat | Does not load this local plugin |
 | IDE extension | Not a supported plugin surface |
 | Codex Cloud or a different SSH host | Needs its own installation and credential |
@@ -36,7 +38,7 @@ conversations use Remem Memory.
 
 ## Quick install
 
-Ask Codex or Claude Code on the target Mac:
+Ask Codex or Claude Code on the target host:
 
 ```text
 Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/remem-memory/refs/heads/master/.codex/INSTALL.md
@@ -47,11 +49,15 @@ Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/
 The installer safely installs and verifies the plugin. Complete these local
 activation steps:
 
-1. Check the canonical Keychain credential:
+1. Check the canonical credential in macOS Keychain or Linux Secret Service:
 
    ```bash
-   env -u REMEM_API_KEY ~/.local/bin/remem-memory status
+   env -u REMEM_API_KEY -u REMEM_API_KEY_FILE \
+     ~/.local/bin/remem-memory status
    ```
+
+   On macOS without a file override,
+   `env -u REMEM_API_KEY ~/.local/bin/remem-memory status` is equivalent.
 
    If it reports `credential: missing`, get a least-privilege API key from your
    [Remem account](https://app.remem.io), then enter it only in the hidden
@@ -89,7 +95,7 @@ and its server default are enough.
 
 Setup is active when the canonical status command above reports the intended
 mode and sensitivity plus `credential: configured`; every installed client
-reports Remem Memory enabled at version `0.4.0`; if Codex is installed, it
+reports Remem Memory enabled at version `0.4.1`; if Codex is installed, it
 shows all five Remem Memory hooks trusted; and a fresh supported-client session
 can use automatic memory.
 
@@ -103,18 +109,18 @@ If activation does not work:
 
 The installer detects Codex and Claude Code, installs the same
 `remem-memory` plugin into each available harness, and verifies version
-`0.4.0` before retiring an older active identity.
+`0.4.1` before retiring an older active identity.
 
 ## Requirements
 
-- macOS, because the supported credential store is macOS Keychain
+- macOS with Keychain, or Linux with Secret Service and `secret-tool`
 - Git and Python 3.10+
 - `uv` on `PATH` before setup starts
 - Codex, Claude Code, or both
 - A Remem API key
 
-Install `uv` with the Mac's trusted package manager if it is missing. With
-Homebrew, use:
+Install `uv` with the host's trusted package manager if it is missing. With
+Homebrew on macOS, use:
 
 ```bash
 brew install uv
@@ -146,11 +152,21 @@ remem-memory auth
 remem-memory status
 ```
 
-`remem-memory auth` uses a hidden terminal prompt and stores the key as the
-macOS Keychain generic password `io.remem.memory` / `default`. The key is not
-placed in plugin manifests, shell startup files, or Codex configuration.
-To verify Keychain rather than an environment override, run
-`env -u REMEM_API_KEY ~/.local/bin/remem-memory status`.
+`remem-memory auth` uses a hidden terminal prompt. It stores the key under
+`io.remem.memory` / `default` in macOS Keychain or Linux Secret Service. The
+key is not placed in plugin manifests, shell startup files, or Codex
+configuration. To verify the platform store rather than an environment
+override, run `env -u REMEM_API_KEY -u REMEM_API_KEY_FILE
+~/.local/bin/remem-memory status`.
+
+For a headless Linux systemd service, provision a service credential and set
+`REMEM_API_KEY_FILE=%d/remem-api-key`. The file must be a protected direct
+child of the directory in `CREDENTIALS_DIRECTORY`; arbitrary file paths,
+symlinks, loose permissions, and oversized files fail closed. Runtime
+precedence is `FD > environment > file > platform store`. Linux platform-store
+reads use `secret-tool search` without `--unlock`, so an unattended lookup
+does not request that a locked collection be opened. `secret-tool store` runs
+only for the deliberate hidden-prompt `auth` and `connections add` commands.
 
 For client-specific reload and trust steps, see [Finish activation](#finish-activation).
 
@@ -351,16 +367,17 @@ delete a dirty checkout to update this plugin.
 
 During the one-time transition, setup accepts only one exact legacy Codex
 `REMEM_API_KEY` basic string from the old Remem MCP environment block. It
-copies that value to the canonical Keychain item, reads it back, and verifies
-it before the new Codex plugin can replace the legacy block. A mismatch fails
-closed and leaves the legacy configuration untouched. Claude's new plugin is
-also verified enabled before its older identity is disabled and removed.
+copies that value to the canonical platform-store item, reads it back, and
+verifies it before the new Codex plugin can replace the legacy block. A
+mismatch fails closed and leaves the legacy configuration untouched. Claude's
+new plugin is also verified enabled before its older identity is disabled and
+removed.
 
 The installer never edits shell startup files. A pre-existing
-`REMEM_API_KEY` environment variable continues to override macOS Keychain. Once
-Keychain setup is verified, remove any old startup-file export yourself and
-run `unset REMEM_API_KEY` in the current shell if you want Keychain to become
-the active source.
+`REMEM_API_KEY` environment variable continues to override the platform store.
+Once platform-store setup is verified, remove any old startup-file export
+yourself and run `unset REMEM_API_KEY` in the current shell if you want the
+platform store to become the active source.
 
 No Remem data is migrated, copied, renamed, or deleted. There are no Remem API
 changes and no Remem portal changes.
@@ -393,10 +410,10 @@ remem-memory mode off
 ```
 
 The verified rollback boundary in this release is the immediate `mode off`
-pause. Keep the current checkout, Keychain item, cloud data, `.remem/` files,
-and both client registrations intact while investigating.
+pause. Keep the current checkout, platform credential, cloud data, `.remem/`
+files, and both client registrations intact while investigating.
 
-Version downgrade is intentionally not automated in 0.4.0. Running an older
+Version downgrade is intentionally not automated in 0.4.1. Running an older
 checkout's installer is not a pin: an existing canonical Git marketplace can
 update back to its current remote head. Replacing that marketplace source is
 client-specific and is not transactional across Codex and Claude Code. Do not
@@ -406,13 +423,13 @@ tested procedure that pins the exact local source in both clients and verifies
 MCP, commands, aliases, and matching skill identities before re-enabling it.
 
 Returning to the pre-unification `remem-dev-sessions` implementation is also a
-manual legacy recovery, not an automated rollback path. Its hooks do not read the new
-persisted `mode off` setting. Keep the unified plugin paused and do not enable
-legacy automation unless the legacy client process is explicitly started with
-`REMEM_MEMORY_AUTO_ENABLED=0`; restore its old Codex MCP, Claude plugin, and
-aliases from a known-good backup and verify all of them before removing the
-unified plugin. No rollback requires deleting cloud data, Keychain data, or
-project `.remem/` logs.
+manual legacy recovery, not an automated rollback path. Its hooks do not read
+the new persisted `mode off` setting. Keep the unified plugin paused and do not
+enable legacy automation unless the legacy client process is explicitly
+started with `REMEM_MEMORY_AUTO_ENABLED=0`; restore its old Codex MCP, Claude
+plugin, and aliases from a known-good backup and verify all of them before
+removing the unified plugin. No rollback requires deleting cloud data,
+platform credentials, or project `.remem/` logs.
 
 See [the Codex guide](docs/README.codex.md) for host-specific use and
 [the security guide](docs/SECURITY.md) for the data and trust boundary.

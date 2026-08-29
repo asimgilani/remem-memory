@@ -8,8 +8,11 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
+import stat
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +37,17 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 16 * 1024
 _KEYCHAIN_INTERACTION_LOCK = threading.RLock()
 _CONNECTION_ACCOUNT = re.compile(r"connection:[0-9a-f]{32}\Z")
+_SECRET_TOOL_ENVIRONMENT_KEYS = (
+    "PATH",
+    "HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+)
 _ERROR_KINDS = frozenset(
     ("auth", "permission", "namespace", "request", "transient")
 )
@@ -54,7 +68,7 @@ class RememCredentialUnavailable(RememAPIError):
 
 
 class RememKeychainError(RememAPIError):
-    """A fixed, non-secret macOS Keychain failure."""
+    """A fixed, non-secret platform credential-store failure."""
 
 
 class Keychain(Protocol):
@@ -591,10 +605,155 @@ class MacOSKeychain:
         return "MacOSKeychain(service='io.remem.memory')"
 
 
-def default_keychain() -> MacOSKeychain:
-    """Return a lazy default adapter without touching Keychain at import time."""
+class LinuxSecretServiceKeychain:
+    """Secret Service adapter for Linux using the standard secret-tool CLI."""
 
+    def __init__(
+        self,
+        *,
+        runner: Optional[Callable[..., Any]] = None,
+        environment: Optional[Mapping[str, str]] = None,
+        executable: Optional[str] = None,
+    ) -> None:
+        self._runner = runner or subprocess.run
+        self._environment = environment
+        self._executable = executable
+
+    def _selected_environment(self) -> dict[str, str]:
+        source = os.environ if self._environment is None else self._environment
+        return {
+            name: source[name]
+            for name in _SECRET_TOOL_ENVIRONMENT_KEYS
+            if name in source and isinstance(source[name], str)
+        }
+
+    def _selected_executable(self) -> str:
+        if isinstance(self._executable, str) and self._executable:
+            return self._executable
+        executable = shutil.which(
+            "secret-tool",
+            path=self._selected_environment().get("PATH"),
+        )
+        if not executable:
+            raise RememKeychainError("Remem credential store is unavailable")
+        return executable
+
+    @staticmethod
+    def _validate_name(value: object) -> str:
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise RememKeychainError("Remem credential store is unavailable")
+        return value
+
+    def read(
+        self,
+        service: str,
+        account: Optional[str] = None,
+    ) -> Optional[str]:
+        """Search without unlocking so unattended reads cannot open a prompt."""
+
+        checked_service = self._validate_name(service)
+        checked_account = self._validate_name(account)
+        command = [
+            self._selected_executable(),
+            "search",
+            "service",
+            checked_service,
+            "account",
+            checked_account,
+        ]
+        try:
+            completed = self._runner(
+                command,
+                env=self._selected_environment(),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            raise RememKeychainError(
+                "Remem credential lookup failed"
+            ) from None
+        if completed.returncode == 1 and not completed.stdout:
+            return None
+        if completed.returncode != 0 or not isinstance(completed.stdout, str):
+            raise RememKeychainError("Remem credential lookup failed")
+        candidates = [
+            line[len("secret = ") :].strip()
+            for line in completed.stdout.splitlines()
+            if line.startswith("secret = ")
+        ]
+        if not candidates:
+            return None
+        if (
+            len(candidates) != 1
+            or not candidates[0]
+            or "\x00" in candidates[0]
+            or len(candidates[0].encode("utf-8")) > _MAX_CREDENTIAL_BYTES
+        ):
+            raise RememKeychainError("Remem credential lookup failed")
+        return candidates[0]
+
+    def write(self, service: str, account: str, value: str) -> None:
+        """Store a secret only during a deliberate interactive auth command."""
+
+        checked_service = self._validate_name(service)
+        checked_account = self._validate_name(account)
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise RememKeychainError("Remem credential storage failed")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise RememKeychainError(
+                "Remem credential storage failed"
+            ) from None
+        if len(encoded) > _MAX_CREDENTIAL_BYTES:
+            raise RememKeychainError("Remem credential storage failed")
+        try:
+            completed = self._runner(
+                [
+                    self._selected_executable(),
+                    "store",
+                    "--label=Remem Memory",
+                    "service",
+                    checked_service,
+                    "account",
+                    checked_account,
+                ],
+                input=value,
+                env=self._selected_environment(),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception:
+            raise RememKeychainError(
+                "Remem credential storage failed"
+            ) from None
+        if completed.returncode != 0:
+            raise RememKeychainError("Remem credential storage failed")
+
+    def __repr__(self) -> str:
+        return "LinuxSecretServiceKeychain(service='io.remem.memory')"
+
+
+def default_keychain() -> Keychain:
+    """Return the host credential adapter without accessing the store."""
+
+    if sys.platform.startswith("linux"):
+        return LinuxSecretServiceKeychain()
     return MacOSKeychain()
+
+
+def credential_store_name() -> str:
+    """Return a public, non-secret name for the active platform store."""
+
+    if sys.platform.startswith("linux"):
+        return "Secret Service"
+    if sys.platform == "darwin":
+        return "macOS Keychain"
+    return "platform credential store"
 
 
 def _is_keychain_account(account: object) -> bool:
@@ -682,6 +841,11 @@ def resolve_connection_api_key(
         explicit = ambient.strip() if isinstance(ambient, str) else ""
         if explicit:
             return explicit
+        file_requested, file_credential = _read_systemd_credential_file(
+            selected_environment
+        )
+        if file_requested:
+            return file_credential
     return resolve_keychain_api_key(
         connection.keychain_account,
         keychain=keychain,
@@ -695,9 +859,12 @@ def resolve_api_key(
     """Resolve the one Remem key without logging or persisting its value."""
 
     selected_environment = os.environ if environment is None else environment
+    file_requested = _credential_file_requested(selected_environment)
     explicit = consume_explicit_api_key(selected_environment)
     if explicit:
         return explicit
+    if file_requested:
+        return None
 
     return resolve_keychain_api_key(
         KEYCHAIN_ACCOUNT,
@@ -708,14 +875,16 @@ def resolve_api_key(
 def consume_explicit_api_key(
     environment: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
-    """Consume an environment/anonymous-FD override without Keychain fallback."""
+    """Consume an FD, environment, or systemd-file override in that order."""
 
     selected = os.environ if environment is None else environment
     descriptor_value = selected.get("REMEM_API_KEY_FD", "")
     raw_explicit = selected.get("REMEM_API_KEY", "")
+    credential_file = selected.get("REMEM_API_KEY_FILE", "")
     if isinstance(selected, MutableMapping):
         selected.pop("REMEM_API_KEY_FD", None)
         selected.pop("REMEM_API_KEY", None)
+        selected.pop("REMEM_API_KEY_FILE", None)
 
     descriptor = -1
     if (
@@ -761,7 +930,119 @@ def consume_explicit_api_key(
         if isinstance(raw_explicit, str)
         else ""
     )
-    return explicit or None
+    if explicit:
+        return explicit
+    _requested, credential = _read_systemd_credential_file(
+        selected,
+        requested_path=credential_file,
+    )
+    return credential
+
+
+def _credential_file_requested(environment: Mapping[str, str]) -> bool:
+    value = environment.get("REMEM_API_KEY_FILE", "")
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _read_systemd_credential_file(
+    environment: Mapping[str, str],
+    *,
+    requested_path: object = None,
+) -> tuple[bool, Optional[str]]:
+    """Read one protected direct child of systemd's credential directory."""
+
+    raw_path = (
+        environment.get("REMEM_API_KEY_FILE", "")
+        if requested_path is None
+        else requested_path
+    )
+    path = raw_path.strip() if isinstance(raw_path, str) else ""
+    if not path:
+        return False, None
+    raw_directory = environment.get("CREDENTIALS_DIRECTORY", "")
+    directory = (
+        raw_directory.strip()
+        if isinstance(raw_directory, str)
+        else ""
+    )
+    if (
+        not directory
+        or not os.path.isabs(directory)
+        or not os.path.isabs(path)
+        or os.path.normpath(directory) != directory
+        or os.path.normpath(path) != path
+        or os.path.dirname(path) != directory
+        or os.path.basename(path) in {"", ".", ".."}
+    ):
+        return True, None
+
+    directory_descriptor = -1
+    credential_descriptor = -1
+    try:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        directory_only = getattr(os, "O_DIRECTORY", 0)
+        if not no_follow or not directory_only:
+            return True, None
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= directory_only
+        directory_flags |= no_follow
+        directory_descriptor = os.open(directory, directory_flags)
+        directory_stat = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid not in {0, os.geteuid()}
+            or directory_stat.st_mode & 0o077
+        ):
+            return True, None
+
+        file_flags = os.O_RDONLY
+        file_flags |= getattr(os, "O_CLOEXEC", 0)
+        file_flags |= no_follow
+        credential_descriptor = os.open(
+            os.path.basename(path),
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        file_stat = os.fstat(credential_descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or file_stat.st_uid not in {0, os.geteuid()}
+            or file_stat.st_mode & 0o077
+            or file_stat.st_size <= 0
+            or file_stat.st_size > _MAX_CREDENTIAL_BYTES
+        ):
+            return True, None
+        chunks: list[bytes] = []
+        remaining = _MAX_CREDENTIAL_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(credential_descriptor, min(4096, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if (
+            not raw
+            or len(raw) > _MAX_CREDENTIAL_BYTES
+            or b"\x00" in raw
+        ):
+            return True, None
+        try:
+            value = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return True, None
+        return True, value or None
+    except (OSError, TypeError, ValueError):
+        return True, None
+    finally:
+        for descriptor in (credential_descriptor, directory_descriptor):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def resolve_api_access(
@@ -773,6 +1054,7 @@ def resolve_api_access(
 
     selected = os.environ if environment is None else environment
     normalized = normalize_api_origin(api_url, allow_local_dev=True)
+    file_requested = _credential_file_requested(selected)
     explicit = consume_explicit_api_key(selected)
     is_production = normalized == _DEFAULT_API_URL
     if not is_production:
@@ -784,6 +1066,8 @@ def resolve_api_access(
         return normalized, explicit
     if explicit:
         return normalized, explicit
+    if file_requested:
+        return normalized, None
     return normalized, resolve_keychain_api_key(
         KEYCHAIN_ACCOUNT,
         keychain=keychain,
@@ -964,12 +1248,14 @@ __all__ = [
     "KEYCHAIN_ACCOUNT",
     "KEYCHAIN_SERVICE",
     "Keychain",
+    "LinuxSecretServiceKeychain",
     "MacOSKeychain",
     "RememAPI",
     "RememAPIError",
     "RememCredentialUnavailable",
     "RememKeychainError",
     "default_keychain",
+    "credential_store_name",
     "consume_explicit_api_key",
     "normalize_api_origin",
     "normalize_api_origin_for_environment",

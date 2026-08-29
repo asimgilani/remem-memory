@@ -1,11 +1,11 @@
 # Remem Memory for Codex
 
-Remem Memory gives Codex on a configured Mac automatic recall, selective
-durable capture, and session checkpoint/rollup continuity.
+Remem Memory gives Codex on a configured macOS or Linux host automatic recall,
+selective durable capture, and session checkpoint/rollup continuity.
 
 ## Install
 
-Tell Codex on the target Mac:
+Tell Codex on the target host:
 
 ```text
 Fetch and follow instructions from https://raw.githubusercontent.com/asimgilani/remem-memory/refs/heads/master/.codex/INSTALL.md
@@ -21,11 +21,11 @@ The installer does not edit `PATH` or shell startup files automatically.
 
 ## Where it works
 
-- Codex CLI and Codex desktop tasks on the configured Mac host load the local
-  plugin.
-- Codex Remote uses it when execution remains on that configured Mac host.
+- Codex CLI tasks on a configured macOS or Linux host load the local plugin.
+- Codex desktop tasks load it on the configured Mac host.
+- Codex Remote uses it when execution remains on that configured host.
 - Ordinary ChatGPT mobile chat and native Claude mobile chat do not load a
-  Mac-local plugin.
+  host-local plugin.
 - An IDE extension, Codex Cloud, or a different SSH host needs separate,
   surface-specific support or its own installation and credential.
 
@@ -102,11 +102,11 @@ checkpoints can resume after a later normal prompt.
 
 ## Credential and MCP
 
-`remem-memory auth` stores the credential in macOS Keychain under
-`io.remem.memory` / `default`; `remem-memory status` reveals only configured or
-missing. An existing `REMEM_API_KEY` environment variable overrides Keychain.
-Verify the Keychain source directly with
-`env -u REMEM_API_KEY ~/.local/bin/remem-memory status`.
+`remem-memory auth` stores the credential under `io.remem.memory` / `default`
+in macOS Keychain or Linux Secret Service; `remem-memory status` reveals only
+configured or missing. An existing `REMEM_API_KEY` environment variable
+overrides the platform store. A Linux systemd unit may instead provide a
+protected `REMEM_API_KEY_FILE` under `CREDENTIALS_DIRECTORY`.
 
 `uv` is the only MCP package-manager prerequisite. Repository helpers use only
 Python's standard library; MCP uses a private, content-addressed cache. The
@@ -194,7 +194,7 @@ remem-memory doctor
 
 If the checkout is dirty, preserve it and stop. The installer can perform a
 narrow, verified legacy Codex credential bridge, and it removes the old MCP
-configuration only after the replacement plugin, Keychain copy, and bundled
+configuration only after the replacement plugin, credential copy, and bundled
 runtime probe are verified.
 
 Command aliases: `remem-dev-sessions`, `remem-session-memory`, and
@@ -204,7 +204,7 @@ and `session-memory`. There is no `session-memory` command and no
 
 For rollback, first use `remem-memory mode off` and keep the checkout,
 credential, `.remem/` logs, and both registrations. That pause is the verified
-rollback boundary in 0.4.0; version downgrade is intentionally not automated.
+rollback boundary in 0.4.1; version downgrade is intentionally not automated.
 An older checkout's installer can update an existing canonical Git marketplace
 back to current remote head, while marketplace replacement is not
 transactional across both clients. Do not run an older installer or partially

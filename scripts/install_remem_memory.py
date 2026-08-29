@@ -6,6 +6,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -33,7 +34,7 @@ KEYCHAIN_SERVICE = _remem_api.KEYCHAIN_SERVICE
 KEYCHAIN_ACCOUNT = _remem_api.KEYCHAIN_ACCOUNT
 PLUGIN_NAME = "remem-memory"
 PLUGIN_ID = "remem-memory@remem-memory"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 LEGACY_PLUGIN_NAME = "remem-dev-sessions"
 LEGACY_PLUGIN_ID = "remem-dev-sessions@remem-dev-sessions"
 CANONICAL_REPOSITORY = "asimgilani/remem-memory"
@@ -621,6 +622,11 @@ class Installer:
                 (tool, "--version"),
                 f"required command unavailable: {tool}",
             )
+        if sys.platform.startswith("linux") and not shutil.which(
+            "secret-tool",
+            path=self.child_environment.get("PATH"),
+        ):
+            raise InstallerError("required command unavailable: secret-tool")
 
     def _validate_repository(self) -> None:
         required = (
@@ -1215,20 +1221,31 @@ class Installer:
 
 
 def _activation_guidance(installed: _InstalledClients) -> str:
+    credential_store = _remem_api.credential_store_name()
+    credential_check = "env -u REMEM_API_KEY"
+    if sys.platform.startswith("linux"):
+        credential_check += " -u REMEM_API_KEY_FILE"
     lines = [
         "Remem Memory installed successfully.",
         "",
         "Finish activation:",
         (
-            "1. Verify Keychain: env -u REMEM_API_KEY "
+            f"1. Verify {credential_store}: {credential_check} "
             "~/.local/bin/remem-memory status"
         ),
         (
             "   If credential is missing: "
             "~/.local/bin/remem-memory auth"
         ),
-        "2. Reload or restart each installed client:",
     ]
+    if sys.platform.startswith("linux"):
+        lines.append(
+            (
+                "   For a systemd service, set REMEM_API_KEY_FILE to a "
+                "credential under CREDENTIALS_DIRECTORY."
+            )
+        )
+    lines.append("2. Reload or restart each installed client:")
     if installed.codex:
         lines.extend(
             (

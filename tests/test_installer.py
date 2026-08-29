@@ -740,7 +740,37 @@ class SecureInstallerTests(unittest.TestCase):
             )
 
     def test_installer_declares_the_exact_release_version(self) -> None:
-        self.assertEqual(install_remem_memory.PLUGIN_VERSION, "0.4.0")
+        self.assertEqual(install_remem_memory.PLUGIN_VERSION, "0.4.1")
+
+    def test_linux_preflight_and_guidance_name_both_credential_sources(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = InstallerFixture(directory)
+            runner = FakeRunner(codex=True)
+            with mock.patch.object(
+                install_remem_memory.sys,
+                "platform",
+                "linux",
+            ):
+                with mock.patch.object(
+                    install_remem_memory.shutil,
+                    "which",
+                    return_value="/usr/bin/secret-tool",
+                ) as which:
+                    result, output = fixture.install(runner=runner)
+
+        self.assertEqual(result, 0, output)
+        self.assertEqual(which.call_args.args, ("secret-tool",))
+        searched_path = which.call_args.kwargs["path"].split(os.pathsep)
+        self.assertEqual(searched_path[0], str(fixture.home / ".local" / "bin"))
+        self.assertEqual(searched_path[1:], ["/test/bin", "/usr/bin", "/bin"])
+        self.assertNotIn(("secret-tool", "--version"), runner.commands)
+        self.assertIn("Secret Service", output)
+        self.assertIn(
+            "env -u REMEM_API_KEY -u REMEM_API_KEY_FILE ",
+            output,
+        )
 
     def test_public_command_and_skill_alias_taxonomy_matches_installer(self) -> None:
         command_aliases = {

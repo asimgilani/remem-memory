@@ -325,6 +325,42 @@ class CanonicalCliTests(unittest.TestCase):
         self.assertNotIn(canary, stdout.getvalue())
         self.assertNotIn(canary, stderr.getvalue())
 
+    def test_codex_forwards_systemd_credential_source_only_to_wrapper(
+        self,
+    ) -> None:
+        credential_directory = "/run/credentials/remem.service"
+        credential_path = credential_directory + "/remem-api-key"
+        completed = subprocess.CompletedProcess([], 0)
+        parent_environment = {
+            "PATH": "/test/bin",
+            "HOME": "/test/home",
+            "CREDENTIALS_DIRECTORY": credential_directory,
+            "REMEM_API_KEY_FILE": credential_path,
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            parent_environment,
+            clear=True,
+        ):
+            with mock.patch.object(
+                remem_memory.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                self.assertEqual(remem_memory.run_command("codex", []), 0)
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            child_environment["CREDENTIALS_DIRECTORY"],
+            credential_directory,
+        )
+        self.assertEqual(
+            child_environment["REMEM_API_KEY_FILE"],
+            credential_path,
+        )
+        self.assertNotIn("REMEM_API_KEY", child_environment)
+
     def test_manual_workflows_reject_plaintext_api_key_arguments(self):
         canary = "vlt_plaintext-argument-secret-canary"
         for arguments in (
@@ -447,6 +483,7 @@ class CanonicalCliTests(unittest.TestCase):
 
         rendered = stdout.getvalue()
         self.assertIn("credential: configured", rendered)
+        self.assertIn("platform store: ", rendered)
         self.assertNotIn(canary, rendered)
         self.assertNotIn("sha256", rendered)
 
@@ -532,10 +569,15 @@ class RoutingCliTests(unittest.TestCase):
 
     def test_routes_show_has_stable_fully_qualified_default_output(self):
         with tempfile.TemporaryDirectory() as directory:
-            result, stdout, stderr = self._run(
-                ["routes", "show"],
-                environment={"REMEM_MEMORY_DATA_DIR": directory},
-            )
+            with mock.patch.object(
+                remem_memory.remem_api,
+                "resolve_connection_api_key",
+                return_value=None,
+            ):
+                result, stdout, stderr = self._run(
+                    ["routes", "show"],
+                    environment={"REMEM_MEMORY_DATA_DIR": directory},
+                )
 
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")

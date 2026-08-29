@@ -175,6 +175,7 @@ def _strict_child_environment(
                 not in {
                     "REMEM_API_KEY",
                     "REMEM_API_KEY_FD",
+                    "REMEM_API_KEY_FILE",
                     _RUNTIME_ENV_FD,
                 }
             }

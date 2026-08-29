@@ -2103,6 +2103,18 @@ def _spawn_background(
                     new_events.append(memory_event)
     if not new_events:
         return output
+    primary_override = dependencies.primary_credential_override
+    if (
+        primary_override is not None
+        and not primary_override.strip()
+    ):
+        new_events = [
+            event
+            for event in new_events
+            if event["connection_id"] != "primary"
+        ]
+    if not new_events:
+        return output
     queue = BackgroundQueueStore(dependencies.state_dir)
     queued_claim = _enqueue_background(
         queue,
@@ -2426,6 +2438,7 @@ def handle_event(
 
     if harness not in {"codex", "claude"}:
         return {}
+    runtime_dependencies = dependencies is None
     selected_dependencies = dependencies or Dependencies(
         background_writes=True
     )
@@ -2436,6 +2449,28 @@ def handle_event(
                 selected_dependencies,
                 primary_credential_override=ambient_primary,
             )
+        else:
+            credential_file = os.environ.get(
+                "REMEM_API_KEY_FILE",
+                "",
+            )
+            should_capture_platform_credential = bool(
+                credential_file.strip()
+            ) or (
+                runtime_dependencies
+                and selected_dependencies.background_writes
+            )
+            if should_capture_platform_credential:
+                try:
+                    captured_primary = resolve_api_key(
+                        environment=dict(os.environ)
+                    )
+                except Exception:
+                    captured_primary = None
+                selected_dependencies = replace(
+                    selected_dependencies,
+                    primary_credential_override=captured_primary or "",
+                )
     selected_harness = harness
     fallback = (
         {"continue": True}

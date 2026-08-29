@@ -5394,6 +5394,207 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertEqual(selected, ["ambient-primary-key"])
         self.assertEqual(keychain_calls, [])
 
+    def test_primary_background_job_captures_systemd_file_credential(
+        self,
+    ) -> None:
+        canary = "remem-linux-background-canary"
+        config = routing_config(
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-history"),
+                )
+            },
+            revision=8,
+        )
+        observed = {}
+
+        def launch(_arguments, **kwargs):
+            environment = kwargs["env"]
+            descriptor = int(environment["REMEM_API_KEY_FD"])
+            observed["credential"] = os.read(descriptor, 8192).decode(
+                "utf-8"
+            )
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            dependencies = self._dependencies(
+                directory,
+                None,
+                background_writes=True,
+                routing_resolver=routed(config),
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CREDENTIALS_DIRECTORY": "/run/credentials/remem.service",
+                    "REMEM_API_KEY_FILE": (
+                        "/run/credentials/remem.service/remem-api-key"
+                    ),
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    _HOOK,
+                    "resolve_api_key",
+                    return_value=canary,
+                ) as resolve:
+                    with mock.patch.object(
+                        _HOOK.subprocess,
+                        "Popen",
+                        side_effect=launch,
+                    ):
+                        _HOOK.handle_event(
+                            {
+                                "hook_event_name": "PostToolUse",
+                                "session_id": "s1",
+                                "tool_name": "Write",
+                            },
+                            harness="codex",
+                            mode="post_tool_use",
+                            dependencies=dependencies,
+                        )
+
+        resolve.assert_called_once()
+        self.assertEqual(observed["credential"], canary)
+
+    def test_primary_background_job_captures_platform_store_credential(
+        self,
+    ) -> None:
+        canary = "remem-linux-secret-service-background-canary"
+        config = routing_config(
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-history"),
+                )
+            },
+            revision=8,
+        )
+        observed = {}
+
+        def resolve(*, environment):
+            observed["resolver_environment"] = dict(environment)
+            return canary
+
+        def launch(_arguments, **kwargs):
+            environment = kwargs["env"]
+            descriptor = int(environment["REMEM_API_KEY_FD"])
+            observed["credential"] = os.read(descriptor, 8192).decode(
+                "utf-8"
+            )
+            observed["worker_has_dbus"] = (
+                "DBUS_SESSION_BUS_ADDRESS" in environment
+            )
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            return process
+
+        with tempfile.TemporaryDirectory() as directory:
+            dependencies = self._dependencies(
+                directory,
+                None,
+                background_writes=True,
+                routing_resolver=routed(config),
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": "/tmp/home",
+                    "PATH": "/usr/bin",
+                    "XDG_RUNTIME_DIR": "/run/user/1000",
+                    "DBUS_SESSION_BUS_ADDRESS": (
+                        "unix:path=/run/user/1000/bus"
+                    ),
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    _HOOK,
+                    "resolve_api_key",
+                    side_effect=resolve,
+                ) as resolver:
+                    with mock.patch.object(
+                        _HOOK,
+                        "Dependencies",
+                        return_value=dependencies,
+                    ):
+                        with mock.patch.object(
+                            _HOOK.subprocess,
+                            "Popen",
+                            side_effect=launch,
+                        ):
+                            _HOOK.handle_event(
+                                {
+                                    "hook_event_name": "PostToolUse",
+                                    "session_id": "s1",
+                                    "tool_name": "Write",
+                                },
+                                harness="claude",
+                                mode="post_tool_use",
+                            )
+
+        resolver.assert_called_once()
+        self.assertEqual(observed["credential"], canary)
+        self.assertEqual(
+            observed["resolver_environment"][
+                "DBUS_SESSION_BUS_ADDRESS"
+            ],
+            "unix:path=/run/user/1000/bus",
+        )
+        self.assertFalse(observed["worker_has_dbus"])
+
+    def test_invalid_systemd_file_does_not_spawn_primary_worker(
+        self,
+    ) -> None:
+        config = routing_config(
+            global_routes={
+                "sessions": (
+                    _ROUTING.RouteTarget("primary", "session-history"),
+                )
+            },
+            revision=8,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            dependencies = self._dependencies(
+                directory,
+                None,
+                background_writes=True,
+                routing_resolver=routed(config),
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CREDENTIALS_DIRECTORY": "/run/credentials/remem.service",
+                    "REMEM_API_KEY_FILE": (
+                        "/run/credentials/remem.service/remem-api-key"
+                    ),
+                },
+                clear=True,
+            ):
+                with mock.patch.object(
+                    _HOOK,
+                    "resolve_api_key",
+                    return_value=None,
+                ) as resolve:
+                    with mock.patch.object(_HOOK.subprocess, "Popen") as popen:
+                        _HOOK.handle_event(
+                            {
+                                "hook_event_name": "PostToolUse",
+                                "session_id": "s1",
+                                "tool_name": "Write",
+                            },
+                            harness="codex",
+                            mode="post_tool_use",
+                            dependencies=dependencies,
+                        )
+            queued = _HOOK.BackgroundQueueStore(Path(directory)).load("s1")
+
+        resolve.assert_called_once()
+        popen.assert_not_called()
+        self.assertEqual(queued, [])
+
     def test_background_worker_without_env_key_resolves_keychain_in_process(
         self,
     ) -> None:

@@ -278,6 +278,7 @@ def _git_branch(repo_root: str) -> str | None:
         environment = os.environ.copy()
         environment.pop("REMEM_API_KEY", None)
         environment.pop("REMEM_API_KEY_FD", None)
+        environment.pop("REMEM_API_KEY_FILE", None)
         out = subprocess.check_output(
             ["git", "-C", repo_root, "branch", "--show-current"],
             stderr=subprocess.DEVNULL,

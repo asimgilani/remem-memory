@@ -34,7 +34,7 @@ MANIFEST_PATHS = (
     "plugins/remem-memory/.claude-plugin/plugin.json",
     "plugins/remem-memory/.codex-plugin/plugin.json",
 )
-RELEASE_VERSION = "0.4.0"
+RELEASE_VERSION = "0.4.1"
 
 
 def read(path: str) -> str:
@@ -146,7 +146,7 @@ class PackagingDocsTests(unittest.TestCase):
             ),
             normalized,
         )
-        self.assertIn("enabled at version `0.4.0`", normalized)
+        self.assertIn("enabled at version `0.4.1`", normalized)
         self.assertIn("if codex is installed", normalized)
         self.assertIn("all five remem memory hooks trusted", normalized)
         self.assertIn(
@@ -157,6 +157,20 @@ class PackagingDocsTests(unittest.TestCase):
         self.assertIn("rerun the installer", normalized)
         self.assertIn("reload-plugins", normalized)
         self.assertIn("remem-memory doctor", normalized)
+
+    def test_linux_credentials_are_documented_without_weak_file_fallbacks(
+        self,
+    ) -> None:
+        docs = read_public_docs()
+        normalized = " ".join(docs.lower().split())
+
+        self.assertIn("linux secret service", normalized)
+        self.assertIn("secret-tool search", normalized)
+        self.assertIn("without `--unlock`", normalized)
+        self.assertIn("remem_api_key_file", normalized)
+        self.assertIn("credentials_directory", normalized)
+        self.assertIn("fd > environment > file > platform store", normalized)
+        self.assertIn("direct child", normalized)
 
     def test_docs_use_one_product_name_and_keep_install_url(self) -> None:
         readme = read("README.md")
