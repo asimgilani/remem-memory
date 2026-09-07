@@ -2112,6 +2112,27 @@ class AutoMemoryHookTests(unittest.TestCase):
             self.assertEqual(caught.exception.kind, "request")
             self.assertEqual(path.read_text(encoding="utf-8"), before)
 
+    def _prepared_checkpoint_row(self, operation_id, source_id):
+        payload = {
+            "source_id": source_id,
+            "metadata": {
+                "project": "remem",
+                "session_id": "sess-a",
+            },
+        }
+        digest = _MODULE._stable_digest(payload)
+        return {
+            "event": "auto_checkpoint_prepared",
+            "operation_id": operation_id,
+            "payload": payload,
+            "payload_digest": digest,
+            "coverage": {
+                "through_seq": 1,
+                "events_since": 1,
+                "window": 1,
+            },
+        }, digest
+
     def test_checkpoint_loader_excludes_pending_and_keeps_legacy(
         self,
     ) -> None:
@@ -2125,31 +2146,18 @@ class AutoMemoryHookTests(unittest.TestCase):
                 },
             },
         }
-        prepared = {
-            "event": "auto_checkpoint_prepared",
-            "operation_id": "a" * 32,
-            "payload": {
-                "source_id": "auto-checkpoint:" + "a" * 32 + ":milestone",
-                "metadata": {
-                    "project": "remem",
-                    "session_id": "sess-a",
-                },
-            },
-        }
-        other_prepared = {
-            "event": "auto_checkpoint_prepared",
-            "operation_id": "b" * 32,
-            "payload": {
-                "source_id": "auto-checkpoint:" + "b" * 32 + ":milestone",
-                "metadata": {
-                    "project": "remem",
-                    "session_id": "sess-a",
-                },
-            },
-        }
+        prepared, digest = self._prepared_checkpoint_row(
+            "a" * 32,
+            "auto-checkpoint:" + "a" * 32 + ":milestone",
+        )
+        other_prepared, _ = self._prepared_checkpoint_row(
+            "b" * 32,
+            "auto-checkpoint:" + "b" * 32 + ":milestone",
+        )
         delivered = {
             "event": "auto_checkpoint_delivered",
             "operation_id": "a" * 32,
+            "payload_digest": digest,
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "memory.ndjson"
@@ -2181,6 +2189,161 @@ class AutoMemoryHookTests(unittest.TestCase):
                 "auto-checkpoint:" + "a" * 32 + ":milestone",
             ],
         )
+
+    def test_checkpoint_loader_follows_delivery_marker_order(
+        self,
+    ) -> None:
+        prepared_a, digest_a = self._prepared_checkpoint_row(
+            "a" * 32,
+            "auto-checkpoint:" + "a" * 32 + ":milestone",
+        )
+        prepared_d, digest_d = self._prepared_checkpoint_row(
+            "d" * 32,
+            "auto-checkpoint:" + "d" * 32 + ":milestone",
+        )
+        delivered_d = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "d" * 32,
+            "payload_digest": digest_d,
+        }
+        delivered_a = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "a" * 32,
+            "payload_digest": digest_a,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.ndjson"
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        prepared_a,
+                        prepared_d,
+                        delivered_d,
+                        delivered_a,
+                        delivered_d,
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rows = _MODULE._load_checkpoint_rows(
+                path,
+                project="remem",
+                session_id="sess-a",
+            )
+        source_ids = [
+            row.get("payload", {}).get("source_id") for row in rows
+        ]
+        self.assertEqual(
+            source_ids,
+            [
+                "auto-checkpoint:" + "d" * 32 + ":milestone",
+                "auto-checkpoint:" + "a" * 32 + ":milestone",
+            ],
+        )
+
+    def test_checkpoint_loader_skips_delivery_without_prepared_link(
+        self,
+    ) -> None:
+        prepared_a, digest_a = self._prepared_checkpoint_row(
+            "a" * 32,
+            "auto-checkpoint:" + "a" * 32 + ":milestone",
+        )
+        delivered_a = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "a" * 32,
+            "payload_digest": "0" * 64,
+        }
+        delivered_missing = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "b" * 32,
+            "payload_digest": digest_a,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.ndjson"
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (prepared_a, delivered_a, delivered_missing)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rows = _MODULE._load_checkpoint_rows(
+                path,
+                project="remem",
+                session_id="sess-a",
+            )
+        self.assertEqual(rows, [])
+
+    def test_legacy_empty_tail_coverage_uses_admitted_end(self) -> None:
+        state = _MODULE._default_state("sess-a")
+        state["events_since_checkpoint"] = 75
+        state["recent_events"] = []
+        coverage = _MODULE._coverage_from_state(state)
+        self.assertEqual(coverage["through_seq"], 75)
+        self.assertEqual(coverage["events_since"], 75)
+        self.assertEqual(coverage["window"], 0)
+        self.assertEqual(state["pending_seq"], 75)
+        self.assertEqual(state["checkpoint_acked_through"], 0)
+        _MODULE._consume_checkpoint_coverage(state, coverage)
+        self.assertEqual(state["events_since_checkpoint"], 0)
+        self.assertEqual(state["checkpoint_acked_through"], 75)
+        self.assertEqual(state["pending_seq"], 75)
+
+    def test_overlapping_consume_does_not_subtract_already_acked_count(
+        self,
+    ) -> None:
+        state = _MODULE._default_state("sess-a")
+        state["events_since_checkpoint"] = 4
+        state["recent_events"] = [
+            {"files": [f"src/seed-{index}.py"]}
+            for index in range(1, 5)
+        ]
+        coverage_a = _MODULE._coverage_from_state(state)
+        self.assertEqual(coverage_a["through_seq"], 4)
+        state["pending_seq"] = int(state["pending_seq"]) + 1
+        state["recent_events"].append({"files": ["src/later-b.py"], "seq": 5})
+        state["events_since_checkpoint"] = 5
+        coverage_b = {
+            "through_seq": 5,
+            "events_since": 5,
+            "window": 5,
+        }
+        state["pending_seq"] = int(state["pending_seq"]) + 1
+        state["recent_events"].append(
+            {"files": ["src/uncovered-c.py"], "seq": 6}
+        )
+        state["events_since_checkpoint"] = 6
+        _MODULE._consume_checkpoint_coverage(state, coverage_a)
+        self.assertEqual(state["events_since_checkpoint"], 2)
+        self.assertEqual(state["checkpoint_acked_through"], 4)
+        _MODULE._consume_checkpoint_coverage(state, coverage_b)
+        self.assertEqual(state["events_since_checkpoint"], 1)
+        self.assertEqual(state["checkpoint_acked_through"], 5)
+        self.assertEqual(
+            [event["files"] for event in state["recent_events"]],
+            [["src/uncovered-c.py"]],
+        )
+
+    def test_legacy_retained_suffix_is_not_the_pending_count(self) -> None:
+        state = _MODULE._default_state("sess-a")
+        state["events_since_checkpoint"] = 75
+        state["recent_events"] = [
+            {"files": [f"src/t{index:02d}.py"]}
+            for index in range(30)
+        ]
+        _MODULE._ensure_event_seqs(state)
+        self.assertEqual(state["pending_seq"], 75)
+        self.assertEqual(state["events_since_checkpoint"], 75)
+        self.assertEqual(len(state["recent_events"]), 30)
+        self.assertEqual(state["recent_events"][0]["seq"], 46)
+        self.assertEqual(state["recent_events"][-1]["seq"], 75)
+        coverage = _MODULE._coverage_from_state(state)
+        self.assertEqual(coverage["through_seq"], 75)
+        self.assertEqual(coverage["window"], 30)
+        self.assertNotEqual(coverage["events_since"], coverage["window"])
 
 
 if __name__ == "__main__":

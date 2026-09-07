@@ -54,6 +54,7 @@ _RECEIPT_PROTOCOL = 2
 _MAX_RECEIPTS = 128
 _MAX_RECEIPT_STARTED_AT = 40
 _MAX_RECEIPT_SOURCE_ID = 200
+_MAX_RECENT_EVENTS = 30
 
 
 class EngineeringWriteRejected(Exception):
@@ -457,21 +458,35 @@ def _is_unavailable(value: object) -> bool:
     return isinstance(value, dict) and value.get("unavailable") is True
 
 
-def _parse_checkpoint_input(value: object) -> dict[str, Any] | None:
+def _parse_coverage(value: object) -> dict[str, int] | None:
     if not isinstance(value, dict) or _is_unavailable(value):
         return None
-    digest = _parse_digest(value.get("digest"))
     through_seq = _nonneg_int(value.get("through_seq"))
     events_since = _nonneg_int(value.get("events_since"))
     window = _nonneg_int(value.get("window"))
-    if None in (digest, through_seq, events_since, window):
+    if None in (through_seq, events_since, window):
+        return None
+    if (
+        window > _MAX_RECENT_EVENTS
+        or window > events_since
+        or through_seq < events_since
+    ):
         return None
     return {
-        "digest": digest,
         "through_seq": through_seq,
         "events_since": events_since,
         "window": window,
     }
+
+
+def _parse_checkpoint_input(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or _is_unavailable(value):
+        return None
+    digest = _parse_digest(value.get("digest"))
+    coverage = _parse_coverage(value)
+    if digest is None or coverage is None:
+        return None
+    return {"digest": digest, **coverage}
 
 
 def _parse_rollup_input(value: object) -> dict[str, Any] | None:
@@ -729,6 +744,15 @@ def _event_seq(event: object) -> int | None:
     return _nonneg_int(event.get("seq"))
 
 
+def _events_since_value(state: dict[str, Any]) -> int:
+    raw = state.get("events_since_checkpoint")
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)) and raw >= 0:
+        return int(raw)
+    return 0
+
+
 def _ensure_event_seqs(state: dict[str, Any]) -> None:
     recent = [
         event
@@ -737,16 +761,35 @@ def _ensure_event_seqs(state: dict[str, Any]) -> None:
     ]
     pending_seq = _nonneg_int(state.get("pending_seq")) or 0
     acked = _nonneg_int(state.get("checkpoint_acked_through")) or 0
+    events_since = _events_since_value(state)
+    sequenced = False
     for event in recent:
         seq = _event_seq(event)
-        if seq is None or seq == 0:
-            pending_seq += 1
-            event["seq"] = pending_seq
-        else:
-            pending_seq = max(pending_seq, seq)
-    state["recent_events"] = recent
-    state["pending_seq"] = max(pending_seq, acked)
+        if seq is not None and seq > 0:
+            sequenced = True
+            break
+    if not sequenced and pending_seq == 0:
+        pending_seq = max(events_since, acked, len(recent))
+        if recent:
+            start = pending_seq - len(recent) + 1
+            if start <= acked:
+                start = acked + 1
+            for index, event in enumerate(recent):
+                event["seq"] = start + index
+            pending_seq = max(pending_seq, int(recent[-1]["seq"]))
+    else:
+        for event in recent:
+            seq = _event_seq(event)
+            if seq is None or seq == 0:
+                pending_seq = max(pending_seq, acked) + 1
+                event["seq"] = pending_seq
+            else:
+                pending_seq = max(pending_seq, seq)
+        pending_seq = max(pending_seq, acked, acked + events_since)
+    state["recent_events"] = recent[-_MAX_RECENT_EVENTS:]
+    state["pending_seq"] = pending_seq
     state["checkpoint_acked_through"] = acked
+    state["events_since_checkpoint"] = pending_seq - acked
 
 
 def _assign_append_seq(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
@@ -754,6 +797,10 @@ def _assign_append_seq(state: dict[str, Any], event: dict[str, Any]) -> dict[str
     state["pending_seq"] = int(state.get("pending_seq") or 0) + 1
     tagged = dict(event)
     tagged["seq"] = state["pending_seq"]
+    state["events_since_checkpoint"] = (
+        int(state["pending_seq"])
+        - int(state.get("checkpoint_acked_through") or 0)
+    )
     return tagged
 
 
@@ -764,13 +811,8 @@ def _coverage_from_state(state: dict[str, Any]) -> dict[str, int]:
         for event in (state.get("recent_events") or [])
         if isinstance(event, dict)
     ]
-    through = 0
-    for event in recent:
-        seq = _event_seq(event) or 0
-        if seq > through:
-            through = seq
     return {
-        "through_seq": through,
+        "through_seq": int(state.get("pending_seq") or 0),
         "events_since": int(state.get("events_since_checkpoint") or 0),
         "window": len(recent),
     }
@@ -782,19 +824,26 @@ def _consume_checkpoint_coverage(
 ) -> None:
     _ensure_event_seqs(state)
     through = int(coverage.get("through_seq") or 0)
-    freeze_since = int(coverage.get("events_since") or 0)
     acked = int(state.get("checkpoint_acked_through") or 0)
     if through <= acked:
         return
+    acked = max(acked, through)
     recent = [
         event
         for event in (state.get("recent_events") or [])
-        if isinstance(event, dict) and (_event_seq(event) or 0) > through
+        if isinstance(event, dict) and (_event_seq(event) or 0) > acked
     ]
-    events_since = int(state.get("events_since_checkpoint") or 0)
-    state["recent_events"] = recent[-30:]
-    state["events_since_checkpoint"] = max(0, events_since - freeze_since)
-    state["checkpoint_acked_through"] = through
+    pending_seq = int(state.get("pending_seq") or 0)
+    state["recent_events"] = recent[-_MAX_RECENT_EVENTS:]
+    state["checkpoint_acked_through"] = acked
+    state["events_since_checkpoint"] = max(0, pending_seq - acked)
+
+
+def _clear_pending_activity(state: dict[str, Any]) -> None:
+    _ensure_event_seqs(state)
+    state["checkpoint_acked_through"] = int(state.get("pending_seq") or 0)
+    state["events_since_checkpoint"] = 0
+    state["recent_events"] = []
 
 
 def _commit_checkpoint_state(config: Config, state: dict[str, Any]) -> None:
@@ -808,8 +857,7 @@ def _commit_checkpoint_state(config: Config, state: dict[str, Any]) -> None:
     if coverage is not None:
         _consume_checkpoint_coverage(state, coverage)
     else:
-        state["events_since_checkpoint"] = 0
-        state["recent_events"] = []
+        _clear_pending_activity(state)
     _mark_receipt(config, state, "checkpoint")
     _save_state(config.state_path, state)
 
@@ -855,12 +903,13 @@ def _sanitize_state(
             for event in recent_events
             if isinstance(event, dict)
             and not _payload_contains_secret(event)
-        ][-30:]
+        ][-_MAX_RECENT_EVENTS:]
         if isinstance(recent_events, list)
         else []
     )
     state["transcript_path"] = _safe_path(value.get("transcript_path"))
     state["receipts"] = _sanitize_receipts(value.get("receipts"))
+    _ensure_event_seqs(state)
     return state
 
 
@@ -1034,6 +1083,119 @@ def _operation_delivered(
         row.get("event") == event_name
         and row.get("operation_id") == operation_id
         for row in _read_ndjson(log_path)
+    )
+
+
+def _reject_operation_input(
+    config: Config,
+    state: dict[str, Any],
+    field: str,
+) -> None:
+    _mark_input_unavailable(config, state, field)
+    raise RememAPIError("Remem request failed", kind="request")
+
+
+def _checkpoint_payload_in_session(
+    payload: object,
+    project: str,
+    session_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("project") != project:
+        return None
+    if metadata.get("session_id") != session_id:
+        return None
+    return payload
+
+
+def _validate_prepared_checkpoint(row: object) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    if row.get("event") != "auto_checkpoint_prepared":
+        return None
+    operation_id = row.get("operation_id")
+    if (
+        not isinstance(operation_id, str)
+        or _REQUEST_IDENTITY.fullmatch(operation_id) is None
+    ):
+        return None
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    digest = _parse_digest(row.get("payload_digest"))
+    if digest is None or digest != _stable_digest(payload):
+        return None
+    coverage = _parse_coverage(row.get("coverage"))
+    if coverage is None:
+        return None
+    return {
+        "operation_id": operation_id,
+        "payload": payload,
+        "digest": digest,
+        "coverage": coverage,
+    }
+
+
+def _validate_prepared_rollup(row: object) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    if row.get("event") != "auto_rollup_prepared":
+        return None
+    operation_id = row.get("operation_id")
+    if (
+        not isinstance(operation_id, str)
+        or _REQUEST_IDENTITY.fullmatch(operation_id) is None
+    ):
+        return None
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    digest = _parse_digest(row.get("payload_digest"))
+    if digest is None or digest != _stable_digest(payload):
+        return None
+    cursor = row.get("cursor")
+    if not isinstance(cursor, dict):
+        return None
+    restored = dict(cursor)
+    restored["payload_digest"] = digest
+    parsed = _parse_rollup_input(restored)
+    if parsed is None:
+        return None
+    return {
+        "operation_id": operation_id,
+        "payload": payload,
+        "digest": digest,
+        "cursor": parsed,
+    }
+
+
+def _checkpoint_input_matches(
+    parsed: dict[str, Any],
+    validated: dict[str, Any],
+) -> bool:
+    coverage = validated["coverage"]
+    return (
+        parsed.get("digest") == validated["digest"]
+        and parsed.get("through_seq") == coverage["through_seq"]
+        and parsed.get("events_since") == coverage["events_since"]
+        and parsed.get("window") == coverage["window"]
+    )
+
+
+def _rollup_input_matches(
+    parsed: dict[str, Any],
+    validated: dict[str, Any],
+) -> bool:
+    cursor = validated["cursor"]
+    return (
+        parsed.get("digest") == cursor.get("digest")
+        and parsed.get("rows") == cursor.get("rows")
+        and parsed.get("last_id") == cursor.get("last_id")
+        and parsed.get("payload_digest") == validated["digest"]
     )
 
 
@@ -2101,32 +2263,44 @@ def _load_checkpoint_rows(
     end: int | None = None,
 ) -> list[dict[str, Any]]:
     rows = _read_ndjson(log_path)
-    delivered_ids = {
-        row.get("operation_id")
-        for row in rows
-        if row.get("event") == "auto_checkpoint_delivered"
-        and isinstance(row.get("operation_id"), str)
-    }
-    selected: list[dict[str, Any]] = []
+    prepared_by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
-        payload = row.get("payload")
-        if not isinstance(payload, dict):
+        validated = _validate_prepared_checkpoint(row)
+        if validated is None:
             continue
-        metadata = payload.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        if metadata.get("project") != project:
-            continue
-        if metadata.get("session_id") != session_id:
-            continue
+        operation_id = validated["operation_id"]
+        if operation_id not in prepared_by_id:
+            prepared_by_id[operation_id] = row
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
         event = row.get("event")
         if event == "auto_checkpoint":
+            if _checkpoint_payload_in_session(
+                row.get("payload"), project, session_id
+            ) is None:
+                continue
             selected.append(row)
-        elif (
-            event == "auto_checkpoint_prepared"
-            and row.get("operation_id") in delivered_ids
-        ):
-            selected.append(row)
+        elif event == "auto_checkpoint_delivered":
+            operation_id = row.get("operation_id")
+            if not isinstance(operation_id, str) or operation_id in seen:
+                continue
+            prepared_row = prepared_by_id.get(operation_id)
+            validated = _validate_prepared_checkpoint(prepared_row)
+            if validated is None:
+                continue
+            marker_digest = row.get("payload_digest")
+            if (
+                marker_digest is not None
+                and marker_digest != validated["digest"]
+            ):
+                continue
+            if _checkpoint_payload_in_session(
+                validated["payload"], project, session_id
+            ) is None:
+                continue
+            selected.append(prepared_row)
+            seen.add(operation_id)
         if end is not None and len(selected) >= end:
             break
     return selected
@@ -2537,38 +2711,28 @@ def _persist_prepared_checkpoint(
             prepared = record
             parsed = receipt["checkpoint_input"]
         else:
-            payload = prepared.get("payload")
-            if not isinstance(payload, dict):
-                _mark_input_unavailable(config, state, "checkpoint_input")
-                raise RememAPIError("Remem request failed", kind="request")
-            coverage = prepared.get("coverage")
-            if not isinstance(coverage, dict):
-                coverage = _coverage_from_state(state)
-            digest = (
-                prepared.get("payload_digest")
-                if isinstance(prepared.get("payload_digest"), str)
-                else _stable_digest(payload)
-            )
-            parsed = _parse_checkpoint_input(
-                {
-                    "digest": digest,
-                    "through_seq": coverage.get("through_seq", 0),
-                    "events_since": coverage.get("events_since", 0),
-                    "window": coverage.get("window", 0),
-                }
-            )
-            if parsed is None:
-                _mark_input_unavailable(config, state, "checkpoint_input")
-                raise RememAPIError("Remem request failed", kind="request")
+            validated = _validate_prepared_checkpoint(prepared)
+            if validated is None:
+                _reject_operation_input(config, state, "checkpoint_input")
+            parsed = {
+                "digest": validated["digest"],
+                **validated["coverage"],
+            }
+            payload = validated["payload"]
             receipt["checkpoint_input"] = parsed
             _replace_receipt(config, state, receipt)
             _save_state(config.state_path, state)
     else:
-        if prepared is None:
-            raise RememAPIError("Remem request failed", kind="request")
-        payload = prepared.get("payload")
-        if not isinstance(payload, dict) or _stable_digest(payload) != parsed["digest"]:
-            raise RememAPIError("Remem request failed", kind="request")
+        validated = _validate_prepared_checkpoint(prepared)
+        if validated is None or not _checkpoint_input_matches(parsed, validated):
+            _reject_operation_input(config, state, "checkpoint_input")
+        payload = validated["payload"]
+    if (
+        not isinstance(payload, dict)
+        or parsed is None
+        or _stable_digest(payload) != parsed["digest"]
+    ):
+        _reject_operation_input(config, state, "checkpoint_input")
     if _operation_delivered(
         config.log_path,
         "auto_checkpoint_delivered",
@@ -2675,19 +2839,11 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
             _mark_input_unavailable(config, state, "rollup_input")
             raise RememAPIError("Remem request failed", kind="request")
         if prepared is not None:
-            payload = prepared.get("payload") if isinstance(prepared.get("payload"), dict) else None
-            cursor = prepared.get("cursor")
-            payload_digest = prepared.get("payload_digest")
-            if payload is None or not isinstance(cursor, dict):
-                _mark_input_unavailable(config, state, "rollup_input")
-                raise RememAPIError("Remem request failed", kind="request")
-            restored = dict(cursor)
-            if isinstance(payload_digest, str):
-                restored["payload_digest"] = payload_digest
-            parsed = _parse_rollup_input(restored)
-            if parsed is None:
-                _mark_input_unavailable(config, state, "rollup_input")
-                raise RememAPIError("Remem request failed", kind="request")
+            validated = _validate_prepared_rollup(prepared)
+            if validated is None:
+                _reject_operation_input(config, state, "rollup_input")
+            parsed = dict(validated["cursor"])
+            payload = validated["payload"]
             receipt["rollup_input"] = parsed
             _replace_receipt(config, state, receipt)
             _save_state(config.state_path, state)
@@ -2736,15 +2892,18 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
         raise RememAPIError("Remem request failed", kind="request")
     if parsed["rows"] == 0:
         return True
-    if payload is None:
-        if prepared is None:
-            raise RememAPIError("Remem request failed", kind="request")
-        payload = prepared.get("payload")
-        if (
-            not isinstance(payload, dict)
-            or _stable_digest(payload) != parsed.get("payload_digest")
-        ):
-            raise RememAPIError("Remem request failed", kind="request")
+    if prepared is None:
+        prepared = _find_prepared_record(
+            config.log_path,
+            "auto_rollup_prepared",
+            config.request_identity or "",
+        )
+    validated = _validate_prepared_rollup(prepared)
+    if validated is None or not _rollup_input_matches(parsed, validated):
+        _reject_operation_input(config, state, "rollup_input")
+    payload = validated["payload"]
+    if _stable_digest(payload) != parsed.get("payload_digest"):
+        _reject_operation_input(config, state, "rollup_input")
     if _operation_delivered(
         config.log_path,
         "auto_rollup_delivered",
@@ -2830,8 +2989,7 @@ def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
             recent = state.get("recent_events")
             recent = recent if isinstance(recent, list) else []
             recent.append(_assign_append_seq(state, event))
-            state["recent_events"] = recent[-30:]
-            state["events_since_checkpoint"] = int(state.get("events_since_checkpoint") or 0) + 1
+            state["recent_events"] = recent[-_MAX_RECENT_EVENTS:]
             _mark_receipt(config, state, "append")
             if config.request_identity:
                 _save_state(config.state_path, state)
@@ -2971,8 +3129,7 @@ def _handle_session_end(config: Config, payload: dict[str, Any]) -> int:
                 return 0
         if not config.request_identity:
             state["last_checkpoint_epoch"] = _utc_now().timestamp()
-            state["events_since_checkpoint"] = 0
-            state["recent_events"] = []
+            _clear_pending_activity(state)
         return _finish_event(config, state)
 
 
