@@ -10,6 +10,7 @@ from unittest import mock
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "plugins" / "remem-memory" / "scripts" / "auto_memory_hook.py"
 sys.path.insert(0, str(_SCRIPT_PATH.parent))
+import remem_api
 _SPEC = importlib.util.spec_from_file_location("auto_memory_hook", _SCRIPT_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC and _SPEC.loader
@@ -598,6 +599,33 @@ class AutoMemoryHookTests(unittest.TestCase):
                     namespace,
                     timeout=20,
                 )
+
+    def test_ingest_propagates_transport_failure_only_with_request_identity(
+        self,
+    ) -> None:
+        payload = {
+            "title": "Trusted checkpoint",
+            "content": "Safe engineering summary.",
+        }
+        failing = mock.Mock()
+        failing.ingest.side_effect = RuntimeError(
+            "synthetic transport failure"
+        )
+        config = _MODULE.Config(
+            **{
+                **_build_cfg().__dict__,
+                "api_key": "selected-key",
+            }
+        )
+        with mock.patch.object(_MODULE, "RememAPI", return_value=failing):
+            self.assertIsNone(_MODULE._ingest(config, payload))
+
+        object.__setattr__(config, "request_identity", "a" * 32)
+        object.__setattr__(config, "propagate_delivery_failure", True)
+        with mock.patch.object(_MODULE, "RememAPI", return_value=failing):
+            with self.assertRaises(remem_api.RememAPIError) as caught:
+                _MODULE._ingest(config, payload)
+        self.assertEqual(caught.exception.kind, "request")
 
     def test_session_write_gate_runs_after_summary_immediately_before_ingest(
         self,

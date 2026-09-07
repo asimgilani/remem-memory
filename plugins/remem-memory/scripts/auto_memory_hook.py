@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -28,6 +29,7 @@ from memory_policy import (
 )
 from remem_api import (
     RememAPI,
+    RememAPIError,
     _NoRedirectHandler,
     _system_tls_context,
     normalize_api_origin_for_environment,
@@ -44,6 +46,14 @@ _DEFAULT_STATE_PATH = ".remem/auto-memory-state.json"
 _DEFAULT_LOG_PATH = ".remem/session-checkpoints.ndjson"
 _DEFAULT_API_URL = "https://api.remem.io"
 _WRITE_GATE_REJECTED = object()
+_REQUEST_IDENTITY = re.compile(r"[0-9a-f]{32}\Z")
+_RECEIPT_OPERATIONS = frozenset({"append", "checkpoint", "rollup"})
+_MAX_RECEIPTS = 128
+_MAX_RECEIPT_STARTED_AT = 40
+
+
+class EngineeringWriteRejected(Exception):
+    """The live write gate rejected this capture as no longer allowed."""
 _DEFAULT_SUMMARY_MAX_MESSAGES = 80
 _DEFAULT_SUMMARY_HEAD_LINES = 120
 _DEFAULT_SUMMARY_TAIL_LINES = 600
@@ -117,6 +127,8 @@ class Config:
     namespace: str | None = None
     allow_local_dev: bool = False
     write_gate: Callable[[], bool] | None = None
+    request_identity: str | None = None
+    propagate_delivery_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -300,6 +312,8 @@ def _load_config(
     connection_id: str | None = None,
     namespace: str | None = None,
     write_gate: Callable[[], bool] | None = None,
+    request_identity: str | None = None,
+    propagate_delivery_failure: bool = False,
 ) -> Config:
     cwd_raw = payload.get("cwd")
     safe_cwd = _safe_cwd_path(cwd_raw)
@@ -372,6 +386,13 @@ def _load_config(
         namespace=namespace,
         allow_local_dev=api_url != _DEFAULT_API_URL,
         write_gate=write_gate,
+        request_identity=(
+            request_identity
+            if isinstance(request_identity, str)
+            and _REQUEST_IDENTITY.fullmatch(request_identity)
+            else None
+        ),
+        propagate_delivery_failure=bool(propagate_delivery_failure),
     )
 
 
@@ -385,7 +406,172 @@ def _default_state(session_id: str) -> dict[str, Any]:
         "checkpoints_created": 0,
         "last_rollup_epoch": 0.0,
         "transcript_path": "",
+        "receipts": {},
     }
+
+
+def _receipt_is_complete(receipt: dict[str, Any]) -> bool:
+    done = receipt.get("done")
+    if not isinstance(done, list):
+        return False
+    operations = {item for item in done if item in _RECEIPT_OPERATIONS}
+    return "rollup" in operations or (
+        "append" in operations and "checkpoint" in operations
+    )
+
+
+def _sanitize_receipts(value: object) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    receipts: dict[str, dict[str, Any]] = {}
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or _REQUEST_IDENTITY.fullmatch(key) is None
+        ):
+            continue
+        done: list[str] = []
+        started_at = ""
+        raw_done: object
+        raw_started: object = ""
+        if isinstance(item, dict):
+            raw_done = item.get("done")
+            raw_started = item.get("started_at")
+        elif isinstance(item, list):
+            raw_done = item
+        else:
+            continue
+        if isinstance(raw_done, list):
+            for operation in raw_done:
+                if (
+                    type(operation) is str
+                    and operation in _RECEIPT_OPERATIONS
+                    and operation not in done
+                ):
+                    done.append(operation)
+        if (
+            isinstance(raw_started, str)
+            and raw_started
+            and len(raw_started) <= _MAX_RECEIPT_STARTED_AT
+            and not contains_secret(raw_started)
+        ):
+            started_at = raw_started
+        if not done and not started_at:
+            continue
+        receipts[key] = {"done": done, "started_at": started_at}
+    if len(receipts) <= _MAX_RECEIPTS:
+        return receipts
+    bounded: dict[str, dict[str, Any]] = {}
+    for key, receipt in receipts.items():
+        if not _receipt_is_complete(receipt):
+            bounded[key] = receipt
+            if len(bounded) >= _MAX_RECEIPTS:
+                return bounded
+    for key, receipt in receipts.items():
+        if key in bounded:
+            continue
+        bounded[key] = receipt
+        if len(bounded) >= _MAX_RECEIPTS:
+            break
+    return bounded
+
+
+def _should_propagate(config: Config) -> bool:
+    return bool(config.request_identity and config.propagate_delivery_failure)
+
+
+def _operation_done(config: Config, state: dict[str, Any], operation: str) -> bool:
+    if not config.request_identity:
+        return False
+    receipts = state.get("receipts")
+    if not isinstance(receipts, dict):
+        return False
+    receipt = receipts.get(config.request_identity)
+    if not isinstance(receipt, dict):
+        return False
+    done = receipt.get("done")
+    return isinstance(done, list) and operation in done
+
+
+def _bound_receipts(
+    receipts: dict[str, dict[str, Any]],
+    *,
+    keep: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    sanitized = _sanitize_receipts(receipts)
+    if keep is None or keep in sanitized or len(sanitized) < _MAX_RECEIPTS:
+        return sanitized
+    current = receipts.get(keep)
+    if not isinstance(current, dict):
+        return sanitized
+    kept = _sanitize_receipts({keep: current}).get(keep)
+    if kept is None:
+        return sanitized
+    if len(sanitized) < _MAX_RECEIPTS:
+        sanitized[keep] = kept
+        return sanitized
+    for key, receipt in list(sanitized.items()):
+        if key != keep and _receipt_is_complete(receipt):
+            del sanitized[key]
+            sanitized[keep] = kept
+            break
+    return sanitized
+
+
+def _ensure_receipt_started(config: Config, state: dict[str, Any]) -> str:
+    timestamp = _utc_now_iso()
+    if not config.request_identity:
+        return timestamp
+    receipts = dict(state.get("receipts") or {})
+    current = dict(
+        receipts.get(config.request_identity)
+        or {"done": [], "started_at": ""}
+    )
+    started = current.get("started_at")
+    if isinstance(started, str) and started:
+        return started
+    current["started_at"] = timestamp
+    current["done"] = list(current.get("done") or [])
+    receipts[config.request_identity] = current
+    state["receipts"] = _bound_receipts(
+        receipts, keep=config.request_identity
+    )
+    _save_state(config.state_path, state)
+    return timestamp
+
+
+def _mark_receipt(config: Config, state: dict[str, Any], operation: str) -> None:
+    if not config.request_identity:
+        return
+    receipts = dict(state.get("receipts") or {})
+    current = dict(
+        receipts.get(config.request_identity)
+        or {"done": [], "started_at": ""}
+    )
+    done = [
+        item
+        for item in (current.get("done") or [])
+        if item in _RECEIPT_OPERATIONS
+    ]
+    if operation not in done:
+        done.append(operation)
+    started = current.get("started_at")
+    current["done"] = done
+    current["started_at"] = (
+        started if isinstance(started, str) and started else _utc_now_iso()
+    )
+    receipts[config.request_identity] = current
+    state["receipts"] = _bound_receipts(
+        receipts, keep=config.request_identity
+    )
+
+
+def _commit_checkpoint_state(config: Config, state: dict[str, Any]) -> None:
+    state["last_checkpoint_epoch"] = _utc_now().timestamp()
+    state["events_since_checkpoint"] = 0
+    state["recent_events"] = []
+    _mark_receipt(config, state, "checkpoint")
+    _save_state(config.state_path, state)
 
 
 def _sanitize_state(
@@ -430,6 +616,7 @@ def _sanitize_state(
         else []
     )
     state["transcript_path"] = _safe_path(value.get("transcript_path"))
+    state["receipts"] = _sanitize_receipts(value.get("receipts"))
     return state
 
 
@@ -1492,8 +1679,9 @@ def _build_checkpoint_payload(
     recent_events: list[dict[str, Any]],
     events_since_checkpoint: int,
     transcript_path: str | None,
+    timestamp: str | None = None,
 ) -> dict[str, Any]:
-    timestamp = _utc_now_iso()
+    timestamp = timestamp or _utc_now_iso()
     project_slug = _slug(config.project)
     session_slug = _slug(config.session_id)
     files_touched = _dedupe(
@@ -1560,9 +1748,12 @@ def _build_checkpoint_payload(
     if next_actions:
         lines.extend(["## Next Actions", *[f"- {item}" for item in next_actions], ""])
 
-    source_id = (
-        f"auto-checkpoint:{project_slug}:{session_slug}:{kind}:{timestamp}"
-    )
+    if config.request_identity:
+        source_id = f"auto-checkpoint:{config.request_identity}:{kind}"
+    else:
+        source_id = (
+            f"auto-checkpoint:{project_slug}:{session_slug}:{kind}:{timestamp}"
+        )
     source_id = source_id[:200]
 
     result = {
@@ -1632,8 +1823,12 @@ def _load_checkpoint_rows(log_path: Path, *, project: str, session_id: str) -> l
     return rows
 
 
-def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict[str, Any]:
-    timestamp = _utc_now_iso()
+def _build_rollup_payload(
+    config: Config,
+    records: list[dict[str, Any]],
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    timestamp = timestamp or _utc_now_iso()
     project_slug = _slug(config.project)
     session_slug = _slug(config.session_id)
     rolling = (
@@ -1737,7 +1932,10 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     if next_actions:
         lines.extend(["## Next Actions", *[f"- {item}" for item in next_actions], ""])
 
-    source_id = f"auto-rollup:{project_slug}:{session_slug}:{timestamp}"
+    if config.request_identity:
+        source_id = f"auto-rollup:{config.request_identity}"
+    else:
+        source_id = f"auto-rollup:{project_slug}:{session_slug}:{timestamp}"
     source_id = source_id[:200]
 
     llm_meta: dict[str, Any] = {}
@@ -1787,7 +1985,12 @@ def _build_rollup_payload(config: Config, records: list[dict[str, Any]]) -> dict
     return result
 
 
-def _ingest(config: Config, payload: dict[str, Any]) -> object | None:
+def _ingest(
+    config: Config,
+    payload: dict[str, Any],
+    *,
+    operation: str | None = None,
+) -> object | None:
     if (
         _payload_contains_secret(
             payload,
@@ -1795,6 +1998,10 @@ def _ingest(config: Config, payload: dict[str, Any]) -> object | None:
         )
         or not config.api_key
     ):
+        if _should_propagate(config) and not config.api_key:
+            raise RememAPIError(
+                "Remem credential unavailable", kind="credential"
+            )
         return None
     try:
         api = RememAPI(
@@ -1805,13 +2012,37 @@ def _ingest(config: Config, payload: dict[str, Any]) -> object | None:
         if config.write_gate is not None:
             try:
                 allowed = config.write_gate()
+            except RememAPIError:
+                if _should_propagate(config):
+                    raise
+                allowed = False
             except Exception:
+                if _should_propagate(config):
+                    raise RememAPIError(
+                        "Remem request failed", kind="request"
+                    ) from None
                 allowed = False
             if not allowed:
+                if _should_propagate(config):
+                    raise EngineeringWriteRejected()
                 return _WRITE_GATE_REJECTED
-        return api.ingest(payload, config.namespace, timeout=20)
+        kwargs: dict[str, str] = {}
+        if config.request_identity and operation:
+            kwargs["idempotency_key"] = (
+                f"{config.request_identity}:{operation}"
+            )
+        return api.ingest(
+            payload, config.namespace, timeout=20, **kwargs
+        )
+    except (RememAPIError, EngineeringWriteRejected):
+        if _should_propagate(config):
+            raise
     except Exception:  # pragma: no cover
         sys.stderr.write("[remem-memory] ingest failed\n")
+        if _should_propagate(config):
+            raise RememAPIError(
+                "Remem request failed", kind="request"
+            ) from None
     return None
 
 
@@ -1821,12 +2052,13 @@ def _persist_checkpoint(
     kind: str,
     hook_event: str,
     state: dict[str, Any],
-) -> None:
+) -> bool:
     recent_events = state.get("recent_events")
     recent_events = recent_events if isinstance(recent_events, list) else []
     events_since = int(state.get("events_since_checkpoint") or 0)
     transcript_path = state.get("transcript_path")
     transcript_path = transcript_path if isinstance(transcript_path, str) and transcript_path.strip() else None
+    timestamp = _ensure_receipt_started(config, state)
     payload = _build_checkpoint_payload(
         config=config,
         kind=kind,
@@ -1834,30 +2066,42 @@ def _persist_checkpoint(
         recent_events=[event for event in recent_events if isinstance(event, dict)],
         events_since_checkpoint=events_since,
         transcript_path=transcript_path,
+        timestamp=timestamp,
     )
-    response = _ingest(config, payload)
+    response = _ingest(config, payload, operation="checkpoint")
     if response is _WRITE_GATE_REJECTED:
-        return
+        return False
+    if response is None and _should_propagate(config):
+        return True
     _append_ndjson(
         config.log_path,
-        {"timestamp": _utc_now_iso(), "event": "auto_checkpoint", "payload": payload, "response": response},
+        {"timestamp": timestamp, "event": "auto_checkpoint", "payload": payload, "response": response},
         trusted_fragments=(str(config.cwd),),
     )
+    return True
 
 
-def _persist_rollup(config: Config) -> None:
+def _persist_rollup(config: Config, state: dict[str, Any] | None = None) -> bool:
     records = _load_checkpoint_rows(config.log_path, project=config.project, session_id=config.session_id)
     if not records:
-        return
-    payload = _build_rollup_payload(config, records)
-    response = _ingest(config, payload)
+        return True
+    timestamp = (
+        _ensure_receipt_started(config, state)
+        if state is not None
+        else _utc_now_iso()
+    )
+    payload = _build_rollup_payload(config, records, timestamp=timestamp)
+    response = _ingest(config, payload, operation="rollup")
     if response is _WRITE_GATE_REJECTED:
-        return
+        return False
+    if response is None and _should_propagate(config):
+        return True
     _append_ndjson(
         config.log_path,
-        {"timestamp": _utc_now_iso(), "event": "auto_rollup", "payload": payload, "response": response},
+        {"timestamp": timestamp, "event": "auto_rollup", "payload": payload, "response": response},
         trusted_fragments=(str(config.cwd),),
     )
+    return True
 
 
 def _should_interval_checkpoint(state: dict[str, Any], config: Config) -> bool:
@@ -1882,23 +2126,29 @@ def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
         transcript_path = _safe_path(payload.get("transcript_path"))
         if transcript_path:
             state["transcript_path"] = transcript_path
-        recent = state.get("recent_events")
-        recent = recent if isinstance(recent, list) else []
-        recent.append(event)
-        state["recent_events"] = recent[-30:]
-        state["events_since_checkpoint"] = int(state.get("events_since_checkpoint") or 0) + 1
+        if not _operation_done(config, state, "append"):
+            recent = state.get("recent_events")
+            recent = recent if isinstance(recent, list) else []
+            recent.append(event)
+            state["recent_events"] = recent[-30:]
+            state["events_since_checkpoint"] = int(state.get("events_since_checkpoint") or 0) + 1
+            _mark_receipt(config, state, "append")
+            if config.request_identity:
+                _save_state(config.state_path, state)
 
-        if _should_interval_checkpoint(state, config):
-            _persist_checkpoint(
+        if _should_interval_checkpoint(state, config) and not _operation_done(
+            config, state, "checkpoint"
+        ):
+            persisted = _persist_checkpoint(
                 config=config,
                 kind="interval",
                 hook_event=_safe_event_name(payload, "PostToolUse"),
                 state=state,
             )
-            state["last_checkpoint_epoch"] = _utc_now().timestamp()
-            state["events_since_checkpoint"] = 0
-            state["recent_events"] = []
-            state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+            if persisted:
+                state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+                _commit_checkpoint_state(config, state)
+                return 0
         _save_state(config.state_path, state)
     return 0
 
@@ -1911,19 +2161,19 @@ def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
         if transcript_path:
             state["transcript_path"] = transcript_path
         events_since = int(state.get("events_since_checkpoint") or 0)
-        if events_since <= 0:
+        if events_since <= 0 or _operation_done(config, state, "checkpoint"):
             _save_state(config.state_path, state)
             return 0
-        _persist_checkpoint(
+        persisted = _persist_checkpoint(
             config=config,
             kind="milestone",
             hook_event=_safe_event_name(payload, "TaskCompleted"),
             state=state,
         )
-        state["last_checkpoint_epoch"] = _utc_now().timestamp()
-        state["events_since_checkpoint"] = 0
-        state["recent_events"] = []
-        state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+        if persisted:
+            state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+            _commit_checkpoint_state(config, state)
+            return 0
         _save_state(config.state_path, state)
     return 0
 
@@ -1943,17 +2193,20 @@ def _handle_pre_compact(config: Config, payload: dict[str, Any]) -> int:
         if last_epoch > 0 and events_since <= 0 and (_utc_now().timestamp() - last_epoch) < 30:
             _save_state(config.state_path, state)
             return 0
+        if _operation_done(config, state, "checkpoint"):
+            _save_state(config.state_path, state)
+            return 0
 
-        _persist_checkpoint(
+        persisted = _persist_checkpoint(
             config=config,
             kind="milestone",
             hook_event=_safe_event_name(payload, "PreCompact"),
             state=state,
         )
-        state["last_checkpoint_epoch"] = _utc_now().timestamp()
-        state["events_since_checkpoint"] = 0
-        state["recent_events"] = []
-        state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+        if persisted:
+            state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
+            _commit_checkpoint_state(config, state)
+            return 0
         _save_state(config.state_path, state)
     return 0
 
@@ -1966,20 +2219,37 @@ def _handle_session_end(config: Config, payload: dict[str, Any]) -> int:
         if transcript_path:
             state["transcript_path"] = transcript_path
         events_since = int(state.get("events_since_checkpoint") or 0)
-        if events_since > 0:
-            _persist_checkpoint(
+        if events_since > 0 and not _operation_done(config, state, "checkpoint"):
+            persisted = _persist_checkpoint(
                 config=config,
                 kind="milestone",
                 hook_event=_safe_event_name(payload, "SessionEnd"),
                 state=state,
             )
-            state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
-        if config.rollup_on_session_end:
-            _persist_rollup(config)
-            state["last_rollup_epoch"] = _utc_now().timestamp()
-        state["last_checkpoint_epoch"] = _utc_now().timestamp()
-        state["events_since_checkpoint"] = 0
-        state["recent_events"] = []
+            if persisted:
+                state["checkpoints_created"] = int(
+                    state.get("checkpoints_created") or 0
+                ) + 1
+                _commit_checkpoint_state(config, state)
+                state = _load_state(config.state_path, config.session_id)
+            elif not config.request_identity:
+                state["checkpoints_created"] = int(
+                    state.get("checkpoints_created") or 0
+                ) + 1
+        if config.rollup_on_session_end and not _operation_done(
+            config, state, "rollup"
+        ):
+            persisted_rollup = _persist_rollup(config, state)
+            if persisted_rollup:
+                state["last_rollup_epoch"] = _utc_now().timestamp()
+                _mark_receipt(config, state, "rollup")
+                if config.request_identity:
+                    _save_state(config.state_path, state)
+                    return 0
+        if not config.request_identity:
+            state["last_checkpoint_epoch"] = _utc_now().timestamp()
+            state["events_since_checkpoint"] = 0
+            state["recent_events"] = []
         _save_state(config.state_path, state)
     return 0
 
@@ -2002,6 +2272,8 @@ def handle_payload(
     connection_id: str | None = None,
     namespace: str | None = None,
     write_gate: Callable[[], bool] | None = None,
+    request_identity: str | None = None,
+    propagate_delivery_failure: bool = False,
 ) -> int:
     """Run one existing engineering hook mode for an already-parsed payload."""
 
@@ -2010,6 +2282,8 @@ def handle_payload(
         connection_id=connection_id,
         namespace=namespace,
         write_gate=write_gate,
+        request_identity=request_identity,
+        propagate_delivery_failure=propagate_delivery_failure,
     )
     if not config.enabled:
         return 0

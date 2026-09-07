@@ -64,9 +64,17 @@ Session and queue filenames use a hash rather than the raw session ID.
 Failed automatic captures remain in that bounded queue for at most three
 automatic delivery attempts. An exhausted event stays recoverable in the
 queue with non-content status, reason, and attempt diagnostics; successful
-delivery or an explicit policy rejection removes it. The queue's existing
-128-event and 262,144-byte limits still apply, so this does not promise
-indefinite retention or backend exactly-once ingestion.
+delivery or an explicit policy rejection removes it. Admission and payload
+retention stay at 128 events and 262,144 bytes. The same queue file may grow
+by a separately bounded diagnostic reserve used only for those non-content
+retry fields, never for payload. Engineering receipts stored with local
+session state are bounded IDs, operation enums, and counts/progress only.
+Retrying a checkpoint or rollup reuses a frozen per-event timestamp and
+source identity when those exist; optional summary-provider text and git
+metadata may still change under the same idempotency key. Backend ingest
+idempotency (issue 61) must treat that residual mutation. This does not
+promise indefinite retention or exactly-once ingestion across a crash
+between network delivery and local receipt persistence.
 
 Session automation keeps project-local files under `.remem/`, normally:
 
