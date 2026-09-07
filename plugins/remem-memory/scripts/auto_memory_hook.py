@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from collections import deque
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from urllib import request as urllib_request
 from memory_policy import (
     contains_explicit_secret,
     contains_secret,
+    evaluate_automatic_capture,
     is_off_record,
 )
 from remem_api import (
@@ -216,24 +218,54 @@ def _payload_contains_secret(
     *,
     trusted_fragments: tuple[str, ...] = (),
 ) -> bool:
-    try:
-        serialized = json.dumps(payload, ensure_ascii=True)
-    except (TypeError, ValueError):
-        return True
-    for fragment in sorted(
-        (item for item in trusted_fragments if item),
-        key=len,
-        reverse=True,
-    ):
-        encoded_fragment = json.dumps(
-            fragment,
-            ensure_ascii=True,
-        )[1:-1]
-        serialized = serialized.replace(
-            encoded_fragment,
-            "[trusted-local-path]",
-        )
-    return contains_secret(serialized)
+    return not evaluate_automatic_capture(
+        payload,
+        trusted_fragments=trusted_fragments,
+    ).allowed
+
+
+def _payload_trusted_fragments(
+    payload: object,
+    extra: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    fragments = [item for item in extra if item]
+    if isinstance(payload, Mapping):
+        source_path = payload.get("source_path")
+        if (
+            isinstance(source_path, str)
+            and source_path
+            and not contains_explicit_secret(source_path)
+        ):
+            fragments.append(source_path)
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping):
+            repo_root = metadata.get("repo_root")
+            if (
+                isinstance(repo_root, str)
+                and repo_root
+                and not contains_explicit_secret(repo_root)
+            ):
+                fragments.append(repo_root)
+    return tuple(fragments)
+
+
+def _reject_automatic_capture(config: Config) -> bool:
+    if _should_propagate(config):
+        raise EngineeringWriteRejected()
+    return False
+
+
+def _prepared_record_blocked(row: object, config: Config) -> bool:
+    if not isinstance(row, dict):
+        return False
+    payload = row.get("payload")
+    return _payload_contains_secret(
+        payload,
+        trusted_fragments=_payload_trusted_fragments(
+            payload,
+            (str(config.cwd),),
+        ),
+    )
 
 
 def _safe_path(value: object, *, limit: int = 2000) -> str:
@@ -1163,6 +1195,11 @@ def _validate_prepared_checkpoint(row: object) -> dict[str, Any] | None:
     payload = row.get("payload")
     if not isinstance(payload, dict):
         return None
+    if _payload_contains_secret(
+        payload,
+        trusted_fragments=_payload_trusted_fragments(payload),
+    ):
+        return None
     digest = _parse_digest(row.get("payload_digest"))
     if digest is None or digest != _stable_digest(payload):
         return None
@@ -1190,6 +1227,11 @@ def _validate_prepared_rollup(row: object) -> dict[str, Any] | None:
         return None
     payload = row.get("payload")
     if not isinstance(payload, dict):
+        return None
+    if _payload_contains_secret(
+        payload,
+        trusted_fragments=_payload_trusted_fragments(payload),
+    ):
         return None
     digest = _parse_digest(row.get("payload_digest"))
     if digest is None or digest != _stable_digest(payload):
@@ -2562,14 +2604,15 @@ def _ingest(
     *,
     operation: str | None = None,
 ) -> object | None:
-    if (
-        _payload_contains_secret(
-            payload,
-            trusted_fragments=(str(config.cwd),),
-        )
-        or not config.api_key
+    if _payload_contains_secret(
+        payload,
+        trusted_fragments=(str(config.cwd),),
     ):
-        if _should_propagate(config) and not config.api_key:
+        if _should_propagate(config):
+            raise EngineeringWriteRejected()
+        return None
+    if not config.api_key:
+        if _should_propagate(config):
             raise RememAPIError(
                 "Remem credential unavailable", kind="credential"
             )
@@ -2700,6 +2743,8 @@ def _persist_prepared_checkpoint(
         "auto_checkpoint_prepared",
         config.request_identity or "",
     )
+    if _prepared_record_blocked(prepared, config):
+        return _reject_automatic_capture(config)
     if parsed is None:
         if receipt.get("protocol") != _RECEIPT_PROTOCOL:
             _mark_input_unavailable(config, state, "checkpoint_input")
@@ -2718,7 +2763,7 @@ def _persist_prepared_checkpoint(
                 payload,
                 trusted_fragments=(str(config.cwd),),
             ):
-                return True
+                return _reject_automatic_capture(config)
             if not _live_write_allowed(config):
                 return False
             digest = _stable_digest(payload)
@@ -2879,6 +2924,8 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
         "auto_rollup_prepared",
         config.request_identity or "",
     )
+    if _prepared_record_blocked(prepared, config):
+        return _reject_automatic_capture(config)
     payload: dict[str, Any] | None = None
     if parsed is None:
         if receipt.get("protocol") != _RECEIPT_PROTOCOL:
@@ -2903,10 +2950,7 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
                     payload,
                     trusted_fragments=(str(config.cwd),),
                 ):
-                    receipt["rollup_input"] = cursor
-                    _replace_receipt(config, state, receipt)
-                    _save_state(config.state_path, state)
-                    return True
+                    return _reject_automatic_capture(config)
                 if not _live_write_allowed(config):
                     return False
                 payload_digest = _stable_digest(payload)

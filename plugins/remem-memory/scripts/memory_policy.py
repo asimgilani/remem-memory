@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter
@@ -15,6 +16,33 @@ from typing import Any
 _MAX_QUERY = 2000
 _MAX_CONTEXT = 6000
 _MAX_RESULTS = 4
+AUTOMATIC_CAPTURE_POLICY_VERSION = "automatic-capture-policy-v1"
+_ALLOWED_REASON = "allowed"
+_SECRET_REASON = "secret"
+_OFF_RECORD_REASON = "off-record"
+_CREDENTIAL_FIELD_NAMES = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "client_secret",
+        "id_token",
+        "auth_token",
+    }
+)
+_CREDENTIAL_FIELD_SUFFIXES = (
+    "_password",
+    "_passwd",
+    "_secret",
+    "_token",
+    "_api_key",
+)
 
 _SECRET_PATTERNS = (
     re.compile(
@@ -90,6 +118,15 @@ _TRIVIAL_PROMPT = re.compile(
 
 
 @dataclass(frozen=True)
+class AutomaticCaptureDecision:
+    """A secret/off-record decision safe to retain as aggregate telemetry."""
+
+    allowed: bool
+    reason: str
+    matched_count: int
+
+
+@dataclass(frozen=True)
 class RecallDecision:
     """A deterministic recall decision safe to retain as aggregate telemetry."""
 
@@ -150,6 +187,113 @@ def is_off_record(text: str) -> bool:
     """Return whether a prompt explicitly disables memory for this turn."""
 
     return bool(_OFF_RECORD.search(text))
+
+
+def _credential_field_name(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    if normalized in _CREDENTIAL_FIELD_NAMES:
+        return True
+    return any(
+        normalized.endswith(suffix) for suffix in _CREDENTIAL_FIELD_SUFFIXES
+    )
+
+
+def _strip_trusted_text(
+    value: str,
+    trusted_fragments: tuple[str, ...],
+) -> str:
+    scanned = value
+    for fragment in sorted(
+        (item for item in trusted_fragments if item),
+        key=len,
+        reverse=True,
+    ):
+        scanned = scanned.replace(fragment, "[trusted-local-path]")
+    return scanned
+
+
+def _strip_trusted_serialized(
+    serialized: str,
+    trusted_fragments: tuple[str, ...],
+) -> str:
+    scanned = serialized
+    for fragment in sorted(
+        (item for item in trusted_fragments if item),
+        key=len,
+        reverse=True,
+    ):
+        encoded_fragment = json.dumps(fragment, ensure_ascii=True)[1:-1]
+        scanned = scanned.replace(encoded_fragment, "[trusted-local-path]")
+    return scanned
+
+
+def evaluate_automatic_capture(
+    payload: object,
+    *,
+    trusted_fragments: tuple[str, ...] = (),
+) -> AutomaticCaptureDecision:
+    """Return whether automatic capture may persist or ingest this payload."""
+
+    secret_count = 0
+    off_record_count = 0
+
+    def consider_text(text: str, *, serialized: bool = False) -> None:
+        nonlocal secret_count, off_record_count
+        scanned = (
+            _strip_trusted_serialized(text, trusted_fragments)
+            if serialized
+            else _strip_trusted_text(text, trusted_fragments)
+        )
+        if is_off_record(scanned):
+            off_record_count += 1
+        if contains_secret(scanned):
+            secret_count += 1
+
+    def walk(value: object, *, field_name: str | None = None) -> None:
+        nonlocal secret_count
+        if isinstance(value, str):
+            if field_name and _credential_field_name(field_name) and value.strip():
+                secret_count += 1
+            consider_text(value)
+            return
+        if type(value) in {int, float} and not isinstance(value, bool):
+            if field_name and _credential_field_name(field_name):
+                secret_count += 1
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                key_text = key if isinstance(key, str) else None
+                if key_text:
+                    consider_text(key_text)
+                walk(item, field_name=key_text)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, field_name=field_name)
+            return
+        if value is None or type(value) is bool:
+            return
+        try:
+            consider_text(json.dumps(value, ensure_ascii=True), serialized=True)
+        except (TypeError, ValueError):
+            secret_count += 1
+
+    try:
+        serialized = json.dumps(payload, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return AutomaticCaptureDecision(False, _SECRET_REASON, 1)
+    consider_text(serialized, serialized=True)
+    walk(payload)
+    matched_count = off_record_count + secret_count
+    if off_record_count:
+        return AutomaticCaptureDecision(
+            False,
+            _OFF_RECORD_REASON,
+            matched_count,
+        )
+    if secret_count:
+        return AutomaticCaptureDecision(False, _SECRET_REASON, matched_count)
+    return AutomaticCaptureDecision(True, _ALLOWED_REASON, 0)
 
 
 def sanitize_query(text: str) -> str | None:
@@ -560,10 +704,13 @@ def normalize_recall_items(response: object) -> list[dict[str, str]]:
 
 
 __all__ = [
+    "AUTOMATIC_CAPTURE_POLICY_VERSION",
+    "AutomaticCaptureDecision",
     "RecallDecision",
     "RecallSource",
     "contains_explicit_secret",
     "contains_secret",
+    "evaluate_automatic_capture",
     "is_off_record",
     "merge_recall_items",
     "normalize_recall_items",

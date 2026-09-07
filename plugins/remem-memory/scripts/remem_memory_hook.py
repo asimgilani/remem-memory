@@ -28,6 +28,7 @@ import remem_api
 from memory_policy import (
     RecallSource,
     contains_secret,
+    evaluate_automatic_capture,
     is_off_record,
     merge_recall_items,
     render_untrusted_context,
@@ -1442,6 +1443,13 @@ def _handle_stop(
                 str(payload.get("cwd") or ""),
                 harness,
             )
+            if not evaluate_automatic_capture(
+                memory,
+                trusted_fragments=(str(payload.get("cwd") or ""),),
+            ).allowed:
+                if propagate_capture_failure:
+                    raise CapturePolicyRejected()
+                return output
             if write_gate is not None:
                 try:
                     allowed = write_gate(state)
@@ -1588,6 +1596,8 @@ def _background_payload(
             if safe_turn_state["off_record"]:
                 return None
             minimized["_turn_state"] = safe_turn_state
+    if not evaluate_automatic_capture(minimized).allowed:
+        return None
     return minimized
 
 
@@ -2419,6 +2429,8 @@ def _process_background_event(
     )
     if live_state is None or live_state["off_record"]:
         return CaptureOutcome("discard", "policy")
+    if not evaluate_automatic_capture(payload).allowed:
+        return CaptureOutcome("discard", "policy")
     try:
         config, targets = _resolved_route(
             dependencies,
@@ -2585,6 +2597,7 @@ def _drain_background_queue(
                     None,
                 )
                 if event is None:
+                    queue.save(session_id, events)
                     return {}
                 if event.get("delivery_status") == "exhausted":
                     pending.discard(event["id"])

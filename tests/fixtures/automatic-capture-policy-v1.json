@@ -1,0 +1,304 @@
+{
+  "version": "automatic-capture-policy-v1",
+  "scope": {
+    "applies_to": [
+      "automatic durable conversation capture",
+      "automatic session checkpoints and rollups",
+      "automatic background queue persistence",
+      "automatic prepared capture records",
+      "automatic ingest and retry of those records"
+    ],
+    "does_not_apply_to": [
+      "explicit user-requested raw storage",
+      "manual checkpoint, rollup, or recall CLI helpers",
+      "explicit MCP writes such as remem_ingest"
+    ],
+    "guarantee": "Best-effort pattern, credential-field, entropy, and off-record detection. This is not complete protection and must not be marketed as a guarantee."
+  },
+  "reasons": ["secret", "off-record", "allowed"],
+  "detectors": {
+    "explicit_key_patterns": [
+      "vlt_ plus 16 or more URL-safe characters",
+      "sk- or sk-proj- plus 20 or more URL-safe characters",
+      "GitHub ghp_/gho_/ghu_/ghs_/ghr_ tokens",
+      "github_pat_ tokens",
+      "AWS AKIA/ASIA access key IDs",
+      "Bearer tokens of 20 or more URL-safe characters"
+    ],
+    "private_keys": "PEM BEGIN PRIVATE KEY markers, including algorithm-specific BEGIN <ALG> PRIVATE KEY blocks",
+    "credential_fields": "Object keys named password, passwd, secret, token, api_key, or a suffix of those names, with a non-empty value",
+    "high_entropy": "32 or more base64url-like characters whose Shannon entropy is at least 4.0 bits per character, unless the caller marks that exact string as a trusted local path fragment",
+    "off_record_directives": [
+      "the phrase off the record",
+      "the slash command /remem off-record"
+    ],
+    "off_record_spans": "Any automatic payload that contains an off-record directive is rejected as a whole. Transcript summarization also drops the rest of that user turn until the next safe user message."
+  },
+  "rejection": {
+    "new_capture": "Do not write the payload to a queue, prepared log, receipt body, state file, or transport body. Automatic hooks stay fail-open for the user session.",
+    "legacy_or_retry": "Do not ingest. Discard the live queue event with the fixed reason policy. Do not retry. Do not copy rejected text into receipts, diagnostics, or logs. An append-only prepared row that already exists is not rewritten; it is never re-ingested.",
+    "safe_reasons": ["policy", "secret", "off-record"],
+    "matched_count": "Implementations may expose a count of matched fields or spans. They must not echo rejected text."
+  },
+  "cases": [
+    {
+      "id": "openai-api-key",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["sk-abcdefghijklmnopqrstuvwxyz1234567890"],
+      "payload": {
+        "content": "Use sk-abcdefghijklmnopqrstuvwxyz1234567890 for the client."
+      }
+    },
+    {
+      "id": "github-pat",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["ghp_abcdefghijklmnopqrstuvwxyz1234"],
+      "payload": {
+        "content": "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234"
+      }
+    },
+    {
+      "id": "aws-access-key-id",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["AKIAIOSFODNN7EXAMPLE"],
+      "payload": {
+        "content": "aws_access_key_id=AKIAIOSFODNN7EXAMPLE"
+      }
+    },
+    {
+      "id": "bearer-token",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcd"],
+      "payload": {
+        "content": "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcd"
+      }
+    },
+    {
+      "id": "vault-style-key",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["vlt_abcdefghijklmnopqrstuvwxyz"],
+      "payload": {
+        "content": "api_key=vlt_abcdefghijklmnopqrstuvwxyz"
+      }
+    },
+    {
+      "id": "pem-private-key",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "private-key",
+      "needles": ["BEGIN RSA PRIVATE KEY", "MIIEowIBAAKCAQEAprivateKeyMaterialNotForUse"],
+      "payload": {
+        "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAprivateKeyMaterialNotForUse\n-----END RSA PRIVATE KEY-----"
+      }
+    },
+    {
+      "id": "password-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "needles": ["password=super-secret-value"],
+      "payload": {
+        "content": "db password=super-secret-value"
+      }
+    },
+    {
+      "id": "nested-password-field",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "needles": ["hunter2-not-a-real-password"],
+      "payload": {
+        "title": "Checkpoint",
+        "content": "safe body",
+        "metadata": {
+          "password": "hunter2-not-a-real-password"
+        }
+      }
+    },
+    {
+      "id": "nested-summary-secret",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "nested-metadata",
+      "needles": ["vlt_nestedSummaryCanary0001"],
+      "payload": {
+        "title": "Checkpoint",
+        "content": "Automatic interval checkpoint.",
+        "metadata": {
+          "summary": "Model returned api_key=vlt_nestedSummaryCanary0001",
+          "decisions": ["ship v1"],
+          "open_questions": []
+        }
+      }
+    },
+    {
+      "id": "nested-decisions-secret",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "nested-metadata",
+      "needles": ["vlt_nestedDecisionCanary01"],
+      "payload": {
+        "metadata": {
+          "summary": "Safe summary.",
+          "decisions": [
+            "Keep the blue theme",
+            "token=vlt_nestedDecisionCanary01"
+          ]
+        }
+      }
+    },
+    {
+      "id": "high-entropy-token",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "needles": ["n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG"],
+      "payload": {
+        "content": "store n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG in the worker"
+      }
+    },
+    {
+      "id": "off-record-directive",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "needles": ["STARLING-PRIVATE-CONTEXT"],
+      "payload": {
+        "content": "Off the record: evaluate STARLING-PRIVATE-CONTEXT."
+      }
+    },
+    {
+      "id": "off-record-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "content": "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+      }
+    },
+    {
+      "id": "off-record-span",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-span",
+      "needles": ["STARLING-PRIVATE-CONTEXT", "Off the record"],
+      "payload": {
+        "content": "Public intro. Off the record: STARLING-PRIVATE-CONTEXT. Later text is still in the same span."
+      }
+    },
+    {
+      "id": "nested-off-record-summary",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-span",
+      "needles": ["STARLING-PRIVATE-CONTEXT"],
+      "payload": {
+        "metadata": {
+          "summary": "Off the record: STARLING-PRIVATE-CONTEXT",
+          "decisions": ["do not store this"]
+        }
+      }
+    },
+    {
+      "id": "safe-preference",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "safe",
+      "payload": {
+        "title": "Durable conversation context",
+        "content": "User: Remember that I prefer concise answers.\n\nAssistant: I will keep future answers concise.",
+        "metadata": {
+          "memory_kind": "conversation_turn",
+          "summary": "Prefer concise answers."
+        }
+      }
+    },
+    {
+      "id": "safe-checkpoint",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "safe",
+      "payload": {
+        "title": "project | session | interval checkpoint (auto)",
+        "content": "Automatic interval checkpoint after 4 tool events.",
+        "metadata": {
+          "summary": "Write src/main.py",
+          "decisions": ["ship v1"],
+          "open_questions": ["who reviews the diff?"],
+          "files_touched": ["src/main.py"]
+        }
+      }
+    },
+    {
+      "id": "token-count-false-positive",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "A numeric token_count field is not a credential. The detector matches credential field names, not every word that contains token.",
+      "payload": {
+        "metadata": {
+          "summary": "Counted output tokens for the draft.",
+          "token_count": 3
+        }
+      }
+    },
+    {
+      "id": "password-policy-prose-false-positive",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Prose about a password policy has no assignment and is not a credential field.",
+      "payload": {
+        "content": "The password policy requires twelve characters."
+      }
+    },
+    {
+      "id": "sklearn-false-positive",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "The sk- detector requires 20 or more characters after the prefix, so sk-learn is not a match.",
+      "payload": {
+        "content": "Use sk-learn for the baseline model."
+      }
+    },
+    {
+      "id": "macos-temp-path-trusted",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Opaque macOS temp path entropy is a documented false positive. Callers may pass the exact local cwd as a trusted fragment so automatic capture can keep the path. Without that mark the same string is rejected.",
+      "trusted_fragments": [
+        "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      ],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+        "metadata": {
+          "repo_root": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+        }
+      }
+    },
+    {
+      "id": "macos-temp-path-untrusted",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "notes": "The same opaque path is rejected when it is not a trusted local fragment. This is a documented false positive, not proof of a credential.",
+      "needles": ["1h0qwbnj29b45h4bcrq5g4jm0000gn"],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      }
+    }
+  ]
+}
