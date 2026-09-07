@@ -61,14 +61,15 @@ class FakeAPI:
         )
         return self.query_response
 
-    def ingest(self, payload, namespace, timeout):
-        self.ingests.append(
-            {
-                "payload": payload,
-                "namespace": namespace,
-                "timeout": timeout,
-            }
-        )
+    def ingest(self, payload, namespace, timeout, *, idempotency_key=None):
+        captured = {
+            "payload": payload,
+            "namespace": namespace,
+            "timeout": timeout,
+        }
+        if idempotency_key is not None:
+            captured["idempotency_key"] = idempotency_key
+        self.ingests.append(captured)
         return {"ok": True}
 
 
@@ -602,6 +603,32 @@ class RememAPITests(unittest.TestCase):
                 for attempt in attempts
             },
             {"stable-write-id"},
+        )
+
+    def test_ingest_accepts_durable_caller_request_identity(self) -> None:
+        requests = []
+
+        def opener(request, timeout):
+            del timeout
+            requests.append(request)
+            return FakeResponse({"ok": True})
+
+        api = _API.RememAPI(
+            "https://api.remem.io",
+            "explicit-key",
+            opener=opener,
+            idempotency_factory=lambda: "must-not-be-used",
+        )
+        api.ingest(
+            {"title": "Durable"},
+            None,
+            timeout=2.0,
+            idempotency_key="durable-event-id",
+        )
+
+        self.assertEqual(
+            requests[0].get_header("Idempotency-key"),
+            "durable-event-id",
         )
 
     def test_incomplete_response_reads_retry_with_stable_ingest_request(
@@ -4126,11 +4153,246 @@ class RememMemoryHookTests(unittest.TestCase):
                     ).load("s1")
 
                 self.assertEqual(calls, [])
-                self.assertEqual(queued, [])
+                if label == "missing credential":
+                    self.assertEqual(len(queued), 1)
+                    self.assertEqual(queued[0]["delivery_status"], "retry")
+                    self.assertEqual(
+                        queued[0]["failure_reason"], "credential"
+                    )
+                else:
+                    self.assertEqual(queued, [])
                 self.assertEqual(
                     credential_calls,
                     ["primary"] if label == "missing credential" else [],
                 )
+
+    def test_failed_capture_is_retained_with_bounded_retry_diagnostics(
+        self,
+    ) -> None:
+        class TransientAPI(FakeAPI):
+            def ingest(
+                self,
+                payload,
+                namespace,
+                timeout,
+                *,
+                idempotency_key=None,
+            ):
+                super().ingest(
+                    payload,
+                    namespace,
+                    timeout,
+                    idempotency_key=idempotency_key,
+                )
+                raise _HOOK.RememAPIError(
+                    "synthetic transient failure",
+                    kind="transient",
+                )
+
+        primary = _ROUTING.Connection(
+            "primary", "Primary", "default", True
+        )
+        config = routing_config(
+            connections=(primary,),
+            global_routes={
+                "memory": (
+                    _ROUTING.RouteTarget("primary", "durable-memory"),
+                )
+            },
+            revision=4,
+        )
+        api = TransientAPI()
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            event = _HOOK._background_event(
+                client="codex",
+                behavior="memory",
+                lifecycle_mode="stop",
+                target=_ROUTING.RouteTarget("primary", "durable-memory"),
+                route_revision=4,
+                session_id="s1",
+                payload=_HOOK._background_payload(
+                    {
+                        **stop_payload(),
+                        "_turn_state": _HOOK.StateStore(
+                            Path(directory)
+                        ).load("s1"),
+                    },
+                    "stop",
+                ),
+                off_record_seen=False,
+            )
+            self.assertIsNotNone(event)
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            dependencies = self._dependencies(
+                directory,
+                api,
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: "key",
+            )
+
+            for attempt in range(1, 5):
+                queued = store.load("s1")
+                _HOOK.handle_event(
+                    worker_claim_payload("s1", queued),
+                    harness="codex",
+                    mode="worker_drain",
+                    dependencies=dependencies,
+                )
+                retained = store.load("s1")
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0]["id"], event["id"])
+                self.assertEqual(retained[0]["attempts"], min(attempt, 3))
+
+            self.assertEqual(retained[0]["delivery_status"], "exhausted")
+            self.assertEqual(retained[0]["failure_reason"], "transient")
+            self.assertEqual(len(api.ingests), 3)
+            self.assertEqual(
+                {call["idempotency_key"] for call in api.ingests},
+                {event["id"]},
+            )
+
+    def test_permanent_capture_rejection_is_discarded(self) -> None:
+        class RejectedAPI(FakeAPI):
+            def ingest(self, *args, **kwargs):
+                raise _HOOK.RememAPIError(
+                    "synthetic policy rejection",
+                    kind="permission",
+                )
+
+        primary = _ROUTING.Connection(
+            "primary", "Primary", "default", True
+        )
+        target = _ROUTING.RouteTarget("primary", "durable-memory")
+        config = routing_config(
+            connections=(primary,),
+            global_routes={"memory": (target,)},
+            revision=4,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            event = _HOOK._background_event(
+                client="codex",
+                behavior="memory",
+                lifecycle_mode="stop",
+                target=target,
+                route_revision=4,
+                session_id="s1",
+                payload=_HOOK._background_payload(
+                    {
+                        **stop_payload(),
+                        "_turn_state": _HOOK.StateStore(
+                            Path(directory)
+                        ).load("s1"),
+                    },
+                    "stop",
+                ),
+                off_record_seen=False,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            dependencies = self._dependencies(
+                directory,
+                RejectedAPI(),
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: "key",
+            )
+            _HOOK.handle_event(
+                worker_claim_payload("s1", [event]),
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+
+            self.assertEqual(store.load("s1"), [])
+
+    def test_transient_capture_replays_after_restart_then_acknowledges(self) -> None:
+        class RecoveringAPI(FakeAPI):
+            def __init__(self):
+                super().__init__()
+                self.fail = True
+
+            def ingest(
+                self, payload, namespace, timeout, *, idempotency_key=None
+            ):
+                super().ingest(
+                    payload,
+                    namespace,
+                    timeout,
+                    idempotency_key=idempotency_key,
+                )
+                if self.fail:
+                    raise _HOOK.RememAPIError(
+                        "synthetic transient failure", kind="transient"
+                    )
+                return {"ok": True}
+
+        primary = _ROUTING.Connection(
+            "primary", "Primary", "default", True
+        )
+        target = _ROUTING.RouteTarget("primary", "durable-memory")
+        config = routing_config(
+            connections=(primary,),
+            global_routes={"memory": (target,)},
+            revision=4,
+        )
+        api = RecoveringAPI()
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_durable_turn(directory)
+            state = _HOOK.StateStore(Path(directory)).load("s1")
+            event = _HOOK._background_event(
+                client="codex",
+                behavior="memory",
+                lifecycle_mode="stop",
+                target=target,
+                route_revision=4,
+                session_id="s1",
+                payload=_HOOK._background_payload(
+                    {**stop_payload(), "_turn_state": state}, "stop"
+                ),
+                off_record_seen=False,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            dependencies = self._dependencies(
+                directory,
+                api,
+                background_writes=True,
+                routing_resolver=routed(config),
+                connection_credential_resolver=lambda connection: "key",
+            )
+            _HOOK.handle_event(
+                worker_claim_payload("s1", [event]),
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+            retained = store.load("s1")
+            self.assertEqual(retained[0]["delivery_status"], "retry")
+
+            api.fail = False
+            _HOOK.handle_event(
+                worker_claim_payload("s1", retained),
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+            self.assertEqual(store.load("s1"), [])
+            _HOOK.handle_event(
+                worker_claim_payload("s1", retained),
+                harness="codex",
+                mode="worker_drain",
+                dependencies=dependencies,
+            )
+
+        self.assertEqual(len(api.ingests), 2)
+        self.assertEqual(
+            {call["idempotency_key"] for call in api.ingests},
+            {event["id"]},
+        )
 
     def test_session_write_gate_rechecks_live_route_privacy_and_credential(
         self,

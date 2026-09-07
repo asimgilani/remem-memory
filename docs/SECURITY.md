@@ -61,6 +61,12 @@ Automatic hook state and settings live under
 with owner-only access and state/settings files with owner read/write
 permissions. Its private ordered worker queue lives below that same directory.
 Session and queue filenames use a hash rather than the raw session ID.
+Failed automatic captures remain in that bounded queue for at most three
+automatic delivery attempts. An exhausted event stays recoverable in the
+queue with non-content status, reason, and attempt diagnostics; successful
+delivery or an explicit policy rejection removes it. The queue's existing
+128-event and 262,144-byte limits still apply, so this does not promise
+indefinite retention or backend exactly-once ingestion.
 
 Session automation keeps project-local files under `.remem/`, normally:
 
