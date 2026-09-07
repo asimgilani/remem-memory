@@ -1,7 +1,7 @@
 # Automatic capture policy v1
 
 **Date:** 2026-09-07
-**Status:** Complete
+**Status:** Plugin implementation (OpenClaw port pending)
 **Purpose:** Language-neutral fixture contract for automatic Remem capture, including the later OpenClaw port.
 
 The executable policy lives in `plugins/remem-memory/scripts/memory_policy.py` as
@@ -23,13 +23,17 @@ separate policy. Manual storage is never reclassified as automatic.
 
 This is best-effort pattern, credential-field, entropy, and off-record
 detection. It is not complete protection. Known false positives are in the
-fixture, including opaque local temp-path entropy unless the caller marks that
-exact path as a trusted fragment.
+fixture, including opaque local temp-path entropy unless that exact string is
+a trusted structural path field (`source_path`, `cwd`, `repo_root`,
+`transcript_path`). Trusted fragments are not substituted through body text,
+summaries, or payload-derived paths. Off-record and explicit secrets are
+matched on raw text first.
 
 Rejected text must not appear in queue files, new prepared rows, receipts,
-state files, or transport bodies. Safe outcomes use fixed reasons such as
-`policy`, `secret`, and `off-record`, plus an integer match count. They must
-not echo the rejected payload.
+state files, provider prompts, or transport bodies. Identifier fields such as
+turn IDs are dropped to empty when they fail policy. Safe outcomes use fixed
+reasons such as `policy`, `secret`, and `off-record`, plus an integer match
+count. They must not echo the rejected payload.
 
 ## Legacy rejection
 

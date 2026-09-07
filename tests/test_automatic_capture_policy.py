@@ -64,9 +64,51 @@ def _assert_needles_absent(test, blob: object, needles: list[str]) -> None:
         test.assertNotIn(needle, rendered)
 
 
+def _fixture_case(fixture: dict, case_id: str) -> dict:
+    for case in fixture["cases"]:
+        if case["id"] == case_id:
+            return case
+    raise AssertionError(f"missing fixture case {case_id}")
+
+
+def _auto_config(directory: str, *, cwd: str = "/tmp") -> object:
+    return _AUTO.Config(
+        cwd=Path(cwd),
+        project="remem",
+        session_id="sess-a",
+        api_url="https://api.remem.io",
+        api_key="test-key",
+        interval_seconds=1200,
+        min_events=4,
+        state_path=Path(directory) / "state.json",
+        log_path=Path(directory) / "memory.ndjson",
+        enabled=True,
+        rollup_on_session_end=True,
+    )
+
+
+def _prompt_dependencies(directory: str, api=None):
+    return _HOOK.Dependencies(
+        api=api if api is not None else FakeAPI(),
+        state_dir=Path(directory),
+        settings=_HOOK.Settings(mode="auto", sensitivity="balanced"),
+    )
+
+
 class FakeAPI:
     def __init__(self):
         self.ingests = []
+        self.queries = []
+
+    def query(self, prompt, namespaces, timeout):
+        self.queries.append(
+            {
+                "prompt": prompt,
+                "namespaces": namespaces,
+                "timeout": timeout,
+            }
+        )
+        return {"results": []}
 
     def ingest(self, payload, namespace, timeout, *, idempotency_key=None):
         captured = {
@@ -637,6 +679,386 @@ class AutomaticCapturePolicyTests(unittest.TestCase):
                     cfg,
                     {"content": f"api_key={canary}"},
                 )
+
+    def test_user_prompt_state_save_drops_malicious_identifier(self) -> None:
+        fixture = _load_fixture()
+        secret_case = _fixture_case(fixture, "identifier-secret")
+        allowed_case = _fixture_case(fixture, "identifier-allowed")
+        canary = secret_case["needles"][0]
+        allowed_turn = allowed_case["payload"]["turn_id"]
+        prompt = "Remember that I prefer concise answers."
+        with tempfile.TemporaryDirectory() as directory:
+            _HOOK.handle_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s1",
+                    "turn_id": canary,
+                    "cwd": "/tmp/project",
+                    "prompt": prompt,
+                },
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=_prompt_dependencies(directory),
+            )
+            store = _HOOK.StateStore(Path(directory))
+            secret_path = store.path_for("s1")
+            secret_raw = secret_path.read_text(encoding="utf-8")
+            secret_state = store.load("s1")
+            _HOOK.handle_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s2",
+                    "turn_id": allowed_turn,
+                    "cwd": "/tmp/project",
+                    "prompt": prompt,
+                },
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=_prompt_dependencies(directory),
+            )
+            allowed_path = store.path_for("s2")
+            allowed_raw = allowed_path.read_text(encoding="utf-8")
+            allowed_state = store.load("s2")
+
+        _assert_needles_absent(self, secret_raw, [canary])
+        self.assertNotEqual(secret_state["turn_id"], canary)
+        self.assertNotIn(canary, secret_state["turn_id"])
+        self.assertIn(allowed_turn, allowed_raw)
+        self.assertEqual(allowed_state["turn_id"], allowed_turn)
+        _assert_needles_absent(self, allowed_raw, [canary])
+
+    def test_legacy_completed_turn_ids_are_dropped_on_next_save(self) -> None:
+        fixture = _load_fixture()
+        canary = _fixture_case(fixture, "identifier-secret")["needles"][0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = _HOOK.StateStore(Path(directory))
+            store.save(
+                "s1",
+                {
+                    "current_prompt": "Remember that I prefer concise answers.",
+                    "turn_id": "t-safe",
+                    "off_record": False,
+                    "off_record_seen": False,
+                    "completed_turn_ids": ["t-safe"],
+                    "metrics": {"hits": 0, "misses": 0},
+                },
+            )
+            path = store.path_for("s1")
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            parsed["completed_turn_ids"] = [canary, "t-safe"]
+            parsed["turn_id"] = canary
+            path.write_text(
+                json.dumps(parsed, ensure_ascii=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            self.assertIn(canary, path.read_text(encoding="utf-8"))
+            _HOOK.handle_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s1",
+                    "turn_id": "t-next",
+                    "cwd": "/tmp/project",
+                    "prompt": "Thanks",
+                },
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=_prompt_dependencies(directory),
+            )
+            raw = path.read_text(encoding="utf-8")
+            state = store.load("s1")
+
+        _assert_needles_absent(self, raw, [canary])
+        self.assertNotIn(canary, state["turn_id"])
+        self.assertNotIn(canary, state["completed_turn_ids"])
+        self.assertEqual(state["turn_id"], "t-next")
+        self.assertIn("t-safe", state["completed_turn_ids"])
+
+    def test_engineering_state_save_drops_off_record_identifiers(self) -> None:
+        fixture = _load_fixture()
+        canary = _fixture_case(fixture, "off-record-slash-command")["needles"][0]
+        poison_path = f"/tmp/foo /remem off-record {canary}.jsonl"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state = _AUTO._default_state("sess-a")
+            state["project"] = "off the record"
+            state["session_id"] = f"sess /remem off-record {canary}"
+            state["transcript_path"] = poison_path
+            _AUTO._save_state(path, state)
+            raw = path.read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+
+        _assert_needles_absent(self, raw, [canary, "/remem off-record"])
+        self.assertNotEqual(loaded["project"], "off the record")
+        self.assertNotIn("/remem off-record", loaded["session_id"])
+        self.assertEqual(loaded["transcript_path"], "")
+
+    def test_rollup_legacy_off_record_never_reaches_provider_or_fallback(
+        self,
+    ) -> None:
+        fixture = _load_fixture()
+        rejected = _fixture_case(fixture, "nested-off-record-summary")
+        allowed = _fixture_case(fixture, "safe-checkpoint")
+        needles = _needles(rejected)
+        rejected_row = {
+            "event": "auto_checkpoint",
+            "payload": {
+                "title": "secret checkpoint",
+                "content": (
+                    "## Summary\nOff the record: STARLING-PRIVATE-CONTEXT"
+                ),
+                "metadata": {
+                    "project": "remem",
+                    "session_id": "sess-a",
+                    **rejected["payload"]["metadata"],
+                },
+            },
+        }
+        allowed_row = {
+            "event": "auto_checkpoint",
+            "payload": {
+                **allowed["payload"],
+                "metadata": {
+                    "project": "remem",
+                    "session_id": "sess-a",
+                    **allowed["payload"]["metadata"],
+                },
+            },
+        }
+        provider_prompts: list[str] = []
+
+        def fake_openai(prompt, *, model, max_tokens, timeout):
+            del model, max_tokens, timeout
+            provider_prompts.append(prompt)
+            return json.dumps(
+                {
+                    "summary": "Safe rollup of allowed checkpoints.",
+                    "decisions": ["ship v1"],
+                    "open_questions": [],
+                    "next_actions": [],
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = _auto_config(directory, cwd="/tmp")
+            with mock.patch.object(_AUTO, "_llm_enabled", return_value=True):
+                with mock.patch.object(
+                    _AUTO,
+                    "_select_llm_provider",
+                    return_value="openai",
+                ):
+                    with mock.patch.object(
+                        _AUTO,
+                        "_llm_model_for",
+                        return_value="test-model",
+                    ):
+                        with mock.patch.object(
+                            _AUTO,
+                            "_call_openai",
+                            side_effect=fake_openai,
+                        ) as call_openai:
+                            mixed = _AUTO._build_rollup_payload(
+                                cfg,
+                                [rejected_row, allowed_row],
+                            )
+                            rejected_only = _AUTO._build_rollup_payload(
+                                cfg,
+                                [rejected_row],
+                            )
+                            markdown_only = _AUTO._build_rollup_payload(
+                                cfg,
+                                [
+                                    {
+                                        "event": "auto_checkpoint",
+                                        "payload": {
+                                            "title": "legacy markdown",
+                                            "content": (
+                                                "## Summary\nOff the record: "
+                                                "STARLING-PRIVATE-CONTEXT"
+                                            ),
+                                            "metadata": {
+                                                "project": "remem",
+                                                "session_id": "sess-a",
+                                            },
+                                        },
+                                    }
+                                ],
+                            )
+
+        for blob in (
+            *provider_prompts,
+            mixed,
+            rejected_only,
+            markdown_only,
+            str(call_openai.call_args_list),
+        ):
+            _assert_needles_absent(self, blob, needles)
+            self.assertNotIn("Off the record", _blob(blob))
+        self.assertGreaterEqual(call_openai.call_count, 1)
+        self.assertIn("ship v1", mixed["metadata"]["decisions"])
+        self.assertNotIn("do not store this", mixed["metadata"]["decisions"])
+        self.assertNotIn("STARLING-PRIVATE-CONTEXT", rejected_only["content"])
+        self.assertNotIn("STARLING-PRIVATE-CONTEXT", markdown_only["content"])
+
+    def test_cwd_overlap_does_not_mask_ingest_or_rollup_provider_prompt(
+        self,
+    ) -> None:
+        fixture = _load_fixture()
+        cases = (
+            ("/remem", "trusted-cwd-overlaps-slash-command"),
+            ("/", "trusted-root-overlaps-slash-command"),
+        )
+        provider_prompts: list[str] = []
+
+        def fake_openai(prompt, *, model, max_tokens, timeout):
+            del model, max_tokens, timeout
+            provider_prompts.append(prompt)
+            return json.dumps(
+                {
+                    "summary": "should not see rejected source",
+                    "decisions": [],
+                    "open_questions": [],
+                    "next_actions": [],
+                }
+            )
+
+        for cwd, case_id in cases:
+            case = _fixture_case(fixture, case_id)
+            needles = _needles(case)
+            with self.subTest(cwd=cwd, case=case_id):
+                with tempfile.TemporaryDirectory() as directory:
+                    cfg = _auto_config(directory, cwd=cwd)
+                    with mock.patch.object(
+                        _AUTO.urllib_request,
+                        "urlopen",
+                    ) as urlopen:
+                        self.assertIsNone(
+                            _AUTO._ingest(cfg, case["payload"])
+                        )
+                    urlopen.assert_not_called()
+                    with mock.patch.object(
+                        _AUTO,
+                        "_llm_enabled",
+                        return_value=True,
+                    ):
+                        with mock.patch.object(
+                            _AUTO,
+                            "_select_llm_provider",
+                            return_value="openai",
+                        ):
+                            with mock.patch.object(
+                                _AUTO,
+                                "_llm_model_for",
+                                return_value="test-model",
+                            ):
+                                with mock.patch.object(
+                                    _AUTO,
+                                    "_call_openai",
+                                    side_effect=fake_openai,
+                                ) as call_openai:
+                                    payload = _AUTO._build_rollup_payload(
+                                        cfg,
+                                        [
+                                            {
+                                                "event": "auto_checkpoint",
+                                                "payload": {
+                                                    "title": "overlap",
+                                                    "content": "safe body",
+                                                    "metadata": {
+                                                        "project": "remem",
+                                                        "session_id": "sess-a",
+                                                        "summary": case[
+                                                            "payload"
+                                                        ].get(
+                                                            "content",
+                                                            "",
+                                                        )
+                                                        or case["payload"]
+                                                        .get("metadata", {})
+                                                        .get("summary", ""),
+                                                    },
+                                                },
+                                            }
+                                        ],
+                                    )
+                    _assert_needles_absent(self, payload, needles)
+                    _assert_needles_absent(
+                        self,
+                        str(call_openai.call_args_list),
+                        needles,
+                    )
+                    for prompt in provider_prompts:
+                        _assert_needles_absent(self, prompt, needles)
+
+    def test_checkpoint_provider_prompt_drops_assistant_off_record(
+        self,
+    ) -> None:
+        fixture = _load_fixture()
+        canary = _fixture_case(fixture, "off-record-slash-command")["needles"][0]
+        excerpt = (
+            "User: continue the checkpoint.\n"
+            f"Assistant: /remem off-record evaluate {canary}."
+        )
+        provider_prompts: list[str] = []
+
+        def fake_openai(prompt, *, model, max_tokens, timeout):
+            del model, max_tokens, timeout
+            provider_prompts.append(prompt)
+            return json.dumps(
+                {
+                    "summary": "leaked assistant directive",
+                    "decisions": [],
+                    "open_questions": [],
+                    "next_actions": [],
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = _auto_config(directory, cwd="/tmp")
+            with mock.patch.object(_AUTO, "_llm_enabled", return_value=True):
+                with mock.patch.object(
+                    _AUTO,
+                    "_read_transcript_excerpt",
+                    return_value=excerpt,
+                ):
+                    with mock.patch.object(
+                        _AUTO,
+                        "_select_llm_provider",
+                        return_value="openai",
+                    ):
+                        with mock.patch.object(
+                            _AUTO,
+                            "_llm_model_for",
+                            return_value="test-model",
+                        ):
+                            with mock.patch.object(
+                                _AUTO,
+                                "_call_openai",
+                                side_effect=fake_openai,
+                            ) as call_openai:
+                                with mock.patch.object(
+                                    _AUTO,
+                                    "_git_branch",
+                                    return_value=None,
+                                ):
+                                    payload = _AUTO._build_checkpoint_payload(
+                                        config=cfg,
+                                        kind="interval",
+                                        hook_event="PostToolUse",
+                                        recent_events=[
+                                            {
+                                                "summary": "Write src/main.py",
+                                                "files": ["src/main.py"],
+                                            }
+                                        ],
+                                        events_since_checkpoint=4,
+                                        transcript_path="/tmp/transcript.jsonl",
+                                    )
+
+        call_openai.assert_not_called()
+        self.assertEqual(provider_prompts, [])
+        _assert_needles_absent(self, payload, [canary])
+        self.assertNotIn("/remem off-record", _blob(payload))
 
 
 if __name__ == "__main__":

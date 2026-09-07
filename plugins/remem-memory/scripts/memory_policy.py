@@ -68,6 +68,14 @@ _SECRET_PATTERNS = (
 _HIGH_ENTROPY_CANDIDATE = re.compile(
     r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9])"
 )
+_TRUSTED_PATH_FIELDS = frozenset(
+    {
+        "source_path",
+        "cwd",
+        "repo_root",
+        "transcript_path",
+    }
+)
 _OFF_RECORD = re.compile(
     r"(?:\boff\s+the\s+record\b|(?:^|\s)/remem\s+off-record\b)",
     re.IGNORECASE,
@@ -175,12 +183,7 @@ def contains_explicit_secret(value: str) -> bool:
 def contains_secret(value: str) -> bool:
     """Return whether text contains explicit or high-entropy credentials."""
 
-    if contains_explicit_secret(value):
-        return True
-    return any(
-        _entropy(match.group(0)) >= 4.0
-        for match in _HIGH_ENTROPY_CANDIDATE.finditer(value)
-    )
+    return contains_explicit_secret(value) or _contains_high_entropy(value)
 
 
 def is_off_record(text: str) -> bool:
@@ -198,33 +201,11 @@ def _credential_field_name(key: str) -> bool:
     )
 
 
-def _strip_trusted_text(
-    value: str,
-    trusted_fragments: tuple[str, ...],
-) -> str:
-    scanned = value
-    for fragment in sorted(
-        (item for item in trusted_fragments if item),
-        key=len,
-        reverse=True,
-    ):
-        scanned = scanned.replace(fragment, "[trusted-local-path]")
-    return scanned
-
-
-def _strip_trusted_serialized(
-    serialized: str,
-    trusted_fragments: tuple[str, ...],
-) -> str:
-    scanned = serialized
-    for fragment in sorted(
-        (item for item in trusted_fragments if item),
-        key=len,
-        reverse=True,
-    ):
-        encoded_fragment = json.dumps(fragment, ensure_ascii=True)[1:-1]
-        scanned = scanned.replace(encoded_fragment, "[trusted-local-path]")
-    return scanned
+def _contains_high_entropy(value: str) -> bool:
+    return any(
+        _entropy(match.group(0)) >= 4.0
+        for match in _HIGH_ENTROPY_CANDIDATE.finditer(value)
+    )
 
 
 def evaluate_automatic_capture(
@@ -232,21 +213,38 @@ def evaluate_automatic_capture(
     *,
     trusted_fragments: tuple[str, ...] = (),
 ) -> AutomaticCaptureDecision:
-    """Return whether automatic capture may persist or ingest this payload."""
+    """Return whether automatic capture may persist or ingest this payload.
+
+    Off-record directives and explicit secrets are matched on raw text before
+    any path handling. ``trusted_fragments`` may skip high-entropy false
+    positives only when a structural path field's exact value equals a
+    fragment. They never hide secrets, off-record spans, or arbitrary body
+    text, and payload-derived paths are not a trust root.
+    """
 
     secret_count = 0
     off_record_count = 0
+    trusted_values = frozenset(
+        fragment for fragment in trusted_fragments if fragment
+    )
 
-    def consider_text(text: str, *, serialized: bool = False) -> None:
+    def consider_text(
+        text: str,
+        *,
+        field_name: str | None = None,
+        serialized: bool = False,
+    ) -> None:
         nonlocal secret_count, off_record_count
-        scanned = (
-            _strip_trusted_serialized(text, trusted_fragments)
-            if serialized
-            else _strip_trusted_text(text, trusted_fragments)
-        )
-        if is_off_record(scanned):
+        if is_off_record(text):
             off_record_count += 1
-        if contains_secret(scanned):
+        if contains_explicit_secret(text):
+            secret_count += 1
+            return
+        if serialized:
+            return
+        if field_name in _TRUSTED_PATH_FIELDS and text in trusted_values:
+            return
+        if _contains_high_entropy(text):
             secret_count += 1
 
     def walk(value: object, *, field_name: str | None = None) -> None:
@@ -254,7 +252,7 @@ def evaluate_automatic_capture(
         if isinstance(value, str):
             if field_name and _credential_field_name(field_name) and value.strip():
                 secret_count += 1
-            consider_text(value)
+            consider_text(value, field_name=field_name)
             return
         if type(value) in {int, float} and not isinstance(value, bool):
             if field_name and _credential_field_name(field_name):

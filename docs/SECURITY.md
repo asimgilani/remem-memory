@@ -43,13 +43,16 @@ correct. Confirm consequential or conflicting memories with the user.
 ## Secret filtering
 
 Automatic paths run one executable secret and off-record policy before local
-queue, prepared-log, receipt, or state persistence and again before ingestion
-of a prepared or legacy retry. They reject recognized API keys, tokens,
-password and credential fields, private-key markers, bearer credentials,
-high-entropy credential-like strings, and off-record directives or spans.
-Secret-bearing or off-record tool events, paths, transcript turns, nested
-metadata or summary fields, results, and final payloads are dropped instead of
-redacted and forwarded.
+queue, prepared-log, receipt, or state persistence, before summary-provider
+prompts, and again before ingestion of a prepared or legacy retry. They reject
+recognized API keys, tokens, password and credential fields, private-key
+markers, bearer credentials, high-entropy credential-like strings, and
+off-record directives or spans. Secret-bearing or off-record tool events,
+paths, transcript turns, nested metadata or summary fields, prompt-state
+identifiers, results, and final payloads are dropped instead of redacted and
+forwarded. Opaque local cwd values may skip entropy only on matching
+structural path fields. They do not rewrite body text or become a trust root
+when they appear as payload `source_path` or `repo_root`.
 
 Filtering is defense in depth, not a guarantee that every form of private data
 will be recognized. Documented false positives include opaque local temp-path
@@ -129,9 +132,11 @@ Disable this path with:
 export REMEM_MEMORY_SUMMARY_ENABLED="0"
 ```
 
-The secret filter runs before the summary request, but disable external
-summaries when project policy does not allow another model provider to receive
-the material.
+The same policy runs on checkpoint and rollup source notes and on the assembled
+provider prompt before dispatch. A rejected historical row is omitted from the
+prompt and from fallback summary fields. It is not rewritten in the append-only
+log. Disable external summaries when project policy does not allow another
+model provider to receive the material.
 
 ## Credential handling and precedence
 
