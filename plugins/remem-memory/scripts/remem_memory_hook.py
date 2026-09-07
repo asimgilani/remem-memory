@@ -1030,6 +1030,7 @@ def _default_engineering_handler(
     write_gate: Callable[[], bool] | None = None,
     request_identity: str | None = None,
     propagate_delivery_failure: bool = False,
+    live_request_ids: frozenset[str] | None = None,
 ) -> int:
     import auto_memory_hook
 
@@ -1041,6 +1042,7 @@ def _default_engineering_handler(
         write_gate=write_gate,
         request_identity=request_identity,
         propagate_delivery_failure=propagate_delivery_failure,
+        live_request_ids=live_request_ids,
     )
 
 
@@ -1056,6 +1058,7 @@ def _invoke_engineering(
     write_gate: Callable[[], bool] | None = None,
     request_identity: str | None = None,
     propagate_delivery_failure: bool = False,
+    live_request_ids: frozenset[str] | None = None,
 ) -> None:
     if not _engineering_enabled():
         return
@@ -1102,6 +1105,7 @@ def _invoke_engineering(
                         write_gate=write_gate,
                         request_identity=request_identity,
                         propagate_delivery_failure=propagate_delivery_failure,
+                        live_request_ids=live_request_ids,
                     )
                 else:
                     handler(mode, payload)
@@ -2401,6 +2405,7 @@ def _process_background_event(
     event: dict[str, Any],
     dependencies: Dependencies,
     settings: Settings,
+    live_request_ids: frozenset[str] | None = None,
 ) -> CaptureOutcome:
     if settings.mode != "auto":
         return CaptureOutcome("discard", "policy")
@@ -2482,6 +2487,7 @@ def _process_background_event(
                     write_gate=write_gate,
                     request_identity=event["id"],
                     propagate_delivery_failure=True,
+                    live_request_ids=live_request_ids,
                 )
             except CapturePolicyRejected:
                 return CaptureOutcome("discard", "policy")
@@ -2565,6 +2571,11 @@ def _drain_background_queue(
         while pending:
             with queue.locked(session_id):
                 events = queue.load(session_id)
+                live_request_ids = frozenset(
+                    candidate["id"]
+                    for candidate in events
+                    if isinstance(candidate.get("id"), str)
+                )
                 event = next(
                     (
                         candidate
@@ -2594,6 +2605,7 @@ def _drain_background_queue(
                     event,
                     dependencies,
                     live_settings,
+                    live_request_ids=live_request_ids,
                 )
             except Exception:
                 return {}

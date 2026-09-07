@@ -46,10 +46,14 @@ _DEFAULT_STATE_PATH = ".remem/auto-memory-state.json"
 _DEFAULT_LOG_PATH = ".remem/session-checkpoints.ndjson"
 _DEFAULT_API_URL = "https://api.remem.io"
 _WRITE_GATE_REJECTED = object()
+_RECEIPT_COMPLETE = object()
 _REQUEST_IDENTITY = re.compile(r"[0-9a-f]{32}\Z")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 _RECEIPT_OPERATIONS = frozenset({"append", "checkpoint", "rollup"})
+_RECEIPT_PROTOCOL = 2
 _MAX_RECEIPTS = 128
 _MAX_RECEIPT_STARTED_AT = 40
+_MAX_RECEIPT_SOURCE_ID = 200
 
 
 class EngineeringWriteRejected(Exception):
@@ -129,6 +133,7 @@ class Config:
     write_gate: Callable[[], bool] | None = None
     request_identity: str | None = None
     propagate_delivery_failure: bool = False
+    live_request_ids: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -314,6 +319,7 @@ def _load_config(
     write_gate: Callable[[], bool] | None = None,
     request_identity: str | None = None,
     propagate_delivery_failure: bool = False,
+    live_request_ids: frozenset[str] | None = None,
 ) -> Config:
     cwd_raw = payload.get("cwd")
     safe_cwd = _safe_cwd_path(cwd_raw)
@@ -393,6 +399,15 @@ def _load_config(
             else None
         ),
         propagate_delivery_failure=bool(propagate_delivery_failure),
+        live_request_ids=(
+            frozenset(
+                item
+                for item in live_request_ids
+                if isinstance(item, str) and _REQUEST_IDENTITY.fullmatch(item)
+            )
+            if live_request_ids is not None
+            else None
+        ),
     )
 
 
@@ -407,17 +422,100 @@ def _default_state(session_id: str) -> dict[str, Any]:
         "last_rollup_epoch": 0.0,
         "transcript_path": "",
         "receipts": {},
+        "pending_seq": 0,
+        "checkpoint_acked_through": 0,
     }
 
 
-def _receipt_is_complete(receipt: dict[str, Any]) -> bool:
-    done = receipt.get("done")
-    if not isinstance(done, list):
-        return False
-    operations = {item for item in done if item in _RECEIPT_OPERATIONS}
-    return "rollup" in operations or (
-        "append" in operations and "checkpoint" in operations
+def _nonneg_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _parse_digest(value: object) -> str | None:
+    if isinstance(value, str) and _SHA256_HEX.fullmatch(value):
+        return value
+    return None
+
+
+def _stable_digest(value: object) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
     )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _unavailable_marker() -> dict[str, Any]:
+    return {"unavailable": True}
+
+
+def _is_unavailable(value: object) -> bool:
+    return isinstance(value, dict) and value.get("unavailable") is True
+
+
+def _parse_checkpoint_input(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or _is_unavailable(value):
+        return None
+    digest = _parse_digest(value.get("digest"))
+    through_seq = _nonneg_int(value.get("through_seq"))
+    events_since = _nonneg_int(value.get("events_since"))
+    window = _nonneg_int(value.get("window"))
+    if None in (digest, through_seq, events_since, window):
+        return None
+    return {
+        "digest": digest,
+        "through_seq": through_seq,
+        "events_since": events_since,
+        "window": window,
+    }
+
+
+def _parse_rollup_input(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or _is_unavailable(value):
+        return None
+    rows = _nonneg_int(value.get("rows"))
+    digest = _parse_digest(value.get("digest"))
+    if rows is None or digest is None:
+        return None
+    parsed: dict[str, Any] = {"rows": rows, "digest": digest}
+    payload_digest = _parse_digest(value.get("payload_digest"))
+    if payload_digest is not None:
+        parsed["payload_digest"] = payload_digest
+    last_id = value.get("last_id")
+    if rows == 0:
+        if last_id in (None, ""):
+            return parsed
+        return None
+    if (
+        not isinstance(last_id, str)
+        or not last_id
+        or len(last_id) > _MAX_RECEIPT_SOURCE_ID
+        or contains_secret(last_id)
+    ):
+        return None
+    parsed["last_id"] = last_id
+    if rows > 0 and payload_digest is None:
+        return None
+    return parsed
+
+
+def _sanitize_operation_input(
+    present: bool,
+    value: object,
+    parser: Callable[[object], dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    if not present:
+        return None
+    if _is_unavailable(value):
+        return _unavailable_marker()
+    parsed = parser(value)
+    if parsed is None:
+        return _unavailable_marker()
+    return parsed
 
 
 def _sanitize_receipts(value: object) -> dict[str, dict[str, Any]]:
@@ -434,9 +532,21 @@ def _sanitize_receipts(value: object) -> dict[str, dict[str, Any]]:
         started_at = ""
         raw_done: object
         raw_started: object = ""
+        checkpoint_present = False
+        rollup_present = False
+        raw_checkpoint: object = None
+        raw_rollup: object = None
+        raw_complete: object = False
+        raw_protocol: object = None
         if isinstance(item, dict):
             raw_done = item.get("done")
             raw_started = item.get("started_at")
+            raw_complete = item.get("complete")
+            raw_protocol = item.get("protocol")
+            checkpoint_present = "checkpoint_input" in item
+            rollup_present = "rollup_input" in item
+            raw_checkpoint = item.get("checkpoint_input")
+            raw_rollup = item.get("rollup_input")
         elif isinstance(item, list):
             raw_done = item
         else:
@@ -458,96 +568,132 @@ def _sanitize_receipts(value: object) -> dict[str, dict[str, Any]]:
             started_at = raw_started
         if not done and not started_at:
             continue
-        receipts[key] = {"done": done, "started_at": started_at}
-    if len(receipts) <= _MAX_RECEIPTS:
-        return receipts
-    bounded: dict[str, dict[str, Any]] = {}
-    for key, receipt in receipts.items():
-        if not _receipt_is_complete(receipt):
-            bounded[key] = receipt
-            if len(bounded) >= _MAX_RECEIPTS:
-                return bounded
-    for key, receipt in receipts.items():
-        if key in bounded:
-            continue
-        bounded[key] = receipt
-        if len(bounded) >= _MAX_RECEIPTS:
-            break
-    return bounded
+        receipt: dict[str, Any] = {
+            "done": done,
+            "started_at": started_at,
+            "complete": raw_complete is True,
+        }
+        if raw_protocol == _RECEIPT_PROTOCOL:
+            receipt["protocol"] = _RECEIPT_PROTOCOL
+        checkpoint_input = _sanitize_operation_input(
+            checkpoint_present,
+            raw_checkpoint,
+            _parse_checkpoint_input,
+        )
+        if checkpoint_input is not None:
+            receipt["checkpoint_input"] = checkpoint_input
+        rollup_input = _sanitize_operation_input(
+            rollup_present,
+            raw_rollup,
+            _parse_rollup_input,
+        )
+        if rollup_input is not None:
+            receipt["rollup_input"] = rollup_input
+        receipts[key] = receipt
+    return receipts
 
 
 def _should_propagate(config: Config) -> bool:
     return bool(config.request_identity and config.propagate_delivery_failure)
 
 
-def _operation_done(config: Config, state: dict[str, Any], operation: str) -> bool:
+def _current_receipt(
+    config: Config, state: dict[str, Any]
+) -> dict[str, Any] | None:
     if not config.request_identity:
-        return False
+        return None
     receipts = state.get("receipts")
     if not isinstance(receipts, dict):
-        return False
+        return None
     receipt = receipts.get(config.request_identity)
-    if not isinstance(receipt, dict):
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _operation_done(config: Config, state: dict[str, Any], operation: str) -> bool:
+    receipt = _current_receipt(config, state)
+    if receipt is None:
         return False
     done = receipt.get("done")
     return isinstance(done, list) and operation in done
 
 
-def _bound_receipts(
-    receipts: dict[str, dict[str, Any]],
-    *,
-    keep: str | None = None,
-) -> dict[str, dict[str, Any]]:
-    sanitized = _sanitize_receipts(receipts)
-    if keep is None or keep in sanitized or len(sanitized) < _MAX_RECEIPTS:
-        return sanitized
-    current = receipts.get(keep)
-    if not isinstance(current, dict):
-        return sanitized
-    kept = _sanitize_receipts({keep: current}).get(keep)
-    if kept is None:
-        return sanitized
-    if len(sanitized) < _MAX_RECEIPTS:
-        sanitized[keep] = kept
-        return sanitized
-    for key, receipt in list(sanitized.items()):
-        if key != keep and _receipt_is_complete(receipt):
-            del sanitized[key]
-            sanitized[keep] = kept
-            break
-    return sanitized
+def _replace_receipt(
+    config: Config,
+    state: dict[str, Any],
+    receipt: dict[str, Any],
+) -> None:
+    if not config.request_identity:
+        return
+    receipts = dict(state.get("receipts") or {})
+    receipts[config.request_identity] = receipt
+    state["receipts"] = receipts
 
 
-def _ensure_receipt_started(config: Config, state: dict[str, Any]) -> str:
+def _mark_input_unavailable(
+    config: Config,
+    state: dict[str, Any],
+    field: str,
+) -> None:
+    receipt = dict(_current_receipt(config, state) or {})
+    receipt[field] = _unavailable_marker()
+    _replace_receipt(config, state, receipt)
+    _save_state(config.state_path, state)
+
+
+def _admit_receipt(config: Config, state: dict[str, Any]) -> object:
     timestamp = _utc_now_iso()
     if not config.request_identity:
         return timestamp
     receipts = dict(state.get("receipts") or {})
-    current = dict(
-        receipts.get(config.request_identity)
-        or {"done": [], "started_at": ""}
-    )
-    started = current.get("started_at")
-    if isinstance(started, str) and started:
+    current = receipts.get(config.request_identity)
+    if isinstance(current, dict) and current.get("complete") is True:
+        return _RECEIPT_COMPLETE
+    if config.live_request_ids is not None:
+        receipts = {
+            key: value
+            for key, value in receipts.items()
+            if key in config.live_request_ids
+        }
+        current = receipts.get(config.request_identity)
+    if isinstance(current, dict):
+        started = current.get("started_at")
+        if not (isinstance(started, str) and started):
+            current = dict(current)
+            current["started_at"] = timestamp
+            receipts[config.request_identity] = current
+            started = timestamp
+        state["receipts"] = receipts
+        _save_state(config.state_path, state)
         return started
-    current["started_at"] = timestamp
-    current["done"] = list(current.get("done") or [])
-    receipts[config.request_identity] = current
-    state["receipts"] = _bound_receipts(
-        receipts, keep=config.request_identity
-    )
+    if len(receipts) >= _MAX_RECEIPTS:
+        raise RememAPIError("Remem request failed", kind="request")
+    receipts[config.request_identity] = {
+        "done": [],
+        "started_at": timestamp,
+        "complete": False,
+        "protocol": _RECEIPT_PROTOCOL,
+    }
+    state["receipts"] = receipts
     _save_state(config.state_path, state)
     return timestamp
+
+
+def _ensure_receipt_started(config: Config, state: dict[str, Any]) -> str:
+    receipt = _current_receipt(config, state)
+    if receipt is not None:
+        started = receipt.get("started_at")
+        if isinstance(started, str) and started:
+            return started
+    return _utc_now_iso()
 
 
 def _mark_receipt(config: Config, state: dict[str, Any], operation: str) -> None:
     if not config.request_identity:
         return
-    receipts = dict(state.get("receipts") or {})
-    current = dict(
-        receipts.get(config.request_identity)
-        or {"done": [], "started_at": ""}
-    )
+    receipt = _current_receipt(config, state)
+    if receipt is None:
+        return
+    current = dict(receipt)
     done = [
         item
         for item in (current.get("done") or [])
@@ -555,21 +701,115 @@ def _mark_receipt(config: Config, state: dict[str, Any], operation: str) -> None
     ]
     if operation not in done:
         done.append(operation)
-    started = current.get("started_at")
     current["done"] = done
+    started = current.get("started_at")
     current["started_at"] = (
         started if isinstance(started, str) and started else _utc_now_iso()
     )
-    receipts[config.request_identity] = current
-    state["receipts"] = _bound_receipts(
-        receipts, keep=config.request_identity
-    )
+    _replace_receipt(config, state, current)
+
+
+def _complete_receipt(config: Config, state: dict[str, Any]) -> None:
+    if not config.request_identity:
+        _save_state(config.state_path, state)
+        return
+    receipt = _current_receipt(config, state)
+    if receipt is None:
+        _save_state(config.state_path, state)
+        return
+    current = dict(receipt)
+    current["complete"] = True
+    _replace_receipt(config, state, current)
+    _save_state(config.state_path, state)
+
+
+def _event_seq(event: object) -> int | None:
+    if not isinstance(event, dict):
+        return None
+    return _nonneg_int(event.get("seq"))
+
+
+def _ensure_event_seqs(state: dict[str, Any]) -> None:
+    recent = [
+        event
+        for event in (state.get("recent_events") or [])
+        if isinstance(event, dict)
+    ]
+    pending_seq = _nonneg_int(state.get("pending_seq")) or 0
+    acked = _nonneg_int(state.get("checkpoint_acked_through")) or 0
+    for event in recent:
+        seq = _event_seq(event)
+        if seq is None or seq == 0:
+            pending_seq += 1
+            event["seq"] = pending_seq
+        else:
+            pending_seq = max(pending_seq, seq)
+    state["recent_events"] = recent
+    state["pending_seq"] = max(pending_seq, acked)
+    state["checkpoint_acked_through"] = acked
+
+
+def _assign_append_seq(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    _ensure_event_seqs(state)
+    state["pending_seq"] = int(state.get("pending_seq") or 0) + 1
+    tagged = dict(event)
+    tagged["seq"] = state["pending_seq"]
+    return tagged
+
+
+def _coverage_from_state(state: dict[str, Any]) -> dict[str, int]:
+    _ensure_event_seqs(state)
+    recent = [
+        event
+        for event in (state.get("recent_events") or [])
+        if isinstance(event, dict)
+    ]
+    through = 0
+    for event in recent:
+        seq = _event_seq(event) or 0
+        if seq > through:
+            through = seq
+    return {
+        "through_seq": through,
+        "events_since": int(state.get("events_since_checkpoint") or 0),
+        "window": len(recent),
+    }
+
+
+def _consume_checkpoint_coverage(
+    state: dict[str, Any],
+    coverage: dict[str, Any],
+) -> None:
+    _ensure_event_seqs(state)
+    through = int(coverage.get("through_seq") or 0)
+    freeze_since = int(coverage.get("events_since") or 0)
+    acked = int(state.get("checkpoint_acked_through") or 0)
+    if through <= acked:
+        return
+    recent = [
+        event
+        for event in (state.get("recent_events") or [])
+        if isinstance(event, dict) and (_event_seq(event) or 0) > through
+    ]
+    events_since = int(state.get("events_since_checkpoint") or 0)
+    state["recent_events"] = recent[-30:]
+    state["events_since_checkpoint"] = max(0, events_since - freeze_since)
+    state["checkpoint_acked_through"] = through
 
 
 def _commit_checkpoint_state(config: Config, state: dict[str, Any]) -> None:
     state["last_checkpoint_epoch"] = _utc_now().timestamp()
-    state["events_since_checkpoint"] = 0
-    state["recent_events"] = []
+    receipt = _current_receipt(config, state)
+    coverage = (
+        _parse_checkpoint_input(receipt.get("checkpoint_input"))
+        if receipt is not None
+        else None
+    )
+    if coverage is not None:
+        _consume_checkpoint_coverage(state, coverage)
+    else:
+        state["events_since_checkpoint"] = 0
+        state["recent_events"] = []
     _mark_receipt(config, state, "checkpoint")
     _save_state(config.state_path, state)
 
@@ -603,6 +843,10 @@ def _sanitize_state(
         if isinstance(candidate, (int, float)) and not isinstance(
             candidate, bool
         ):
+            state[name] = candidate
+    for name in ("pending_seq", "checkpoint_acked_through"):
+        candidate = _nonneg_int(value.get(name))
+        if candidate is not None:
             state[name] = candidate
     recent_events = value.get("recent_events")
     state["recent_events"] = (
@@ -734,12 +978,12 @@ def _append_ndjson(
     record: dict[str, Any],
     *,
     trusted_fragments: tuple[str, ...] = (),
-) -> None:
+) -> bool:
     if _payload_contains_secret(
         record,
         trusted_fragments=trusted_fragments,
     ):
-        return
+        return False
     descriptor = _open_regular_file(
         path,
         os.O_WRONLY | os.O_APPEND | os.O_CREAT,
@@ -748,6 +992,61 @@ def _append_ndjson(
         fh.write(json.dumps(record, ensure_ascii=True) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
+    return True
+
+
+def _read_ndjson(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _find_prepared_record(
+    log_path: Path,
+    event_name: str,
+    operation_id: str,
+) -> dict[str, Any] | None:
+    for row in _read_ndjson(log_path):
+        if (
+            row.get("event") == event_name
+            and row.get("operation_id") == operation_id
+        ):
+            return row
+    return None
+
+
+def _operation_delivered(
+    log_path: Path,
+    event_name: str,
+    operation_id: str,
+) -> bool:
+    return any(
+        row.get("event") == event_name
+        and row.get("operation_id") == operation_id
+        for row in _read_ndjson(log_path)
+    )
+
+
+def _require_log_append(
+    config: Config,
+    record: dict[str, Any],
+) -> None:
+    if not _append_ndjson(
+        config.log_path,
+        record,
+        trusted_fragments=(str(config.cwd),),
+    ):
+        raise RememAPIError("Remem request failed", kind="request")
 
 
 @contextmanager
@@ -1794,21 +2093,22 @@ def _build_checkpoint_payload(
     return result
 
 
-def _load_checkpoint_rows(log_path: Path, *, project: str, session_id: str) -> list[dict[str, Any]]:
-    if not log_path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in log_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        if row.get("event") != "auto_checkpoint":
-            continue
+def _load_checkpoint_rows(
+    log_path: Path,
+    *,
+    project: str,
+    session_id: str,
+    end: int | None = None,
+) -> list[dict[str, Any]]:
+    rows = _read_ndjson(log_path)
+    delivered_ids = {
+        row.get("operation_id")
+        for row in rows
+        if row.get("event") == "auto_checkpoint_delivered"
+        and isinstance(row.get("operation_id"), str)
+    }
+    selected: list[dict[str, Any]] = []
+    for row in rows:
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
@@ -1819,8 +2119,45 @@ def _load_checkpoint_rows(log_path: Path, *, project: str, session_id: str) -> l
             continue
         if metadata.get("session_id") != session_id:
             continue
-        rows.append(row)
-    return rows
+        event = row.get("event")
+        if event == "auto_checkpoint":
+            selected.append(row)
+        elif (
+            event == "auto_checkpoint_prepared"
+            and row.get("operation_id") in delivered_ids
+        ):
+            selected.append(row)
+        if end is not None and len(selected) >= end:
+            break
+    return selected
+
+
+def _cursor_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    digest = _stable_digest([row.get("payload") for row in records])
+    cursor: dict[str, Any] = {"rows": len(records), "digest": digest}
+    if not records:
+        return cursor
+    payload = records[-1].get("payload")
+    source_id = payload.get("source_id") if isinstance(payload, dict) else None
+    if isinstance(source_id, str) and source_id and not contains_secret(source_id):
+        cursor["last_id"] = source_id[:_MAX_RECEIPT_SOURCE_ID]
+    return cursor
+
+
+def _cursor_matches(
+    parsed: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> bool:
+    rows = int(parsed.get("rows") or 0)
+    if len(records) < rows:
+        return False
+    selected = records[:rows]
+    expected = _cursor_from_records(selected)
+    if expected.get("digest") != parsed.get("digest"):
+        return False
+    if rows == 0:
+        return True
+    return expected.get("last_id") == parsed.get("last_id")
 
 
 def _build_rollup_payload(
@@ -1985,6 +2322,28 @@ def _build_rollup_payload(
     return result
 
 
+def _live_write_allowed(config: Config) -> bool:
+    if config.write_gate is None:
+        return True
+    try:
+        allowed = config.write_gate()
+    except RememAPIError:
+        if _should_propagate(config):
+            raise
+        return False
+    except Exception:
+        if _should_propagate(config):
+            raise RememAPIError(
+                "Remem request failed", kind="request"
+            ) from None
+        return False
+    if allowed:
+        return True
+    if _should_propagate(config):
+        raise EngineeringWriteRejected()
+    return False
+
+
 def _ingest(
     config: Config,
     payload: dict[str, Any],
@@ -2009,23 +2368,8 @@ def _ingest(
             api_key=config.api_key,
             allow_local_dev=config.allow_local_dev,
         )
-        if config.write_gate is not None:
-            try:
-                allowed = config.write_gate()
-            except RememAPIError:
-                if _should_propagate(config):
-                    raise
-                allowed = False
-            except Exception:
-                if _should_propagate(config):
-                    raise RememAPIError(
-                        "Remem request failed", kind="request"
-                    ) from None
-                allowed = False
-            if not allowed:
-                if _should_propagate(config):
-                    raise EngineeringWriteRejected()
-                return _WRITE_GATE_REJECTED
+        if not _live_write_allowed(config):
+            return _WRITE_GATE_REJECTED
         kwargs: dict[str, str] = {}
         if config.request_identity and operation:
             kwargs["idempotency_key"] = (
@@ -2046,26 +2390,63 @@ def _ingest(
     return None
 
 
-def _persist_checkpoint(
+def _checkpoint_payload_from_state(
+    *,
+    config: Config,
+    kind: str,
+    hook_event: str,
+    state: dict[str, Any],
+    timestamp: str,
+) -> dict[str, Any]:
+    recent_events = state.get("recent_events")
+    recent_events = recent_events if isinstance(recent_events, list) else []
+    events_since = int(state.get("events_since_checkpoint") or 0)
+    transcript_path = state.get("transcript_path")
+    transcript_path = (
+        transcript_path
+        if isinstance(transcript_path, str) and transcript_path.strip()
+        else None
+    )
+    return _build_checkpoint_payload(
+        config=config,
+        kind=kind,
+        hook_event=hook_event,
+        recent_events=[
+            event for event in recent_events if isinstance(event, dict)
+        ],
+        events_since_checkpoint=events_since,
+        transcript_path=transcript_path,
+        timestamp=timestamp,
+    )
+
+
+def _transport_prepared(
+    config: Config,
+    payload: dict[str, Any],
+    *,
+    operation: str,
+) -> bool | None:
+    response = _ingest(config, payload, operation=operation)
+    if response is _WRITE_GATE_REJECTED:
+        return False
+    if response is None and _should_propagate(config):
+        return None
+    return True
+
+
+def _persist_checkpoint_direct(
     *,
     config: Config,
     kind: str,
     hook_event: str,
     state: dict[str, Any],
 ) -> bool:
-    recent_events = state.get("recent_events")
-    recent_events = recent_events if isinstance(recent_events, list) else []
-    events_since = int(state.get("events_since_checkpoint") or 0)
-    transcript_path = state.get("transcript_path")
-    transcript_path = transcript_path if isinstance(transcript_path, str) and transcript_path.strip() else None
     timestamp = _ensure_receipt_started(config, state)
-    payload = _build_checkpoint_payload(
+    payload = _checkpoint_payload_from_state(
         config=config,
         kind=kind,
         hook_event=hook_event,
-        recent_events=[event for event in recent_events if isinstance(event, dict)],
-        events_since_checkpoint=events_since,
-        transcript_path=transcript_path,
+        state=state,
         timestamp=timestamp,
     )
     response = _ingest(config, payload, operation="checkpoint")
@@ -2075,14 +2456,173 @@ def _persist_checkpoint(
         return True
     _append_ndjson(
         config.log_path,
-        {"timestamp": timestamp, "event": "auto_checkpoint", "payload": payload, "response": response},
+        {
+            "timestamp": timestamp,
+            "event": "auto_checkpoint",
+            "payload": payload,
+            "response": response,
+        },
         trusted_fragments=(str(config.cwd),),
     )
     return True
 
 
-def _persist_rollup(config: Config, state: dict[str, Any] | None = None) -> bool:
-    records = _load_checkpoint_rows(config.log_path, project=config.project, session_id=config.session_id)
+def _persist_prepared_checkpoint(
+    *,
+    config: Config,
+    kind: str,
+    hook_event: str,
+    state: dict[str, Any],
+) -> bool:
+    receipt = dict(_current_receipt(config, state) or {})
+    timestamp = _ensure_receipt_started(config, state)
+    raw_input = receipt.get("checkpoint_input")
+    if _is_unavailable(raw_input):
+        raise RememAPIError("Remem request failed", kind="request")
+    parsed = _parse_checkpoint_input(raw_input) if raw_input is not None else None
+    if raw_input is not None and parsed is None:
+        _mark_input_unavailable(config, state, "checkpoint_input")
+        raise RememAPIError("Remem request failed", kind="request")
+    prepared = _find_prepared_record(
+        config.log_path,
+        "auto_checkpoint_prepared",
+        config.request_identity or "",
+    )
+    if parsed is None:
+        if receipt.get("protocol") != _RECEIPT_PROTOCOL:
+            _mark_input_unavailable(config, state, "checkpoint_input")
+            raise RememAPIError("Remem request failed", kind="request")
+        if prepared is None:
+            _ensure_event_seqs(state)
+            coverage = _coverage_from_state(state)
+            payload = _checkpoint_payload_from_state(
+                config=config,
+                kind=kind,
+                hook_event=hook_event,
+                state=state,
+                timestamp=timestamp,
+            )
+            if _payload_contains_secret(
+                payload,
+                trusted_fragments=(str(config.cwd),),
+            ):
+                return True
+            if not _live_write_allowed(config):
+                return False
+            digest = _stable_digest(payload)
+            record = {
+                "timestamp": timestamp,
+                "event": "auto_checkpoint_prepared",
+                "operation_id": config.request_identity,
+                "coverage": coverage,
+                "payload_digest": digest,
+                "payload": payload,
+            }
+            _require_log_append(config, record)
+            if (
+                _find_prepared_record(
+                    config.log_path,
+                    "auto_checkpoint_prepared",
+                    config.request_identity or "",
+                )
+                is None
+            ):
+                raise RememAPIError("Remem request failed", kind="request")
+            receipt["checkpoint_input"] = {
+                "digest": digest,
+                **coverage,
+            }
+            _replace_receipt(config, state, receipt)
+            _save_state(config.state_path, state)
+            prepared = record
+            parsed = receipt["checkpoint_input"]
+        else:
+            payload = prepared.get("payload")
+            if not isinstance(payload, dict):
+                _mark_input_unavailable(config, state, "checkpoint_input")
+                raise RememAPIError("Remem request failed", kind="request")
+            coverage = prepared.get("coverage")
+            if not isinstance(coverage, dict):
+                coverage = _coverage_from_state(state)
+            digest = (
+                prepared.get("payload_digest")
+                if isinstance(prepared.get("payload_digest"), str)
+                else _stable_digest(payload)
+            )
+            parsed = _parse_checkpoint_input(
+                {
+                    "digest": digest,
+                    "through_seq": coverage.get("through_seq", 0),
+                    "events_since": coverage.get("events_since", 0),
+                    "window": coverage.get("window", 0),
+                }
+            )
+            if parsed is None:
+                _mark_input_unavailable(config, state, "checkpoint_input")
+                raise RememAPIError("Remem request failed", kind="request")
+            receipt["checkpoint_input"] = parsed
+            _replace_receipt(config, state, receipt)
+            _save_state(config.state_path, state)
+    else:
+        if prepared is None:
+            raise RememAPIError("Remem request failed", kind="request")
+        payload = prepared.get("payload")
+        if not isinstance(payload, dict) or _stable_digest(payload) != parsed["digest"]:
+            raise RememAPIError("Remem request failed", kind="request")
+    if _operation_delivered(
+        config.log_path,
+        "auto_checkpoint_delivered",
+        config.request_identity or "",
+    ):
+        return True
+    sent = _transport_prepared(config, payload, operation="checkpoint")
+    if sent is False:
+        return False
+    if sent:
+        _require_log_append(
+            config,
+            {
+                "timestamp": timestamp,
+                "event": "auto_checkpoint_delivered",
+                "operation_id": config.request_identity,
+                "payload_digest": parsed["digest"],
+                "source_id": payload.get("source_id"),
+            },
+        )
+    return True
+
+
+def _persist_checkpoint(
+    *,
+    config: Config,
+    kind: str,
+    hook_event: str,
+    state: dict[str, Any],
+) -> bool:
+    if config.request_identity:
+        return _persist_prepared_checkpoint(
+            config=config,
+            kind=kind,
+            hook_event=hook_event,
+            state=state,
+        )
+    return _persist_checkpoint_direct(
+        config=config,
+        kind=kind,
+        hook_event=hook_event,
+        state=state,
+    )
+
+
+def _persist_rollup_direct(
+    config: Config,
+    state: dict[str, Any] | None,
+) -> bool:
+    records = _load_checkpoint_rows(
+        config.log_path,
+        project=config.project,
+        session_id=config.session_id,
+    )
     if not records:
         return True
     timestamp = (
@@ -2098,10 +2638,139 @@ def _persist_rollup(config: Config, state: dict[str, Any] | None = None) -> bool
         return True
     _append_ndjson(
         config.log_path,
-        {"timestamp": timestamp, "event": "auto_rollup", "payload": payload, "response": response},
+        {
+            "timestamp": timestamp,
+            "event": "auto_rollup",
+            "payload": payload,
+            "response": response,
+        },
         trusted_fragments=(str(config.cwd),),
     )
     return True
+
+
+def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
+    receipt = dict(_current_receipt(config, state) or {})
+    timestamp = _ensure_receipt_started(config, state)
+    raw_input = receipt.get("rollup_input")
+    if _is_unavailable(raw_input):
+        raise RememAPIError("Remem request failed", kind="request")
+    parsed = _parse_rollup_input(raw_input) if raw_input is not None else None
+    if raw_input is not None and parsed is None:
+        _mark_input_unavailable(config, state, "rollup_input")
+        raise RememAPIError("Remem request failed", kind="request")
+    records = _load_checkpoint_rows(
+        config.log_path,
+        project=config.project,
+        session_id=config.session_id,
+    )
+    prepared = _find_prepared_record(
+        config.log_path,
+        "auto_rollup_prepared",
+        config.request_identity or "",
+    )
+    payload: dict[str, Any] | None = None
+    if parsed is None:
+        if receipt.get("protocol") != _RECEIPT_PROTOCOL:
+            _mark_input_unavailable(config, state, "rollup_input")
+            raise RememAPIError("Remem request failed", kind="request")
+        if prepared is not None:
+            payload = prepared.get("payload") if isinstance(prepared.get("payload"), dict) else None
+            cursor = prepared.get("cursor")
+            payload_digest = prepared.get("payload_digest")
+            if payload is None or not isinstance(cursor, dict):
+                _mark_input_unavailable(config, state, "rollup_input")
+                raise RememAPIError("Remem request failed", kind="request")
+            restored = dict(cursor)
+            if isinstance(payload_digest, str):
+                restored["payload_digest"] = payload_digest
+            parsed = _parse_rollup_input(restored)
+            if parsed is None:
+                _mark_input_unavailable(config, state, "rollup_input")
+                raise RememAPIError("Remem request failed", kind="request")
+            receipt["rollup_input"] = parsed
+            _replace_receipt(config, state, receipt)
+            _save_state(config.state_path, state)
+        else:
+            cursor = _cursor_from_records(records)
+            if records:
+                payload = _build_rollup_payload(
+                    config, records, timestamp=timestamp
+                )
+                if _payload_contains_secret(
+                    payload,
+                    trusted_fragments=(str(config.cwd),),
+                ):
+                    receipt["rollup_input"] = cursor
+                    _replace_receipt(config, state, receipt)
+                    _save_state(config.state_path, state)
+                    return True
+                if not _live_write_allowed(config):
+                    return False
+                payload_digest = _stable_digest(payload)
+                cursor["payload_digest"] = payload_digest
+                _require_log_append(
+                    config,
+                    {
+                        "timestamp": timestamp,
+                        "event": "auto_rollup_prepared",
+                        "operation_id": config.request_identity,
+                        "cursor": {
+                            key: cursor[key]
+                            for key in ("rows", "last_id", "digest")
+                            if key in cursor
+                        },
+                        "payload_digest": payload_digest,
+                        "payload": payload,
+                    },
+                )
+            receipt["rollup_input"] = cursor
+            _replace_receipt(config, state, receipt)
+            _save_state(config.state_path, state)
+            if not records or payload is None:
+                return True
+            parsed = cursor
+    if parsed is None:
+        raise RememAPIError("Remem request failed", kind="request")
+    if not _cursor_matches(parsed, records):
+        raise RememAPIError("Remem request failed", kind="request")
+    if parsed["rows"] == 0:
+        return True
+    if payload is None:
+        if prepared is None:
+            raise RememAPIError("Remem request failed", kind="request")
+        payload = prepared.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or _stable_digest(payload) != parsed.get("payload_digest")
+        ):
+            raise RememAPIError("Remem request failed", kind="request")
+    if _operation_delivered(
+        config.log_path,
+        "auto_rollup_delivered",
+        config.request_identity or "",
+    ):
+        return True
+    sent = _transport_prepared(config, payload, operation="rollup")
+    if sent is False:
+        return False
+    if sent:
+        _require_log_append(
+            config,
+            {
+                "timestamp": timestamp,
+                "event": "auto_rollup_delivered",
+                "operation_id": config.request_identity,
+                "payload_digest": parsed.get("payload_digest"),
+            },
+        )
+    return True
+
+
+def _persist_rollup(config: Config, state: dict[str, Any] | None = None) -> bool:
+    if config.request_identity and state is not None:
+        return _persist_prepared_rollup(config, state)
+    return _persist_rollup_direct(config, state)
 
 
 def _should_interval_checkpoint(state: dict[str, Any], config: Config) -> bool:
@@ -2115,29 +2784,64 @@ def _should_interval_checkpoint(state: dict[str, Any], config: Config) -> bool:
     return elapsed >= config.interval_seconds or events_since >= config.min_events * 2
 
 
+def _checkpoint_attempt_pending(config: Config, state: dict[str, Any]) -> bool:
+    if _operation_done(config, state, "checkpoint"):
+        return False
+    receipt = _current_receipt(config, state)
+    if receipt is not None and receipt.get("checkpoint_input") is not None:
+        return True
+    if not config.request_identity:
+        return False
+    return (
+        _find_prepared_record(
+            config.log_path,
+            "auto_checkpoint_prepared",
+            config.request_identity,
+        )
+        is not None
+    )
+
+
+def _finish_event(config: Config, state: dict[str, Any]) -> int:
+    if config.request_identity:
+        _complete_receipt(config, state)
+    else:
+        _save_state(config.state_path, state)
+    return 0
+
+
 def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
     event = _extract_tool_event(payload)
-    if event is None:
+    if event is None and not config.request_identity:
         return 0
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
+        admitted = _admit_receipt(config, state)
+        if admitted is _RECEIPT_COMPLETE:
+            return 0
         state["project"] = config.project
         transcript_path = _safe_path(payload.get("transcript_path"))
         if transcript_path:
             state["transcript_path"] = transcript_path
+        if event is None:
+            return _finish_event(config, state)
         if not _operation_done(config, state, "append"):
             recent = state.get("recent_events")
             recent = recent if isinstance(recent, list) else []
-            recent.append(event)
+            recent.append(_assign_append_seq(state, event))
             state["recent_events"] = recent[-30:]
             state["events_since_checkpoint"] = int(state.get("events_since_checkpoint") or 0) + 1
             _mark_receipt(config, state, "append")
             if config.request_identity:
                 _save_state(config.state_path, state)
 
-        if _should_interval_checkpoint(state, config) and not _operation_done(
-            config, state, "checkpoint"
+        if (
+            (
+                _should_interval_checkpoint(state, config)
+                or _checkpoint_attempt_pending(config, state)
+            )
+            and not _operation_done(config, state, "checkpoint")
         ):
             persisted = _persist_checkpoint(
                 config=config,
@@ -2148,22 +2852,27 @@ def _handle_post_tool_use(config: Config, payload: dict[str, Any]) -> int:
             if persisted:
                 state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
                 _commit_checkpoint_state(config, state)
-                return 0
-        _save_state(config.state_path, state)
-    return 0
+                return _finish_event(config, state)
+            _save_state(config.state_path, state)
+            return 0
+        return _finish_event(config, state)
 
 
 def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
+        admitted = _admit_receipt(config, state)
+        if admitted is _RECEIPT_COMPLETE:
+            return 0
         transcript_path = _safe_path(payload.get("transcript_path"))
         if transcript_path:
             state["transcript_path"] = transcript_path
         events_since = int(state.get("events_since_checkpoint") or 0)
-        if events_since <= 0 or _operation_done(config, state, "checkpoint"):
-            _save_state(config.state_path, state)
-            return 0
+        if _operation_done(config, state, "checkpoint") or (
+            events_since <= 0 and not _checkpoint_attempt_pending(config, state)
+        ):
+            return _finish_event(config, state)
         persisted = _persist_checkpoint(
             config=config,
             kind="milestone",
@@ -2173,7 +2882,7 @@ def _handle_task_completed(config: Config, payload: dict[str, Any]) -> int:
         if persisted:
             state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
             _commit_checkpoint_state(config, state)
-            return 0
+            return _finish_event(config, state)
         _save_state(config.state_path, state)
     return 0
 
@@ -2182,20 +2891,27 @@ def _handle_pre_compact(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
+        admitted = _admit_receipt(config, state)
+        if admitted is _RECEIPT_COMPLETE:
+            return 0
         state["project"] = config.project
         transcript_path = _safe_path(payload.get("transcript_path"))
         if transcript_path:
             state["transcript_path"] = transcript_path
 
-        # Avoid spamming duplicate checkpoints if PreCompact fires repeatedly without new activity.
         last_epoch = float(state.get("last_checkpoint_epoch") or 0.0)
         events_since = int(state.get("events_since_checkpoint") or 0)
-        if last_epoch > 0 and events_since <= 0 and (_utc_now().timestamp() - last_epoch) < 30:
-            _save_state(config.state_path, state)
-            return 0
+        if (
+            last_epoch > 0
+            and events_since <= 0
+            and (_utc_now().timestamp() - last_epoch) < 30
+            and not _checkpoint_attempt_pending(config, state)
+        ):
+            return _finish_event(config, state)
         if _operation_done(config, state, "checkpoint"):
-            _save_state(config.state_path, state)
-            return 0
+            return _finish_event(config, state)
+        if events_since <= 0 and not _checkpoint_attempt_pending(config, state):
+            return _finish_event(config, state)
 
         persisted = _persist_checkpoint(
             config=config,
@@ -2206,7 +2922,7 @@ def _handle_pre_compact(config: Config, payload: dict[str, Any]) -> int:
         if persisted:
             state["checkpoints_created"] = int(state.get("checkpoints_created") or 0) + 1
             _commit_checkpoint_state(config, state)
-            return 0
+            return _finish_event(config, state)
         _save_state(config.state_path, state)
     return 0
 
@@ -2215,11 +2931,16 @@ def _handle_session_end(config: Config, payload: dict[str, Any]) -> int:
     lock_path = config.state_path.with_suffix(config.state_path.suffix + ".lock")
     with _state_lock(lock_path):
         state = _load_state(config.state_path, config.session_id)
+        admitted = _admit_receipt(config, state)
+        if admitted is _RECEIPT_COMPLETE:
+            return 0
         transcript_path = _safe_path(payload.get("transcript_path"))
         if transcript_path:
             state["transcript_path"] = transcript_path
         events_since = int(state.get("events_since_checkpoint") or 0)
-        if events_since > 0 and not _operation_done(config, state, "checkpoint"):
+        if not _operation_done(config, state, "checkpoint") and (
+            events_since > 0 or _checkpoint_attempt_pending(config, state)
+        ):
             persisted = _persist_checkpoint(
                 config=config,
                 kind="milestone",
@@ -2244,14 +2965,15 @@ def _handle_session_end(config: Config, payload: dict[str, Any]) -> int:
                 state["last_rollup_epoch"] = _utc_now().timestamp()
                 _mark_receipt(config, state, "rollup")
                 if config.request_identity:
-                    _save_state(config.state_path, state)
-                    return 0
+                    return _finish_event(config, state)
+            elif config.request_identity:
+                _save_state(config.state_path, state)
+                return 0
         if not config.request_identity:
             state["last_checkpoint_epoch"] = _utc_now().timestamp()
             state["events_since_checkpoint"] = 0
             state["recent_events"] = []
-        _save_state(config.state_path, state)
-    return 0
+        return _finish_event(config, state)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2274,6 +2996,7 @@ def handle_payload(
     write_gate: Callable[[], bool] | None = None,
     request_identity: str | None = None,
     propagate_delivery_failure: bool = False,
+    live_request_ids: frozenset[str] | None = None,
 ) -> int:
     """Run one existing engineering hook mode for an already-parsed payload."""
 
@@ -2284,6 +3007,7 @@ def handle_payload(
         write_gate=write_gate,
         request_identity=request_identity,
         propagate_delivery_failure=propagate_delivery_failure,
+        live_request_ids=live_request_ids,
     )
     if not config.enabled:
         return 0

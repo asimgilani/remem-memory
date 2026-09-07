@@ -68,13 +68,18 @@ delivery or an explicit policy rejection removes it. Admission and payload
 retention stay at 128 events and 262,144 bytes. The same queue file may grow
 by a separately bounded diagnostic reserve used only for those non-content
 retry fields, never for payload. Engineering receipts stored with local
-session state are bounded IDs, operation enums, and counts/progress only.
-Retrying a checkpoint or rollup reuses a frozen per-event timestamp and
-source identity when those exist; optional summary-provider text and git
-metadata may still change under the same idempotency key. Backend ingest
-idempotency (issue 61) must treat that residual mutation. This does not
-promise indefinite retention or exactly-once ingestion across a crash
-between network delivery and local receipt persistence.
+session state are bounded IDs, operation enums, a completion flag, protocol
+version, and non-content cursor fields only: integer coverage counts, a
+source-id of at most 200 characters, SHA-256 digests, and an unavailable
+marker. They do not store checkpoint or rollup bodies. A queued checkpoint
+or rollup is prepared once in the existing append-only session log as an
+immutable pending record, then marked delivered in that same log. Retry
+reuses that prepared body; it does not rebuild from later pending activity
+or a later summary-provider result. Failed or interrupted queued captures
+therefore leave prepared content in that log until a future retention pass
+(issue 54). The queue's diagnostic reserve is not used for this content.
+This does not promise indefinite retention or exactly-once ingestion across
+a crash between network delivery and local receipt persistence.
 
 Session automation keeps project-local files under `.remem/`, normally:
 

@@ -6834,6 +6834,7 @@ class RememMemoryHookTests(unittest.TestCase):
             recorded = {
                 "headers": headers,
                 "body": json.loads(request.data.decode("utf-8")),
+                "raw": request.data,
                 "url": request.full_url,
                 "timeout": timeout,
             }
@@ -6945,6 +6946,27 @@ class RememMemoryHookTests(unittest.TestCase):
     def _load_engineering_state(self, config):
         return _AUTO._load_state(config.state_path, config.session_id)
 
+    def _log_rows(self, path):
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def _calls_for(self, calls, key):
+        return [
+            call
+            for call in calls
+            if call["headers"].get("idempotency-key") == key
+        ]
+
+    def _seed_recent_checkpoint_epoch(self, config) -> None:
+        state = self._load_engineering_state(config)
+        state["last_checkpoint_epoch"] = _AUTO._utc_now().timestamp()
+        _AUTO._save_state(config.state_path, state)
+
     def _drain(self, directory, events, dependencies, session_id="s1"):
         _HOOK.handle_event(
             worker_claim_payload(session_id, events),
@@ -6980,6 +7002,7 @@ class RememMemoryHookTests(unittest.TestCase):
                 queued = self._drain(directory, [event], dependencies)
 
             state = self._load_engineering_state(engineering)
+            log_rows = self._log_rows(engineering.log_path)
 
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0]["id"], event["id"])
@@ -6989,7 +7012,10 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertEqual(state["events_since_checkpoint"], 4)
         self.assertEqual(len(state["recent_events"]), 1)
         self.assertEqual(state["checkpoints_created"], 0)
-        self.assertFalse(engineering.log_path.exists())
+        self.assertEqual(
+            [row.get("event") for row in log_rows],
+            ["auto_checkpoint_prepared"],
+        )
         self.assertTrue(calls)
         self.assertEqual(
             {call["headers"].get("idempotency-key") for call in calls},
@@ -7105,7 +7131,12 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertGreaterEqual(len(rollup_keys), 2)
         self.assertEqual(
             [row["event"] for row in log_rows],
-            ["auto_checkpoint", "auto_rollup"],
+            [
+                "auto_checkpoint_prepared",
+                "auto_checkpoint_delivered",
+                "auto_rollup_prepared",
+                "auto_rollup_delivered",
+            ],
         )
 
     def test_engineering_pre_ack_crash_replays_without_transport(
@@ -7753,6 +7784,1086 @@ class RememMemoryHookTests(unittest.TestCase):
         self.assertTrue(calls)
         self.assertEqual(state.get("receipts") or {}, {})
         self.assertEqual(state["events_since_checkpoint"], 0)
+
+    def test_receipt_saturation_after_ordinary_acks_keeps_current_and_pre_ack_replay(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+
+        def script(call, calls):
+            del call, calls
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_MEMORY_SUMMARY_ENABLED": "0",
+                    "REMEM_MEMORY_MIN_EVENTS": "1000",
+                    "REMEM_MEMORY_INTERVAL_SECONDS": "1000000",
+                },
+                clear=False,
+            ):
+                engineering = _AUTO._load_config(
+                    {"cwd": str(directory), "session_id": "s1"},
+                    connection_id="primary",
+                )
+                _AUTO._save_state(
+                    engineering.state_path,
+                    {
+                        **_AUTO._default_state("s1"),
+                        "project": engineering.project,
+                    },
+                )
+                store = _HOOK.BackgroundQueueStore(Path(directory))
+                queue_path = store.path_for("s1")
+                dependencies, _ = self._real_engineering_dependencies(
+                    directory, config
+                )
+                last_event = None
+                pre_ack = b""
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    for index in range(149):
+                        event = self._sessions_event(
+                            directory=directory,
+                            target=target,
+                            route_revision=4,
+                            lifecycle_mode="post_tool_use",
+                            event_id=f"{index + 1:032x}",
+                            extra_payload={
+                                "tool_name": "Write",
+                                "tool_input": {
+                                    "file_path": f"src/e{index}.py"
+                                },
+                            },
+                        )
+                        store.save("s1", [event])
+                        if index == 148:
+                            pre_ack = queue_path.read_bytes()
+                            last_event = event
+                        queued = self._drain(
+                            directory, [event], dependencies
+                        )
+                        self.assertEqual(queued, [])
+                        state = self._load_engineering_state(engineering)
+                        receipts = state.get("receipts") or {}
+                        self.assertIn(event["id"], receipts)
+                        self.assertTrue(receipts[event["id"]].get("complete"))
+                        self.assertLessEqual(len(receipts), 128)
+
+                state = self._load_engineering_state(engineering)
+                events_since = state["events_since_checkpoint"]
+                self.assertEqual(events_since, 149)
+                self.assertEqual(
+                    len(state.get("receipts") or {}),
+                    1,
+                )
+                queue_path.write_bytes(pre_ack)
+                os.chmod(queue_path, 0o600)
+                restored = store.load("s1")
+                transport_before_replay = len(calls)
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    replayed = self._drain(
+                        directory, restored, dependencies
+                    )
+                replay_state = self._load_engineering_state(engineering)
+
+        self.assertIsNotNone(last_event)
+        self.assertEqual(replayed, [])
+        self.assertEqual(len(calls), transport_before_replay)
+        self.assertEqual(
+            replay_state["events_since_checkpoint"],
+            events_since,
+        )
+        self.assertEqual(len(replay_state["recent_events"]), 30)
+
+    def test_failed_receipts_are_reclaimed_from_live_queue_not_claim_subset(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+
+        def script(call, calls):
+            del call, calls
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        exhausted_id = "e" * 32
+        stale_id = "d" * 32
+        current_id = "c" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_MEMORY_SUMMARY_ENABLED": "0",
+                    "REMEM_MEMORY_MIN_EVENTS": "1000",
+                    "REMEM_MEMORY_INTERVAL_SECONDS": "1000000",
+                },
+                clear=False,
+            ):
+                engineering = _AUTO._load_config(
+                    {"cwd": str(directory), "session_id": "s1"},
+                    connection_id="primary",
+                )
+                state = _AUTO._default_state("s1")
+                state["project"] = engineering.project
+                state["receipts"] = {
+                    exhausted_id: {
+                        "done": ["checkpoint"],
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "complete": False,
+                        "protocol": 2,
+                    },
+                    stale_id: {
+                        "done": ["append"],
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "complete": False,
+                        "protocol": 2,
+                    },
+                }
+                _AUTO._save_state(engineering.state_path, state)
+                exhausted = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=exhausted_id,
+                )
+                exhausted = {
+                    **exhausted,
+                    "attempts": 3,
+                    "delivery_status": "exhausted",
+                    "failure_reason": "transient",
+                }
+                current = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    lifecycle_mode="post_tool_use",
+                    event_id=current_id,
+                    extra_payload={
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": "src/live.py"},
+                    },
+                )
+                store = _HOOK.BackgroundQueueStore(Path(directory))
+                store.save("s1", [exhausted, current])
+                dependencies, _ = self._real_engineering_dependencies(
+                    directory, config
+                )
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    after_current = self._drain(
+                        directory, [current], dependencies
+                    )
+                state = self._load_engineering_state(engineering)
+                receipts = state.get("receipts") or {}
+
+        self.assertEqual(
+            [item["id"] for item in after_current],
+            [exhausted_id],
+        )
+        self.assertIn(exhausted_id, receipts)
+        self.assertNotIn(stale_id, receipts)
+        self.assertLessEqual(len(receipts), 128)
+
+    def test_interleaved_later_checkpoint_does_not_change_frozen_rollup(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+        fail_a_rollup = [True]
+
+        def script(call, calls):
+            del calls
+            key = call["headers"].get("idempotency-key", "")
+            if key == f"{event_a_id}:rollup" and fail_a_rollup[0]:
+                raise urllib.error.URLError("synthetic rollup failure")
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_a_id = "a" * 32
+        event_b_id = "b" * 32
+        event_c_id = "c" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"REMEM_MEMORY_SUMMARY_ENABLED": "0"},
+                clear=False,
+            ):
+                engineering = self._seed_engineering_pending(directory)
+                event_a = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=event_a_id,
+                )
+                event_b = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    lifecycle_mode="post_tool_use",
+                    event_id=event_b_id,
+                    extra_payload={
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": "src/later.py"},
+                    },
+                )
+                event_c = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=event_c_id,
+                )
+                store = _HOOK.BackgroundQueueStore(Path(directory))
+                store.save("s1", [event_a])
+                dependencies, _ = self._real_engineering_dependencies(
+                    directory, config
+                )
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    after_a = self._drain(
+                        directory, [event_a], dependencies
+                    )
+                    retained_a = [
+                        item
+                        for item in after_a
+                        if item["id"] == event_a_id
+                    ]
+                    store.save("s1", [*retained_a, event_b])
+                    self._drain(directory, [event_b], dependencies)
+                    remaining = [
+                        item
+                        for item in store.load("s1")
+                        if item["id"] == event_a_id
+                    ]
+                    store.save("s1", [*remaining, event_c])
+                    after_c = self._drain(
+                        directory, [event_c], dependencies
+                    )
+                    a_rollup_before = self._calls_for(
+                        calls, f"{event_a_id}:rollup"
+                    )
+                    fail_a_rollup[0] = False
+                    after_resume = self._drain(
+                        directory,
+                        [
+                            item
+                            for item in store.load("s1")
+                            if item["id"] == event_a_id
+                        ]
+                        or retained_a,
+                        dependencies,
+                    )
+                    a_rollup_after = self._calls_for(
+                        calls, f"{event_a_id}:rollup"
+                    )
+                    c_rollup = self._calls_for(
+                        calls, f"{event_c_id}:rollup"
+                    )
+
+            log_rows = self._log_rows(engineering.log_path)
+
+        self.assertEqual(len(retained_a), 1)
+        self.assertEqual(retained_a[0]["delivery_status"], "retry")
+        self.assertNotIn(event_c_id, {item["id"] for item in after_c})
+        self.assertEqual(after_resume, [])
+        self.assertGreaterEqual(len(a_rollup_before), 1)
+        self.assertGreater(len(a_rollup_after), len(a_rollup_before))
+        first_raw = a_rollup_before[0]["raw"]
+        for call in a_rollup_after:
+            self.assertEqual(call["raw"], first_raw)
+            self.assertNotIn("src/later.py", call["body"]["content"])
+        self.assertTrue(c_rollup)
+        self.assertIn("src/later.py", c_rollup[0]["body"]["content"])
+        self.assertIn("src/a.py", c_rollup[0]["body"]["content"])
+        delivered_kinds = [row.get("event") for row in log_rows]
+        self.assertIn("auto_checkpoint_prepared", delivered_kinds)
+        self.assertNotIn(
+            "src/later.py",
+            a_rollup_after[-1]["body"]["content"],
+        )
+
+    def test_failed_checkpoint_replay_stays_frozen_and_keeps_later_append(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+        fail_a = [True]
+
+        def script(call, calls):
+            del calls
+            key = call["headers"].get("idempotency-key", "")
+            if key == f"{event_a_id}:checkpoint" and fail_a[0]:
+                raise urllib.error.URLError("synthetic checkpoint failure")
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_a_id = "a" * 32
+        event_b_id = "b" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"REMEM_MEMORY_SUMMARY_ENABLED": "0"},
+                clear=False,
+            ):
+                engineering = self._seed_engineering_pending(directory)
+                self._seed_recent_checkpoint_epoch(engineering)
+                event_a = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=event_a_id,
+                )
+                event_b = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    lifecycle_mode="post_tool_use",
+                    event_id=event_b_id,
+                    extra_payload={
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": "src/later.py"},
+                    },
+                )
+                store = _HOOK.BackgroundQueueStore(Path(directory))
+                store.save("s1", [event_a])
+                dependencies, _ = self._real_engineering_dependencies(
+                    directory, config
+                )
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    after_a = self._drain(
+                        directory, [event_a], dependencies
+                    )
+                    first_bodies = [
+                        call["raw"]
+                        for call in self._calls_for(
+                            calls, f"{event_a_id}:checkpoint"
+                        )
+                    ]
+                    store.save(
+                        "s1",
+                        [
+                            *[
+                                item
+                                for item in after_a
+                                if item["id"] == event_a_id
+                            ],
+                            event_b,
+                        ],
+                    )
+                    self._drain(directory, [event_b], dependencies)
+                    state_after_b = self._load_engineering_state(
+                        engineering
+                    )
+                    fail_a[0] = False
+                    after_resume = self._drain(
+                        directory,
+                        [
+                            item
+                            for item in store.load("s1")
+                            if item["id"] == event_a_id
+                        ],
+                        dependencies,
+                    )
+                    replay_bodies = [
+                        call["raw"]
+                        for call in self._calls_for(
+                            calls, f"{event_a_id}:checkpoint"
+                        )
+                    ]
+                    state_after_a = self._load_engineering_state(
+                        engineering
+                    )
+
+        self.assertEqual(len(after_a), 1)
+        self.assertEqual(after_a[0]["delivery_status"], "retry")
+        self.assertEqual(state_after_b["events_since_checkpoint"], 5)
+        self.assertEqual(
+            [event["files"] for event in state_after_b["recent_events"]],
+            [["src/a.py"], ["src/later.py"]],
+        )
+        self.assertEqual(after_resume, [])
+        self.assertGreaterEqual(len(first_bodies), 1)
+        self.assertGreater(len(replay_bodies), len(first_bodies))
+        for raw in replay_bodies:
+            self.assertEqual(raw, first_bodies[0])
+        self.assertNotIn("src/later.py", json.loads(first_bodies[0])["content"])
+        self.assertEqual(state_after_a["events_since_checkpoint"], 1)
+        self.assertEqual(
+            state_after_a["recent_events"][0]["files"],
+            ["src/later.py"],
+        )
+
+    def test_later_checkpoint_commit_does_not_change_failed_owner_replay(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+        fail_a = [True]
+
+        def script(call, calls):
+            del calls
+            key = call["headers"].get("idempotency-key", "")
+            if key == f"{event_a_id}:checkpoint" and fail_a[0]:
+                raise urllib.error.URLError("synthetic checkpoint failure")
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_a_id = "a" * 32
+        event_b_id = "b" * 32
+        event_c_id = "c" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"REMEM_MEMORY_SUMMARY_ENABLED": "0"},
+                clear=False,
+            ):
+                engineering = self._seed_engineering_pending(directory)
+                self._seed_recent_checkpoint_epoch(engineering)
+                event_a = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=event_a_id,
+                )
+                event_b = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    lifecycle_mode="post_tool_use",
+                    event_id=event_b_id,
+                    extra_payload={
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": "src/later.py"},
+                    },
+                )
+                event_c = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=event_c_id,
+                )
+                store = _HOOK.BackgroundQueueStore(Path(directory))
+                store.save("s1", [event_a])
+                dependencies, _ = self._real_engineering_dependencies(
+                    directory, config
+                )
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    after_a = self._drain(
+                        directory, [event_a], dependencies
+                    )
+                    first_checkpoint = self._calls_for(
+                        calls, f"{event_a_id}:checkpoint"
+                    )
+                    store.save(
+                        "s1",
+                        [
+                            *[
+                                item
+                                for item in after_a
+                                if item["id"] == event_a_id
+                            ],
+                            event_b,
+                        ],
+                    )
+                    self._drain(directory, [event_b], dependencies)
+                    remaining = [
+                        item
+                        for item in store.load("s1")
+                        if item["id"] == event_a_id
+                    ]
+                    store.save("s1", [*remaining, event_c])
+                    self._drain(directory, [event_c], dependencies)
+                    state_after_c = self._load_engineering_state(
+                        engineering
+                    )
+                    c_checkpoint = self._calls_for(
+                        calls, f"{event_c_id}:checkpoint"
+                    )
+                    fail_a[0] = False
+                    after_resume = self._drain(
+                        directory,
+                        [
+                            item
+                            for item in store.load("s1")
+                            if item["id"] == event_a_id
+                        ],
+                        dependencies,
+                    )
+                    replay_checkpoint = self._calls_for(
+                        calls, f"{event_a_id}:checkpoint"
+                    )
+                    state_after_a = self._load_engineering_state(
+                        engineering
+                    )
+
+        self.assertTrue(first_checkpoint)
+        self.assertTrue(c_checkpoint)
+        self.assertIn("src/a.py", c_checkpoint[0]["body"]["content"])
+        self.assertIn("src/later.py", c_checkpoint[0]["body"]["content"])
+        self.assertEqual(state_after_c["events_since_checkpoint"], 0)
+        self.assertEqual(state_after_c["recent_events"], [])
+        self.assertEqual(after_resume, [])
+        self.assertGreater(len(replay_checkpoint), len(first_checkpoint))
+        for call in replay_checkpoint:
+            self.assertEqual(call["raw"], first_checkpoint[0]["raw"])
+            self.assertNotIn("src/later.py", call["body"]["content"])
+        self.assertEqual(state_after_a["events_since_checkpoint"], 0)
+        self.assertEqual(state_after_a["recent_events"], [])
+        self.assertFalse(
+            any(
+                "src/later.py" in (event.get("files") or [])
+                for event in state_after_a["recent_events"]
+            )
+        )
+
+    def test_prepare_crash_before_receipt_save_reuses_same_record(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+
+        def script(call, calls):
+            del call, calls
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_id = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            engineering = self._seed_engineering_pending(directory)
+            event = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                event_id=event_id,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            dependencies, _ = self._real_engineering_dependencies(
+                directory, config
+            )
+            prepared = []
+            real_append = _AUTO._append_ndjson
+            real_save = _AUTO._save_state
+
+            def append_wrap(path, record, **kwargs):
+                result = real_append(path, record, **kwargs)
+                if (
+                    isinstance(record, dict)
+                    and record.get("event") == "auto_checkpoint_prepared"
+                ):
+                    prepared.append(record)
+                return result
+
+            def save_wrap(path, state):
+                if prepared and not getattr(save_wrap, "crashed", False):
+                    save_wrap.crashed = True
+                    raise OSError("crash after prepare append")
+                return real_save(path, state)
+
+            with mock.patch.object(_AUTO, "RememAPI", api_type):
+                with mock.patch.object(
+                    _AUTO, "_append_ndjson", side_effect=append_wrap
+                ):
+                    with mock.patch.object(
+                        _AUTO, "_save_state", side_effect=save_wrap
+                    ):
+                        first = self._drain(
+                            directory, [event], dependencies
+                        )
+                state_after_crash = self._load_engineering_state(
+                    engineering
+                )
+                second = self._drain(
+                    directory,
+                    first or store.load("s1"),
+                    dependencies,
+                )
+            rows = self._log_rows(engineering.log_path)
+            checkpoint_calls = self._calls_for(
+                calls, f"{event_id}:checkpoint"
+            )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["delivery_status"], "retry")
+        receipt = (state_after_crash.get("receipts") or {}).get(event_id) or {}
+        self.assertFalse(receipt.get("checkpoint_input"))
+        self.assertEqual(second, [])
+        prepared_rows = [
+            row
+            for row in rows
+            if row.get("event") == "auto_checkpoint_prepared"
+        ]
+        self.assertEqual(len(prepared_rows), 1)
+        self.assertEqual(len(checkpoint_calls), 1)
+
+    def test_delivery_marker_without_state_commit_does_not_resend(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+
+        def script(call, calls):
+            del call, calls
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_id = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            engineering = self._seed_engineering_pending(directory)
+            event = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                event_id=event_id,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            dependencies, _ = self._real_engineering_dependencies(
+                directory, config
+            )
+            delivered = []
+            real_append = _AUTO._append_ndjson
+            real_commit = _AUTO._commit_checkpoint_state
+
+            def append_wrap(path, record, **kwargs):
+                result = real_append(path, record, **kwargs)
+                if (
+                    isinstance(record, dict)
+                    and record.get("event")
+                    == "auto_checkpoint_delivered"
+                ):
+                    delivered.append(record)
+                return result
+
+            def commit_wrap(*args, **kwargs):
+                if delivered and not getattr(commit_wrap, "crashed", False):
+                    commit_wrap.crashed = True
+                    raise _AUTO.RememAPIError(
+                        "crash after delivery",
+                        kind="request",
+                    )
+                return real_commit(*args, **kwargs)
+
+            with mock.patch.object(_AUTO, "RememAPI", api_type):
+                with mock.patch.object(
+                    _AUTO, "_append_ndjson", side_effect=append_wrap
+                ):
+                    with mock.patch.object(
+                        _AUTO,
+                        "_commit_checkpoint_state",
+                        side_effect=commit_wrap,
+                    ):
+                        first = self._drain(
+                            directory, [event], dependencies
+                        )
+                transport_after_first = len(
+                    self._calls_for(calls, f"{event_id}:checkpoint")
+                )
+                second = self._drain(
+                    directory,
+                    first or store.load("s1"),
+                    dependencies,
+                )
+            state = self._load_engineering_state(engineering)
+            checkpoint_calls = self._calls_for(
+                calls, f"{event_id}:checkpoint"
+            )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["delivery_status"], "retry")
+        self.assertEqual(transport_after_first, 1)
+        self.assertEqual(len(checkpoint_calls), 1)
+        self.assertEqual(second, [])
+        self.assertEqual(state["events_since_checkpoint"], 0)
+
+    def test_malformed_and_legacy_rollup_cursors_fail_closed(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+        fail_rollup = [True]
+
+        def script(call, calls):
+            del calls
+            key = call["headers"].get("idempotency-key", "")
+            if key.endswith(":rollup") and fail_rollup[0]:
+                raise urllib.error.URLError("synthetic rollup failure")
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_a_id = "a" * 32
+        event_b_id = "b" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            engineering = self._seed_engineering_pending(directory)
+            event_a = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                event_id=event_a_id,
+            )
+            event_b = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                lifecycle_mode="post_tool_use",
+                event_id=event_b_id,
+                extra_payload={
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": "src/later.py"},
+                },
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event_a])
+            dependencies, _ = self._real_engineering_dependencies(
+                directory, config
+            )
+            with mock.patch.object(_AUTO, "RememAPI", api_type):
+                after_a = self._drain(directory, [event_a], dependencies)
+                state = self._load_engineering_state(engineering)
+                receipt = dict(
+                    (state.get("receipts") or {}).get(event_a_id) or {}
+                )
+                receipt["rollup_input"] = {"rows": "nope"}
+                state["receipts"] = {event_a_id: receipt}
+                _AUTO._save_state(engineering.state_path, state)
+                rollup_before = len(
+                    self._calls_for(calls, f"{event_a_id}:rollup")
+                )
+                fail_rollup[0] = False
+                malformed = self._drain(
+                    directory,
+                    [
+                        item
+                        for item in after_a
+                        if item["id"] == event_a_id
+                    ],
+                    dependencies,
+                )
+                self.assertEqual(len(malformed), 1)
+                self.assertEqual(malformed[0]["failure_reason"], "request")
+                self.assertEqual(
+                    len(self._calls_for(calls, f"{event_a_id}:rollup")),
+                    rollup_before,
+                )
+
+                receipt = {
+                    "done": ["checkpoint"],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+                state = self._load_engineering_state(engineering)
+                state["receipts"] = {event_a_id: receipt}
+                _AUTO._save_state(engineering.state_path, state)
+                store.save(
+                    "s1",
+                    [
+                        {
+                            **malformed[0],
+                            "attempts": 1,
+                            "delivery_status": "retry",
+                            "failure_reason": "request",
+                        },
+                        event_b,
+                    ],
+                )
+                self._drain(directory, [event_b], dependencies)
+                event_c = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id="c" * 32,
+                )
+                remaining = [
+                    item
+                    for item in store.load("s1")
+                    if item["id"] == event_a_id
+                ]
+                store.save("s1", [*remaining, event_c])
+                self._drain(directory, [event_c], dependencies)
+                legacy = self._drain(
+                    directory,
+                    [
+                        item
+                        for item in store.load("s1")
+                        if item["id"] == event_a_id
+                    ],
+                    dependencies,
+                )
+            state = self._load_engineering_state(engineering)
+            receipt = (state.get("receipts") or {}).get(event_a_id) or {}
+
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(legacy[0]["failure_reason"], "request")
+        self.assertTrue(receipt.get("rollup_input", {}).get("unavailable"))
+        replay_bodies = [
+            call["body"]["content"]
+            for call in self._calls_for(calls, f"{event_a_id}:rollup")
+        ]
+        self.assertTrue(replay_bodies)
+        self.assertFalse(
+            any("src/later.py" in content for content in replay_bodies)
+        )
+
+    def test_truncated_or_replaced_frozen_rollup_input_fails_closed(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+        fail_rollup = [True]
+
+        def script(call, calls):
+            del calls
+            key = call["headers"].get("idempotency-key", "")
+            if key.endswith(":rollup") and fail_rollup[0]:
+                raise urllib.error.URLError("synthetic rollup failure")
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_a_id = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            engineering = self._seed_engineering_pending(directory)
+            event_a = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                event_id=event_a_id,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event_a])
+            dependencies, _ = self._real_engineering_dependencies(
+                directory, config
+            )
+            with mock.patch.object(_AUTO, "RememAPI", api_type):
+                after_a = self._drain(directory, [event_a], dependencies)
+                retained = [
+                    item
+                    for item in after_a
+                    if item["id"] == event_a_id
+                ]
+                original_log = engineering.log_path.read_text(encoding="utf-8")
+                engineering.log_path.write_text("", encoding="utf-8")
+                fail_rollup[0] = False
+                truncated = self._drain(
+                    directory, retained, dependencies
+                )
+                self.assertEqual(len(truncated), 1)
+                self.assertEqual(truncated[0]["failure_reason"], "request")
+                rollup_after_truncate = len(
+                    self._calls_for(calls, f"{event_a_id}:rollup")
+                )
+
+                engineering.log_path.write_text(
+                    original_log.replace("src/a.py", "src/other.py"),
+                    encoding="utf-8",
+                )
+                replaced = self._drain(
+                    directory, truncated, dependencies
+                )
+            state = self._load_engineering_state(engineering)
+            receipt = (state.get("receipts") or {}).get(event_a_id) or {}
+
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual(replaced[0]["failure_reason"], "request")
+        self.assertEqual(
+            len(self._calls_for(calls, f"{event_a_id}:rollup")),
+            rollup_after_truncate,
+        )
+        self.assertTrue(receipt.get("rollup_input"))
+
+    def test_summary_change_cannot_alter_prepared_retry_body(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+        summaries = ["first-summary", "second-summary"]
+
+        def changing_summary(**kwargs):
+            del kwargs
+            text = summaries[0] if len(summaries) == 1 else summaries.pop(0)
+            return _AUTO.StructuredSummary(
+                summary=text,
+                decisions=[],
+                open_questions=[],
+                next_actions=[],
+                provider="test",
+                model="test-model",
+            )
+
+        fail_checkpoint = [True]
+
+        def script(call, calls):
+            del calls
+            key = call["headers"].get("idempotency-key", "")
+            if key.endswith(":checkpoint") and fail_checkpoint[0]:
+                raise urllib.error.URLError("synthetic checkpoint failure")
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_id = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            engineering = self._seed_engineering_pending(directory)
+            event = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                event_id=event_id,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            dependencies, _ = self._real_engineering_dependencies(
+                directory, config
+            )
+            with mock.patch.object(
+                _AUTO,
+                "_generate_checkpoint_structured_summary",
+                side_effect=changing_summary,
+            ):
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    first = self._drain(directory, [event], dependencies)
+                    fail_checkpoint[0] = False
+                    second = self._drain(
+                        directory,
+                        first or store.load("s1"),
+                        dependencies,
+                    )
+            checkpoint_calls = self._calls_for(
+                calls, f"{event_id}:checkpoint"
+            )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertGreaterEqual(len(checkpoint_calls), 2)
+        self.assertEqual(
+            checkpoint_calls[0]["raw"],
+            checkpoint_calls[1]["raw"],
+        )
+        self.assertIn("first-summary", checkpoint_calls[0]["body"]["content"])
+        self.assertNotIn(
+            "second-summary",
+            checkpoint_calls[1]["body"]["content"],
+        )
+
+    def test_complete_receipt_still_queued_is_ack_without_transport(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+
+        def script(call, calls):
+            del call, calls
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        event_id = "a" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            self._seed_engineering_pending(directory)
+            event = self._sessions_event(
+                directory=directory,
+                target=target,
+                route_revision=4,
+                event_id=event_id,
+            )
+            store = _HOOK.BackgroundQueueStore(Path(directory))
+            store.save("s1", [event])
+            queue_path = store.path_for("s1")
+            pre_ack = queue_path.read_bytes()
+            dependencies, _ = self._real_engineering_dependencies(
+                directory, config
+            )
+            with mock.patch.object(_AUTO, "RememAPI", api_type):
+                first = self._drain(directory, [event], dependencies)
+                queue_path.write_bytes(pre_ack)
+                os.chmod(queue_path, 0o600)
+                transport_after_first = len(calls)
+                second = self._drain(
+                    directory, store.load("s1"), dependencies
+                )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(len(calls), transport_after_first)
+
+    def test_exhausted_receipt_survives_later_ordinary_drains(
+        self,
+    ) -> None:
+        _, target, config = self._sessions_route()
+
+        def script(call, calls):
+            del call, calls
+            return {"ok": True}
+
+        api_type, calls = self._scripted_remem_api(script)
+        exhausted_id = "e" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REMEM_MEMORY_SUMMARY_ENABLED": "0",
+                    "REMEM_MEMORY_MIN_EVENTS": "1000",
+                    "REMEM_MEMORY_INTERVAL_SECONDS": "1000000",
+                },
+                clear=False,
+            ):
+                engineering = self._seed_engineering_pending(directory)
+                exhausted = self._sessions_event(
+                    directory=directory,
+                    target=target,
+                    route_revision=4,
+                    event_id=exhausted_id,
+                )
+                exhausted = {
+                    **exhausted,
+                    "attempts": 3,
+                    "delivery_status": "exhausted",
+                    "failure_reason": "transient",
+                }
+                state = self._load_engineering_state(engineering)
+                state["receipts"] = {
+                    exhausted_id: {
+                        "done": ["checkpoint"],
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "complete": False,
+                        "protocol": 2,
+                    }
+                }
+                _AUTO._save_state(engineering.state_path, state)
+                store = _HOOK.BackgroundQueueStore(Path(directory))
+                store.save("s1", [exhausted])
+                dependencies, _ = self._real_engineering_dependencies(
+                    directory, config
+                )
+                with mock.patch.object(_AUTO, "RememAPI", api_type):
+                    for index in range(130):
+                        event = self._sessions_event(
+                            directory=directory,
+                            target=target,
+                            route_revision=4,
+                            lifecycle_mode="post_tool_use",
+                            event_id=f"{index + 1:032x}",
+                            extra_payload={
+                                "tool_name": "Write",
+                                "tool_input": {
+                                    "file_path": f"src/n{index}.py"
+                                },
+                            },
+                        )
+                        current = [
+                            item
+                            for item in store.load("s1")
+                            if item["id"] == exhausted_id
+                        ]
+                        store.save("s1", [*current, event])
+                        queued = self._drain(
+                            directory, [event], dependencies
+                        )
+                        self.assertTrue(
+                            any(
+                                item["id"] == exhausted_id
+                                for item in queued
+                            )
+                        )
+                state = self._load_engineering_state(engineering)
+                retained = store.load("s1")
+
+        self.assertEqual(
+            [item["id"] for item in retained],
+            [exhausted_id],
+        )
+        self.assertEqual(retained[0]["delivery_status"], "exhausted")
+        self.assertIn(exhausted_id, state.get("receipts") or {})
+        self.assertEqual(
+            (state.get("receipts") or {})[exhausted_id]["done"],
+            ["checkpoint"],
+        )
 
 
 if __name__ == "__main__":

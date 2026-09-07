@@ -2014,6 +2014,174 @@ class AutoMemoryHookTests(unittest.TestCase):
         self.assertEqual(structured.decisions, meta["decisions"])
         self.assertIn("## Decisions", payload["content"])
 
+    def test_sanitize_receipts_keeps_overfull_set_and_marks_bad_cursors(
+        self,
+    ) -> None:
+        started = "2026-01-01T00:00:00+00:00"
+        receipts = {
+            f"{index:032x}": {
+                "done": ["append"],
+                "started_at": started,
+            }
+            for index in range(130)
+        }
+        receipts["a" * 32] = {
+            "done": ["checkpoint"],
+            "started_at": started,
+            "complete": False,
+            "protocol": 2,
+            "rollup_input": "not-a-object",
+        }
+        receipts["b" * 32] = {
+            "done": ["checkpoint"],
+            "started_at": started,
+            "rollup_input": {
+                "rows": 1,
+                "last_id": "x" * 201,
+                "digest": "ab",
+            },
+        }
+        sanitized = _MODULE._sanitize_receipts(receipts)
+        self.assertGreaterEqual(len(sanitized), 130)
+        self.assertEqual(
+            sanitized["a" * 32]["rollup_input"],
+            {"unavailable": True},
+        )
+        self.assertEqual(
+            sanitized["b" * 32]["rollup_input"],
+            {"unavailable": True},
+        )
+        self.assertNotIn("x" * 201, json.dumps(sanitized["b" * 32]))
+
+    def test_load_state_keeps_overfull_receipts_until_admission(
+        self,
+    ) -> None:
+        started = "2026-01-01T00:00:00+00:00"
+        receipts = {
+            f"{index:032x}": {
+                "done": ["append"],
+                "started_at": started,
+            }
+            for index in range(130)
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "session_id": "sess-a",
+                        "receipts": receipts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = _MODULE._load_state(path, "sess-a")
+        self.assertEqual(len(loaded["receipts"]), 130)
+
+    def test_admit_receipt_rejects_129th_live_receipt_without_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            live_ids = [f"{index:032x}" for index in range(128)]
+            extra = "f" * 32
+            state = _MODULE._default_state("sess-a")
+            state["receipts"] = {
+                event_id: {
+                    "done": [],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "complete": False,
+                    "protocol": 2,
+                }
+                for event_id in live_ids
+            }
+            _MODULE._save_state(path, state)
+            before = path.read_text(encoding="utf-8")
+            config = _MODULE.Config(
+                **{
+                    **_build_cfg().__dict__,
+                    "state_path": path,
+                    "log_path": Path(directory) / "log.ndjson",
+                    "request_identity": extra,
+                    "propagate_delivery_failure": True,
+                    "live_request_ids": frozenset([*live_ids, extra]),
+                }
+            )
+            with self.assertRaises(_MODULE.RememAPIError) as caught:
+                _MODULE._admit_receipt(config, _MODULE._load_state(path, "sess-a"))
+            self.assertEqual(caught.exception.kind, "request")
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_checkpoint_loader_excludes_pending_and_keeps_legacy(
+        self,
+    ) -> None:
+        legacy = {
+            "event": "auto_checkpoint",
+            "payload": {
+                "source_id": "legacy-1",
+                "metadata": {
+                    "project": "remem",
+                    "session_id": "sess-a",
+                },
+            },
+        }
+        prepared = {
+            "event": "auto_checkpoint_prepared",
+            "operation_id": "a" * 32,
+            "payload": {
+                "source_id": "auto-checkpoint:" + "a" * 32 + ":milestone",
+                "metadata": {
+                    "project": "remem",
+                    "session_id": "sess-a",
+                },
+            },
+        }
+        other_prepared = {
+            "event": "auto_checkpoint_prepared",
+            "operation_id": "b" * 32,
+            "payload": {
+                "source_id": "auto-checkpoint:" + "b" * 32 + ":milestone",
+                "metadata": {
+                    "project": "remem",
+                    "session_id": "sess-a",
+                },
+            },
+        }
+        delivered = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "a" * 32,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.ndjson"
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        legacy,
+                        prepared,
+                        other_prepared,
+                        delivered,
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rows = _MODULE._load_checkpoint_rows(
+                path,
+                project="remem",
+                session_id="sess-a",
+            )
+        source_ids = [
+            row.get("payload", {}).get("source_id") for row in rows
+        ]
+        self.assertEqual(
+            source_ids,
+            [
+                "legacy-1",
+                "auto-checkpoint:" + "a" * 32 + ":milestone",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
