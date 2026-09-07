@@ -52,7 +52,12 @@ paths, transcript turns, nested metadata or summary fields, prompt-state
 identifiers, results, and final payloads are dropped instead of redacted and
 forwarded. Opaque local cwd values may skip entropy only on matching
 structural path fields. They do not rewrite body text or become a trust root
-when they appear as payload `source_path` or `repo_root`.
+when they appear as payload `source_path` or `repo_root`. A previously
+generated `- Repo: {cwd}` content line may skip entropy only when that
+exact trusted cwd is both `source_path` and `repo_root`. Prompt-state
+identifiers skip entropy only for the generated `turn-` plus 32 lowercase
+hex shape; other turn IDs are dropped to empty when they fail the same
+secret, off-record, and entropy policy.
 
 Filtering is defense in depth, not a guarantee that every form of private data
 will be recognized. Documented false positives include opaque local temp-path

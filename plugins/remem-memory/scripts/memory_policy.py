@@ -68,6 +68,9 @@ _SECRET_PATTERNS = (
 _HIGH_ENTROPY_CANDIDATE = re.compile(
     r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9])"
 )
+_GENERATED_TURN_ID = re.compile(r"\Aturn-[0-9a-f]{32}\Z")
+_IDENTIFIER_FIELDS = frozenset({"turn_id", "completed_turn_ids"})
+_LEGACY_GENERATED_REPO_PREFIX = "- Repo: "
 _TRUSTED_PATH_FIELDS = frozenset(
     {
         "source_path",
@@ -208,6 +211,48 @@ def _contains_high_entropy(value: str) -> bool:
     )
 
 
+def _agreed_legacy_repo_roots(
+    value: object,
+    trusted_values: frozenset[str],
+) -> frozenset[str]:
+    source_paths: set[str] = set()
+    repo_roots: set[str] = set()
+
+    def collect(item: object, field_name: str | None = None) -> None:
+        if isinstance(item, str):
+            if item in trusted_values:
+                if field_name == "source_path":
+                    source_paths.add(item)
+                elif field_name == "repo_root":
+                    repo_roots.add(item)
+            return
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                collect(child, key if isinstance(key, str) else None)
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                collect(child, field_name)
+
+    collect(value)
+    return frozenset(source_paths & repo_roots)
+
+
+def _content_without_legacy_repo_lines(
+    text: str,
+    agreed_roots: frozenset[str],
+) -> str:
+    if not agreed_roots:
+        return text
+    kept: list[str] = []
+    prefix = _LEGACY_GENERATED_REPO_PREFIX
+    for line in text.splitlines():
+        if line.startswith(prefix) and line[len(prefix):] in agreed_roots:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def evaluate_automatic_capture(
     payload: object,
     *,
@@ -220,6 +265,14 @@ def evaluate_automatic_capture(
     positives only when a structural path field's exact value equals a
     fragment. They never hide secrets, off-record spans, or arbitrary body
     text, and payload-derived paths are not a trust root.
+
+    Identifier entropy may skip only the generated ``turn-`` plus 32
+    lowercase hex shape on ``turn_id`` and ``completed_turn_ids``. Other
+    identifier values use the same secret, off-record, and entropy checks.
+
+    A previously generated content line that is exactly ``- Repo:`` plus a
+    trusted fragment may skip entropy when that fragment is both
+    ``source_path`` and ``repo_root``. Stored content is not rewritten.
     """
 
     secret_count = 0
@@ -227,6 +280,7 @@ def evaluate_automatic_capture(
     trusted_values = frozenset(
         fragment for fragment in trusted_fragments if fragment
     )
+    agreed_repo_roots = _agreed_legacy_repo_roots(payload, trusted_values)
 
     def consider_text(
         text: str,
@@ -244,7 +298,18 @@ def evaluate_automatic_capture(
             return
         if field_name in _TRUSTED_PATH_FIELDS and text in trusted_values:
             return
-        if _contains_high_entropy(text):
+        if (
+            field_name in _IDENTIFIER_FIELDS
+            and _GENERATED_TURN_ID.fullmatch(text)
+        ):
+            return
+        entropy_text = text
+        if field_name == "content":
+            entropy_text = _content_without_legacy_repo_lines(
+                text,
+                agreed_repo_roots,
+            )
+        if _contains_high_entropy(entropy_text):
             secret_count += 1
 
     def walk(value: object, *, field_name: str | None = None) -> None:

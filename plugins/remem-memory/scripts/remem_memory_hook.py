@@ -27,7 +27,6 @@ from uuid import uuid4
 import remem_api
 from memory_policy import (
     RecallSource,
-    contains_explicit_secret,
     contains_secret,
     evaluate_automatic_capture,
     is_off_record,
@@ -273,7 +272,7 @@ def _retained_identifier(value: object, *, limit: int) -> str:
     cleaned = value.strip()[:limit]
     if not cleaned:
         return ""
-    if is_off_record(cleaned) or contains_explicit_secret(cleaned):
+    if not evaluate_automatic_capture({"turn_id": cleaned}).allowed:
         return ""
     return cleaned
 
@@ -1595,7 +1594,7 @@ def _background_payload(
     elif mode == "stop":
         turn_id = _bounded_field(payload, "turn_id", 200)
         if turn_id:
-            if contains_secret(turn_id):
+            if not evaluate_automatic_capture({"turn_id": turn_id}).allowed:
                 return None
             minimized["turn_id"] = turn_id
         assistant = _bounded_field(payload, "last_assistant_message", 2000)
@@ -1618,7 +1617,10 @@ def _normalize_turn_state(value: object) -> dict[str, Any]:
     prompt = sanitize_query(raw_prompt) if raw_prompt else ""
     unsafe_prompt = bool(raw_prompt and prompt is None)
     turn_id = normalized["turn_id"]
-    unsafe_turn_id = bool(turn_id and contains_secret(turn_id))
+    unsafe_turn_id = bool(
+        turn_id
+        and not evaluate_automatic_capture({"turn_id": turn_id}).allowed
+    )
     return {
         "current_prompt": prompt or "",
         "turn_id": "" if unsafe_turn_id else turn_id,

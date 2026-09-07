@@ -2248,7 +2248,6 @@ def _build_checkpoint_payload(
         f"- Kind: {kind}",
         f"- Timestamp: {timestamp}",
         f"- Branch: {_git_branch(config.cwd) or 'unknown'}",
-        f"- Repo: {config.cwd}",
         f"- Trigger: {hook_event}",
         "",
         "## Summary",

@@ -27,7 +27,7 @@
     ],
     "private_keys": "PEM BEGIN PRIVATE KEY markers, including algorithm-specific BEGIN <ALG> PRIVATE KEY blocks",
     "credential_fields": "Object keys named password, passwd, secret, token, api_key, or a suffix of those names, with a non-empty value",
-    "high_entropy": "32 or more base64url-like characters whose Shannon entropy is at least 4.0 bits per character, unless that exact string is a trusted structural path field such as source_path, cwd, repo_root, or transcript_path. Trusted fragments must not be substituted through body text, summary fields, or payload-derived paths before off-record or explicit-secret detection.",
+    "high_entropy": "32 or more base64url-like characters whose Shannon entropy is at least 4.0 bits per character, unless that exact string is a trusted structural path field such as source_path, cwd, repo_root, or transcript_path. Identifier fields turn_id and completed_turn_ids may skip entropy only for the generated turn- plus 32 lowercase hex shape. A previously generated content line that is exactly '- Repo: ' plus a trusted fragment may skip entropy when that fragment is both source_path and repo_root. Trusted fragments must not be substituted through body text, summary fields, or payload-derived paths before off-record or explicit-secret detection.",
     "off_record_directives": [
       "the phrase off the record",
       "the slash command /remem off-record"
@@ -369,6 +369,17 @@
       }
     },
     {
+      "id": "identifier-high-entropy",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "needles": ["n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG"],
+      "payload": {
+        "turn_id": "n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG",
+        "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
       "id": "identifier-allowed",
       "expect": "allow",
       "reason": "allowed",
@@ -376,6 +387,96 @@
       "payload": {
         "turn_id": "t-safe-1",
         "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
+      "id": "identifier-generated-turn",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Entropy may skip only the generated turn- plus 32 lowercase hex identifier shape. Explicit secrets and off-record still reject.",
+      "payload": {
+        "turn_id": "turn-0123456789abcdef0123456789abcdef",
+        "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
+      "id": "macos-temp-path-legacy-generated-repo-line",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "A previously generated checkpoint body may contain one exact '- Repo: {cwd}' line. Entropy may skip that line only when it equals the trusted fragment and both source_path and repo_root agree. Body text is not rewritten.",
+      "trusted_fragments": [
+        "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      ],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+        "content": "# Coding Session Checkpoint (Auto)\n- Repo: /var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project\n## Summary\nSafe interval checkpoint.",
+        "metadata": {
+          "repo_root": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+          "summary": "Safe interval checkpoint."
+        }
+      }
+    },
+    {
+      "id": "legacy-repo-line-without-structural-agreement",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "needles": ["1h0qwbnj29b45h4bcrq5g4jm0000gn"],
+      "payload": {
+        "content": "- Repo: /var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      }
+    },
+    {
+      "id": "legacy-repo-line-does-not-mask-canary-summary",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "notes": "The generated Repo line exception does not hide an explicit secret in summary or remaining body text.",
+      "trusted_fragments": [
+        "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      ],
+      "needles": ["vlt_abcdefghijklmnopqrstuvwxyz"],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+        "content": "- Repo: /var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project\n## Summary\napi_key=vlt_abcdefghijklmnopqrstuvwxyz",
+        "metadata": {
+          "repo_root": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+          "summary": "api_key=vlt_abcdefghijklmnopqrstuvwxyz"
+        }
+      }
+    },
+    {
+      "id": "legacy-repo-line-does-not-mask-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A trusted cwd of /remem plus a generated Repo line must not hide a slash-command directive.",
+      "trusted_fragments": ["/remem"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/remem",
+        "content": "- Repo: /remem\n/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT.",
+        "metadata": {
+          "repo_root": "/remem"
+        }
+      }
+    },
+    {
+      "id": "legacy-repo-line-does-not-mask-root-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A trusted cwd of / plus a generated Repo line must not hide a slash-command directive.",
+      "trusted_fragments": ["/"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/",
+        "content": "- Repo: /\n/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT.",
+        "metadata": {
+          "repo_root": "/"
+        }
       }
     }
   ]

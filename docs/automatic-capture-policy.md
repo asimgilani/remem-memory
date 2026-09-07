@@ -27,13 +27,18 @@ fixture, including opaque local temp-path entropy unless that exact string is
 a trusted structural path field (`source_path`, `cwd`, `repo_root`,
 `transcript_path`). Trusted fragments are not substituted through body text,
 summaries, or payload-derived paths. Off-record and explicit secrets are
-matched on raw text first.
+matched on raw text first. A previously generated checkpoint content line
+that is exactly `- Repo: {trusted cwd}` may skip entropy when that same
+value is both `source_path` and `repo_root`. Surrounding body and summary
+text are not rewritten.
 
 Rejected text must not appear in queue files, new prepared rows, receipts,
 state files, provider prompts, or transport bodies. Identifier fields such as
-turn IDs are dropped to empty when they fail policy. Safe outcomes use fixed
-reasons such as `policy`, `secret`, and `off-record`, plus an integer match
-count. They must not echo the rejected payload.
+turn IDs are dropped to empty when they fail policy. Entropy may skip only
+the generated `turn-` plus 32 lowercase hex shape. Other turn IDs and
+completed turn IDs still face secret, off-record, and entropy checks. Safe
+outcomes use fixed reasons such as `policy`, `secret`, and `off-record`,
+plus an integer match count. They must not echo the rejected payload.
 
 ## Legacy rejection
 

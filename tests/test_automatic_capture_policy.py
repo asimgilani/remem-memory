@@ -727,6 +727,55 @@ class AutomaticCapturePolicyTests(unittest.TestCase):
         self.assertEqual(allowed_state["turn_id"], allowed_turn)
         _assert_needles_absent(self, allowed_raw, [canary])
 
+    def test_user_prompt_state_save_drops_high_entropy_keeps_generated_id(
+        self,
+    ) -> None:
+        fixture = _load_fixture()
+        canary = _fixture_case(fixture, "high-entropy-token")["needles"][0]
+        generated = _fixture_case(fixture, "identifier-generated-turn")[
+            "payload"
+        ]["turn_id"]
+        prompt = "Remember that I prefer concise answers."
+        with tempfile.TemporaryDirectory() as directory:
+            _HOOK.handle_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s1",
+                    "turn_id": canary,
+                    "cwd": "/tmp/project",
+                    "prompt": prompt,
+                },
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=_prompt_dependencies(directory),
+            )
+            store = _HOOK.StateStore(Path(directory))
+            secret_path = store.path_for("s1")
+            secret_raw = secret_path.read_text(encoding="utf-8")
+            secret_state = store.load("s1")
+            _HOOK.handle_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s2",
+                    "turn_id": generated,
+                    "cwd": "/tmp/project",
+                    "prompt": prompt,
+                },
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=_prompt_dependencies(directory),
+            )
+            allowed_path = store.path_for("s2")
+            allowed_raw = allowed_path.read_text(encoding="utf-8")
+            allowed_state = store.load("s2")
+
+        _assert_needles_absent(self, secret_raw, [canary])
+        self.assertEqual(secret_state["turn_id"], "")
+        self.assertNotIn(canary, secret_state["turn_id"])
+        self.assertIn(generated, allowed_raw)
+        self.assertEqual(allowed_state["turn_id"], generated)
+        _assert_needles_absent(self, allowed_raw, [canary])
+
     def test_legacy_completed_turn_ids_are_dropped_on_next_save(self) -> None:
         fixture = _load_fixture()
         canary = _fixture_case(fixture, "identifier-secret")["needles"][0]
@@ -773,6 +822,58 @@ class AutomaticCapturePolicyTests(unittest.TestCase):
         self.assertNotIn(canary, state["completed_turn_ids"])
         self.assertEqual(state["turn_id"], "t-next")
         self.assertIn("t-safe", state["completed_turn_ids"])
+
+    def test_high_entropy_completed_turn_ids_drop_generated_control_kept(
+        self,
+    ) -> None:
+        fixture = _load_fixture()
+        canary = _fixture_case(fixture, "high-entropy-token")["needles"][0]
+        generated = _fixture_case(fixture, "identifier-generated-turn")[
+            "payload"
+        ]["turn_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            store = _HOOK.StateStore(Path(directory))
+            store.save(
+                "s1",
+                {
+                    "current_prompt": "Remember that I prefer concise answers.",
+                    "turn_id": generated,
+                    "off_record": False,
+                    "off_record_seen": False,
+                    "completed_turn_ids": [generated],
+                    "metrics": {"hits": 0, "misses": 0},
+                },
+            )
+            path = store.path_for("s1")
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            parsed["completed_turn_ids"] = [canary, generated]
+            parsed["turn_id"] = canary
+            path.write_text(
+                json.dumps(parsed, ensure_ascii=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            self.assertIn(canary, path.read_text(encoding="utf-8"))
+            _HOOK.handle_event(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "s1",
+                    "turn_id": "t-next",
+                    "cwd": "/tmp/project",
+                    "prompt": "Thanks",
+                },
+                harness="codex",
+                mode="user_prompt_submit",
+                dependencies=_prompt_dependencies(directory),
+            )
+            raw = path.read_text(encoding="utf-8")
+            state = store.load("s1")
+
+        _assert_needles_absent(self, raw, [canary])
+        self.assertNotIn(canary, state["turn_id"])
+        self.assertNotIn(canary, state["completed_turn_ids"])
+        self.assertEqual(state["turn_id"], "t-next")
+        self.assertIn(generated, state["completed_turn_ids"])
 
     def test_engineering_state_save_drops_off_record_identifiers(self) -> None:
         fixture = _load_fixture()
