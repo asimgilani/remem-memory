@@ -68,6 +68,26 @@ _MAX_COMPLETED_TURNS = 100
 _MAX_BACKGROUND_QUEUE = 128
 _MAX_BACKGROUND_QUEUE_BYTES = 262_144
 _MAX_BACKGROUND_CLAIM_BYTES = 8_192
+_MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3
+_BACKGROUND_DIAGNOSTIC_FIELDS = (
+    "attempts",
+    "delivery_status",
+    "failure_reason",
+)
+_MAX_DIAGNOSTIC_BYTES_PER_EVENT = len(
+    json.dumps(
+        {
+            "attempts": _MAX_BACKGROUND_DELIVERY_ATTEMPTS,
+            "delivery_status": "exhausted",
+            "failure_reason": "credential",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+)
+_BACKGROUND_DIAGNOSTIC_RESERVE_BYTES = (
+    _MAX_BACKGROUND_QUEUE * _MAX_DIAGNOSTIC_BYTES_PER_EVENT
+)
 _MAX_CREDENTIAL_BYTES = 8192
 _DEFAULT_API_URL = "https://api.remem.io"
 _BASE_WORKER_ENVIRONMENT_KEYS = (
@@ -164,6 +184,16 @@ class RoutedBackgroundEvent:
 class BackgroundClaim:
     event_ids: tuple[str, ...]
     connection_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CaptureOutcome:
+    disposition: Literal["success", "retry", "discard"]
+    reason: str
+
+
+class CapturePolicyRejected(Exception):
+    """The live write gate rejected this capture as no longer allowed."""
 
 
 @dataclass(frozen=True)
@@ -520,11 +550,11 @@ class BackgroundQueueStore:
                 if (
                     not stat.S_ISREG(metadata.st_mode)
                     or stat.S_IMODE(metadata.st_mode) & 0o077
-                    or metadata.st_size > _MAX_BACKGROUND_QUEUE_BYTES
+                    or metadata.st_size > _background_queue_file_limit()
                 ):
                     raise RuntimeError("background queue unavailable")
                 chunks: list[bytes] = []
-                remaining = _MAX_BACKGROUND_QUEUE_BYTES + 1
+                remaining = _background_queue_file_limit() + 1
                 while remaining:
                     chunk = os.read(descriptor, min(65_536, remaining))
                     if not chunk:
@@ -532,7 +562,7 @@ class BackgroundQueueStore:
                     chunks.append(chunk)
                     remaining -= len(chunk)
                 encoded = b"".join(chunks)
-                if len(encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+                if len(encoded) > _background_queue_file_limit():
                     raise RuntimeError("background queue unavailable")
                 parsed = json.loads(
                     encoded.decode("utf-8"),
@@ -549,7 +579,16 @@ class BackgroundQueueStore:
         events = parsed.get("events") if isinstance(parsed, dict) else None
         if not isinstance(events, list):
             raise RuntimeError("background queue unavailable")
-        return _normalize_background_queue(events)
+        normalized = _normalize_background_queue(events)
+        try:
+            payload_encoded = _encoded_background_queue(
+                _strip_background_diagnostics(normalized)
+            )
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise RuntimeError("background queue unavailable") from None
+        if len(payload_encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+            raise RuntimeError("background queue unavailable")
+        return normalized
 
     def save(
         self,
@@ -558,14 +597,15 @@ class BackgroundQueueStore:
     ) -> None:
         normalized = _normalize_background_queue(events)
         try:
-            encoded = json.dumps(
-                {"events": normalized},
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
+            encoded = _encoded_background_queue(normalized)
+            payload_encoded = _encoded_background_queue(
+                _strip_background_diagnostics(normalized)
+            )
         except (TypeError, ValueError, UnicodeEncodeError):
             raise RuntimeError("background queue unavailable") from None
-        if len(encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+        if len(payload_encoded) > _MAX_BACKGROUND_QUEUE_BYTES:
+            raise RuntimeError("background queue unavailable")
+        if len(encoded) > _background_queue_file_limit():
             raise RuntimeError("background queue unavailable")
         descriptor = -1
         temporary = ""
@@ -988,6 +1028,9 @@ def _default_engineering_handler(
     connection_id: str | None = None,
     namespace: str | None = None,
     write_gate: Callable[[], bool] | None = None,
+    request_identity: str | None = None,
+    propagate_delivery_failure: bool = False,
+    live_request_ids: frozenset[str] | None = None,
 ) -> int:
     import auto_memory_hook
 
@@ -997,6 +1040,9 @@ def _default_engineering_handler(
         connection_id=connection_id,
         namespace=namespace,
         write_gate=write_gate,
+        request_identity=request_identity,
+        propagate_delivery_failure=propagate_delivery_failure,
+        live_request_ids=live_request_ids,
     )
 
 
@@ -1010,6 +1056,9 @@ def _invoke_engineering(
     connection_id: str | None = None,
     namespace: str | None = None,
     write_gate: Callable[[], bool] | None = None,
+    request_identity: str | None = None,
+    propagate_delivery_failure: bool = False,
+    live_request_ids: frozenset[str] | None = None,
 ) -> None:
     if not _engineering_enabled():
         return
@@ -1043,6 +1092,7 @@ def _invoke_engineering(
                 credential = None
             if credential:
                 os.environ["REMEM_API_KEY"] = credential
+    caught: BaseException | None = None
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -1053,11 +1103,14 @@ def _invoke_engineering(
                         connection_id=connection_id,
                         namespace=namespace,
                         write_gate=write_gate,
+                        request_identity=request_identity,
+                        propagate_delivery_failure=propagate_delivery_failure,
+                        live_request_ids=live_request_ids,
                     )
                 else:
                     handler(mode, payload)
-    except Exception:
-        pass
+    except Exception as error:
+        caught = error
     finally:
         if previous_key is None:
             os.environ.pop("REMEM_API_KEY", None)
@@ -1079,6 +1132,16 @@ def _invoke_engineering(
             os.environ["REMEM_MEMORY_SUMMARY_ENABLED"] = (
                 previous_summary_enabled
             )
+    if caught is None or not propagate_delivery_failure:
+        return
+    import auto_memory_hook as engineering
+
+    if isinstance(caught, engineering.EngineeringWriteRejected):
+        raise CapturePolicyRejected() from caught
+    mapped = _capture_api_error(caught)
+    if mapped is not None:
+        raise mapped
+    raise RememAPIError("Remem request failed", kind="request") from caught
 
 
 def _read_current_state(
@@ -1280,6 +1343,8 @@ def _handle_stop(
     *,
     invoke_engineering: bool = True,
     write_gate: Callable[[dict[str, Any]], bool] | None = None,
+    request_identity: str | None = None,
+    propagate_capture_failure: bool = False,
 ) -> dict[str, Any]:
     output = {"continue": True} if harness == "codex" else {}
     if settings.mode != "auto":
@@ -1346,6 +1411,8 @@ def _handle_stop(
             targets=targets,
             error=error,
         )
+        if propagate_capture_failure:
+            raise
         return output
     if api is None:
         _record_target_failure(
@@ -1355,9 +1422,12 @@ def _handle_stop(
             targets=targets,
             error=None,
         )
+        if propagate_capture_failure:
+            raise RememAPIError("Remem request failed", kind="request")
         return output
     namespace = None if target.namespace == "@default" else target.namespace
 
+    ingest_started = False
     try:
         with store.locked(session_id):
             state = store.load(session_id)
@@ -1375,26 +1445,49 @@ def _handle_stop(
             if write_gate is not None:
                 try:
                     allowed = write_gate(state)
+                except RememAPIError:
+                    if propagate_capture_failure:
+                        raise
+                    return output
                 except Exception:
+                    if propagate_capture_failure:
+                        raise RememAPIError(
+                            "Remem request failed", kind="request"
+                        ) from None
                     return output
                 if not allowed:
+                    if propagate_capture_failure:
+                        raise CapturePolicyRejected()
                     return output
+            ingest_started = True
             api.ingest(
                 memory,
                 namespace,
                 timeout=_INGEST_TIMEOUT,
+                **(
+                    {"idempotency_key": request_identity}
+                    if request_identity is not None
+                    else {}
+                ),
             )
             completed.append(payload_turn_id)
             state["completed_turn_ids"] = completed[-_MAX_COMPLETED_TURNS:]
             store.save(session_id, state)
+    except CapturePolicyRejected:
+        if propagate_capture_failure:
+            raise
+        return output
     except Exception as error:
-        _record_target_failure(
-            dependencies,
-            harness=harness,
-            behavior="memory",
-            targets=targets,
-            error=error,
-        )
+        if ingest_started:
+            _record_target_failure(
+                dependencies,
+                harness=harness,
+                behavior="memory",
+                targets=targets,
+                error=error,
+            )
+        if propagate_capture_failure:
+            raise
         return output
     _record_target_success(
         dependencies,
@@ -1517,6 +1610,52 @@ def _normalize_turn_state(value: object) -> dict[str, Any]:
     }
 
 
+def _background_queue_file_limit() -> int:
+    return _MAX_BACKGROUND_QUEUE_BYTES + _BACKGROUND_DIAGNOSTIC_RESERVE_BYTES
+
+
+def _strip_background_diagnostics(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            key: value
+            for key, value in event.items()
+            if key not in _BACKGROUND_DIAGNOSTIC_FIELDS
+        }
+        for event in events
+    ]
+
+
+def _encoded_background_queue(events: list[dict[str, Any]]) -> bytes:
+    return json.dumps(
+        {"events": events},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _capture_api_error(error: BaseException) -> RememAPIError | None:
+    if isinstance(error, RememAPIError):
+        return error
+    kind = getattr(error, "kind", None)
+    if kind in {"auth", "permission", "namespace", "request", "transient", "credential"}:
+        return RememAPIError("Remem request failed", kind=kind)
+    return None
+
+
+def _outcome_for_error(error: BaseException) -> CaptureOutcome:
+    mapped = _capture_api_error(error)
+    if mapped is None:
+        return CaptureOutcome("retry", "request")
+    if mapped.kind in {"permission", "namespace"}:
+        return CaptureOutcome("discard", mapped.kind)
+    reason = mapped.kind
+    if reason not in {"auth", "credential", "request", "transient"}:
+        reason = "request"
+    return CaptureOutcome("retry", reason)
+
+
 def _normalize_background_queue(
     value: object,
 ) -> list[dict[str, Any]]:
@@ -1537,6 +1676,9 @@ def _normalize_background_queue(
         session_id = item.get("session_id")
         payload = item.get("payload")
         off_record_seen = item.get("off_record_seen")
+        attempts = item.get("attempts", 0)
+        delivery_status = item.get("delivery_status", "pending")
+        failure_reason = item.get("failure_reason", "")
         if (
             type(schema_version) is not int
             or schema_version != 1
@@ -1570,6 +1712,22 @@ def _normalize_background_queue(
             or contains_secret(session_id)
             or not isinstance(payload, dict)
             or type(off_record_seen) is not bool
+            or type(attempts) is not int
+            or not 0 <= attempts <= _MAX_BACKGROUND_DELIVERY_ATTEMPTS
+            or type(delivery_status) is not str
+            or delivery_status not in {"pending", "retry", "exhausted"}
+            or type(failure_reason) is not str
+            or failure_reason
+            not in {"", "auth", "credential", "request", "transient"}
+            or (delivery_status == "pending" and (attempts or failure_reason))
+            or (delivery_status == "retry" and not failure_reason)
+            or (
+                delivery_status == "exhausted"
+                and (
+                    attempts != _MAX_BACKGROUND_DELIVERY_ATTEMPTS
+                    or not failure_reason
+                )
+            )
         ):
             continue
         safe_payload = _background_payload(payload, lifecycle_mode)
@@ -1595,6 +1753,9 @@ def _normalize_background_queue(
                 "session_id",
                 "payload",
                 "off_record_seen",
+                "attempts",
+                "delivery_status",
+                "failure_reason",
             }
         }
         try:
@@ -1608,8 +1769,7 @@ def _normalize_background_queue(
             unsafe_unknown = True
         if unsafe_unknown:
             continue
-        normalized.append(
-            {
+        normalized_item = {
                 "schema_version": 1,
                 "id": event_id,
                 "client": client,
@@ -1622,7 +1782,13 @@ def _normalize_background_queue(
                 "payload": safe_payload,
                 "off_record_seen": off_record_seen,
             }
-        )
+        if delivery_status != "pending":
+            normalized_item.update(
+                attempts=attempts,
+                delivery_status=delivery_status,
+                failure_reason=failure_reason,
+            )
+        normalized.append(normalized_item)
     return normalized
 
 
@@ -2209,7 +2375,7 @@ def _background_write_is_current(
             harness=event["client"],
         )
     except Exception:
-        return False
+        raise RememAPIError("Remem request failed", kind="request") from None
     if config.revision != event["route_revision"] or len(targets) != 1:
         return False
     target = targets[0]
@@ -2219,22 +2385,30 @@ def _background_write_is_current(
     ):
         return False
     connection = _connection_for(config, target.connection_id)
-    if connection is None or not connection.configured:
+    if connection is None:
         return False
+    if not connection.configured:
+        raise RememAPIError(
+            "Remem credential unavailable", kind="credential"
+        )
     credential = _connection_credential(dependencies, connection)
-    return bool(
-        credential
-        and hmac.compare_digest(credential, expected_credential)
-    )
+    if not credential:
+        raise RememAPIError(
+            "Remem credential unavailable", kind="credential"
+        )
+    if not hmac.compare_digest(credential, expected_credential):
+        return False
+    return True
 
 
 def _process_background_event(
     event: dict[str, Any],
     dependencies: Dependencies,
     settings: Settings,
-) -> None:
+    live_request_ids: frozenset[str] | None = None,
+) -> CaptureOutcome:
     if settings.mode != "auto":
-        return
+        return CaptureOutcome("discard", "policy")
     mode = event["lifecycle_mode"]
     harness = event["client"]
     behavior = event["behavior"]
@@ -2244,7 +2418,7 @@ def _process_background_event(
         event["session_id"],
     )
     if live_state is None or live_state["off_record"]:
-        return
+        return CaptureOutcome("discard", "policy")
     try:
         config, targets = _resolved_route(
             dependencies,
@@ -2252,18 +2426,20 @@ def _process_background_event(
             harness=harness,
         )
     except Exception:
-        return
+        return CaptureOutcome("retry", "request")
     if config.revision != event["route_revision"] or len(targets) != 1:
-        return
+        return CaptureOutcome("discard", "policy")
     target = targets[0]
     if (
         target.connection_id != event["connection_id"]
         or target.namespace != event["namespace"]
     ):
-        return
+        return CaptureOutcome("discard", "policy")
     connection = _connection_for(config, target.connection_id)
-    if connection is None or not connection.configured:
-        return
+    if connection is None:
+        return CaptureOutcome("discard", "policy")
+    if not connection.configured:
+        return CaptureOutcome("retry", "credential")
     credential = _connection_credential(dependencies, connection)
     if credential is None:
         _record_target_failure(
@@ -2273,7 +2449,7 @@ def _process_background_event(
             targets=(target,),
             error=None,
         )
-        return
+        return CaptureOutcome("retry", "credential")
     off_record_seen = bool(
         event["off_record_seen"] or live_state["off_record_seen"]
     )
@@ -2286,7 +2462,7 @@ def _process_background_event(
         ),
     ) as selected_credential:
         if not selected_credential:
-            return
+            return CaptureOutcome("retry", "credential")
         namespace = (
             None if target.namespace == "@default" else target.namespace
         )
@@ -2299,20 +2475,31 @@ def _process_background_event(
                 dependencies,
                 selected_credential,
             )
-            _invoke_engineering(
-                dependencies,
-                engineering_mode,
-                payload,
-                harness,
-                summaries_allowed=not off_record_seen,
-                connection_id=connection.id,
-                namespace=namespace,
-                write_gate=write_gate,
-            )
-            return
+            try:
+                _invoke_engineering(
+                    dependencies,
+                    engineering_mode,
+                    payload,
+                    harness,
+                    summaries_allowed=not off_record_seen,
+                    connection_id=connection.id,
+                    namespace=namespace,
+                    write_gate=write_gate,
+                    request_identity=event["id"],
+                    propagate_delivery_failure=True,
+                    live_request_ids=live_request_ids,
+                )
+            except CapturePolicyRejected:
+                return CaptureOutcome("discard", "policy")
+            except Exception as error:
+                mapped = _capture_api_error(error)
+                if mapped is not None:
+                    return _outcome_for_error(mapped)
+                return CaptureOutcome("retry", "request")
+            return CaptureOutcome("success", "delivered")
         turn_state = payload.get("_turn_state")
         if not isinstance(turn_state, dict):
-            return
+            return CaptureOutcome("discard", "policy")
         turn_state = _normalize_turn_state(turn_state)
         turn_state["off_record_seen"] = bool(
             turn_state["off_record_seen"] or off_record_seen
@@ -2341,20 +2528,31 @@ def _process_background_event(
                 )
             ),
         )
-        _handle_stop(
-            payload,
-            harness,
-            selected_dependencies,
-            settings,
-            turn_state=turn_state,
-            invoke_engineering=False,
-            write_gate=lambda live_state: _background_write_is_current(
-                event,
-                dependencies,
-                selected_credential,
-                live_state,
-            ),
-        )
+        try:
+            _handle_stop(
+                payload,
+                harness,
+                selected_dependencies,
+                settings,
+                turn_state=turn_state,
+                invoke_engineering=False,
+                write_gate=lambda live_state: _background_write_is_current(
+                    event,
+                    dependencies,
+                    selected_credential,
+                    live_state,
+                ),
+                request_identity=event["id"],
+                propagate_capture_failure=True,
+            )
+        except CapturePolicyRejected:
+            return CaptureOutcome("discard", "policy")
+        except Exception as error:
+            mapped = _capture_api_error(error)
+            if mapped is not None:
+                return _outcome_for_error(mapped)
+            return CaptureOutcome("retry", "request")
+        return CaptureOutcome("success", "delivered")
 
 
 def _drain_background_queue(
@@ -2373,6 +2571,11 @@ def _drain_background_queue(
         while pending:
             with queue.locked(session_id):
                 events = queue.load(session_id)
+                live_request_ids = frozenset(
+                    candidate["id"]
+                    for candidate in events
+                    if isinstance(candidate.get("id"), str)
+                )
                 event = next(
                     (
                         candidate
@@ -2383,6 +2586,9 @@ def _drain_background_queue(
                 )
                 if event is None:
                     return {}
+                if event.get("delivery_status") == "exhausted":
+                    pending.discard(event["id"])
+                    continue
                 live_settings = _settings(dependencies)
                 if live_settings.mode != "auto":
                     queue.save(
@@ -2395,13 +2601,37 @@ def _drain_background_queue(
                     )
                     return {}
             try:
-                _process_background_event(
+                outcome = _process_background_event(
                     event,
                     dependencies,
                     live_settings,
+                    live_request_ids=live_request_ids,
                 )
             except Exception:
                 return {}
+            if outcome.disposition == "retry":
+                attempts = event.get("attempts", 0) + 1
+                retained = dict(event)
+                retained["attempts"] = attempts
+                retained["delivery_status"] = (
+                    "exhausted"
+                    if attempts >= _MAX_BACKGROUND_DELIVERY_ATTEMPTS
+                    else "retry"
+                )
+                retained["failure_reason"] = outcome.reason
+                with queue.locked(session_id):
+                    current = queue.load(session_id)
+                    queue.save(
+                        session_id,
+                        [
+                            retained
+                            if candidate["id"] == event["id"]
+                            else candidate
+                            for candidate in current
+                        ],
+                    )
+                pending.discard(event["id"])
+                continue
             with queue.locked(session_id):
                 current = queue.load(session_id)
                 queue.save(

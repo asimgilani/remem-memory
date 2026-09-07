@@ -875,26 +875,38 @@ class RememAPI:
         payload: dict[str, Any],
         namespace: Optional[str],
         timeout: float,
+        *,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """Ingest one document, adding a namespace only when explicitly set."""
 
         body = dict(payload)
         if isinstance(namespace, str) and namespace.strip():
             body["namespace"] = namespace.strip()
-        return self._request("/v1/documents/ingest", body, timeout)
+        return self._request(
+            "/v1/documents/ingest",
+            body,
+            timeout,
+            idempotency_key=idempotency_key,
+        )
 
     def _request(
         self,
         path: str,
         payload: dict[str, Any],
         timeout: float,
+        *,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         if not self.api_key:
             raise RememCredentialUnavailable("Remem credential unavailable")
-        try:
-            idempotency_key = self._idempotency_factory()
-        except Exception:
-            raise RememAPIError("Remem request failed", kind="request") from None
+        if idempotency_key is None:
+            try:
+                idempotency_key = self._idempotency_factory()
+            except Exception:
+                raise RememAPIError(
+                    "Remem request failed", kind="request"
+                ) from None
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise RememAPIError("Remem request failed", kind="request")
         request = urllib_request.Request(
