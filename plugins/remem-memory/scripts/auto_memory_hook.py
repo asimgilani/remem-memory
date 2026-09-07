@@ -1074,14 +1074,51 @@ def _find_prepared_record(
     return None
 
 
-def _operation_delivered(
+def _validate_delivery_marker(
+    row: object,
+    *,
+    event_name: str,
+    operation_id: str,
+    expected_digest: str,
+) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if row.get("event") != event_name:
+        return False
+    marker_id = row.get("operation_id")
+    if not isinstance(marker_id, str) or marker_id != operation_id:
+        return False
+    expected = _parse_digest(expected_digest)
+    digest = _parse_digest(row.get("payload_digest"))
+    return expected is not None and digest is not None and digest == expected
+
+
+def _operation_delivery_claimed(
     log_path: Path,
     event_name: str,
     operation_id: str,
 ) -> bool:
     return any(
-        row.get("event") == event_name
+        isinstance(row, dict)
+        and row.get("event") == event_name
         and row.get("operation_id") == operation_id
+        for row in _read_ndjson(log_path)
+    )
+
+
+def _operation_delivered(
+    log_path: Path,
+    event_name: str,
+    operation_id: str,
+    expected_digest: str,
+) -> bool:
+    return any(
+        _validate_delivery_marker(
+            row,
+            event_name=event_name,
+            operation_id=operation_id,
+            expected_digest=expected_digest,
+        )
         for row in _read_ndjson(log_path)
     )
 
@@ -2289,10 +2326,11 @@ def _load_checkpoint_rows(
             validated = _validate_prepared_checkpoint(prepared_row)
             if validated is None:
                 continue
-            marker_digest = row.get("payload_digest")
-            if (
-                marker_digest is not None
-                and marker_digest != validated["digest"]
+            if not _validate_delivery_marker(
+                row,
+                event_name="auto_checkpoint_delivered",
+                operation_id=operation_id,
+                expected_digest=validated["digest"],
             ):
                 continue
             if _checkpoint_payload_in_session(
@@ -2733,12 +2771,20 @@ def _persist_prepared_checkpoint(
         or _stable_digest(payload) != parsed["digest"]
     ):
         _reject_operation_input(config, state, "checkpoint_input")
+    expected_digest = parsed["digest"]
     if _operation_delivered(
         config.log_path,
         "auto_checkpoint_delivered",
         config.request_identity or "",
+        expected_digest,
     ):
         return True
+    if _operation_delivery_claimed(
+        config.log_path,
+        "auto_checkpoint_delivered",
+        config.request_identity or "",
+    ):
+        _reject_operation_input(config, state, "checkpoint_input")
     sent = _transport_prepared(config, payload, operation="checkpoint")
     if sent is False:
         return False
@@ -2749,7 +2795,7 @@ def _persist_prepared_checkpoint(
                 "timestamp": timestamp,
                 "event": "auto_checkpoint_delivered",
                 "operation_id": config.request_identity,
-                "payload_digest": parsed["digest"],
+                "payload_digest": expected_digest,
                 "source_id": payload.get("source_id"),
             },
         )
@@ -2904,12 +2950,20 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
     payload = validated["payload"]
     if _stable_digest(payload) != parsed.get("payload_digest"):
         _reject_operation_input(config, state, "rollup_input")
+    expected_digest = validated["digest"]
     if _operation_delivered(
         config.log_path,
         "auto_rollup_delivered",
         config.request_identity or "",
+        expected_digest,
     ):
         return True
+    if _operation_delivery_claimed(
+        config.log_path,
+        "auto_rollup_delivered",
+        config.request_identity or "",
+    ):
+        _reject_operation_input(config, state, "rollup_input")
     sent = _transport_prepared(config, payload, operation="rollup")
     if sent is False:
         return False
@@ -2920,7 +2974,7 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
                 "timestamp": timestamp,
                 "event": "auto_rollup_delivered",
                 "operation_id": config.request_identity,
-                "payload_digest": parsed.get("payload_digest"),
+                "payload_digest": expected_digest,
             },
         )
     return True

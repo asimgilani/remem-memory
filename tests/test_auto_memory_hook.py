@@ -2277,6 +2277,57 @@ class AutoMemoryHookTests(unittest.TestCase):
             )
         self.assertEqual(rows, [])
 
+    def test_checkpoint_loader_skips_missing_marker_digest(self) -> None:
+        prepared_a, _digest_a = self._prepared_checkpoint_row(
+            "a" * 32,
+            "auto-checkpoint:" + "a" * 32 + ":milestone",
+        )
+        prepared_b, digest_b = self._prepared_checkpoint_row(
+            "b" * 32,
+            "auto-checkpoint:" + "b" * 32 + ":milestone",
+        )
+        delivered_a_missing = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "a" * 32,
+        }
+        delivered_b_missing = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "b" * 32,
+        }
+        delivered_b = {
+            "event": "auto_checkpoint_delivered",
+            "operation_id": "b" * 32,
+            "payload_digest": digest_b,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.ndjson"
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        prepared_a,
+                        prepared_b,
+                        delivered_a_missing,
+                        delivered_b_missing,
+                        delivered_b,
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rows = _MODULE._load_checkpoint_rows(
+                path,
+                project="remem",
+                session_id="sess-a",
+            )
+        source_ids = [
+            row.get("payload", {}).get("source_id") for row in rows
+        ]
+        self.assertEqual(
+            source_ids,
+            ["auto-checkpoint:" + "b" * 32 + ":milestone"],
+        )
+
     def test_legacy_empty_tail_coverage_uses_admitted_end(self) -> None:
         state = _MODULE._default_state("sess-a")
         state["events_since_checkpoint"] = 75
