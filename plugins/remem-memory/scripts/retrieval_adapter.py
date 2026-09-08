@@ -94,7 +94,7 @@ def _query_records(response: object) -> list[dict[str, object]]:
     ]
     records.extend(
         {"kind": "fact", "value": item}
-        for item in _collection(data, "facts")
+        for item in _optional_collection(data, "facts")
     )
     if "synthesis" in data and data["synthesis"] is not None:
         records.append(
@@ -115,24 +115,45 @@ def _search_records(response: object) -> list[dict[str, object]]:
 
 
 def _synthesis_value(data: dict[str, object]) -> dict[str, object]:
+    text = data["synthesis"]
+    if type(text) is not str:
+        raise RetrievalAdapterError(_ERROR)
     if "sources" not in data:
-        sources: object = []
+        sources: list[str] = []
     else:
-        sources = data["sources"]
-        if type(sources) is not list:
-            raise RetrievalAdapterError(_ERROR)
-    return {"text": data["synthesis"], "sources": sources}
+        sources = _string_list(data["sources"])
+    return {"text": text, "sources": sources}
 
 
 def _collection(data: dict[str, object], key: str) -> list[dict[str, object]]:
     if key not in data:
         return []
-    value = data[key]
+    return _object_list(data[key])
+
+
+def _optional_collection(data: dict[str, object], key: str) -> list[dict[str, object]]:
+    if key not in data or data[key] is None:
+        return []
+    return _object_list(data[key])
+
+
+def _object_list(value: object) -> list[dict[str, object]]:
     if type(value) is not list:
         raise RetrievalAdapterError(_ERROR)
     members: list[dict[str, object]] = []
     for item in value:
         if type(item) is not dict:
+            raise RetrievalAdapterError(_ERROR)
+        members.append(item)
+    return members
+
+
+def _string_list(value: object) -> list[str]:
+    if type(value) is not list:
+        raise RetrievalAdapterError(_ERROR)
+    members: list[str] = []
+    for item in value:
+        if type(item) is not str:
             raise RetrievalAdapterError(_ERROR)
         members.append(item)
     return members

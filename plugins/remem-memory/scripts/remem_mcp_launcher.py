@@ -41,7 +41,7 @@ _BUNDLE_HASHES = {
 }
 _IMPORTED_SCRIPT_HASHES = {
     "memory_policy.py": "5d7d251e834e634f0dce052ffe13dad84dbffbf2489a2310f592a65de1aed3ed",
-    "retrieval_adapter.py": "44be63fb6b91a76e07528bf2380268e8037c2402f5d3c4d58786a8df6a0a4f22",
+    "retrieval_adapter.py": "929a9fa23f3848d34f27bac6b089acbd2ec5425081484cccc4dffc67df041410",
     "retrieval_policy.py": "d4019b27a8c6061342b4a00c23ba17fd8ed85f1ef90bf1c2437b38dfa9c3d019",
 }
 _CHILD_ENVIRONMENT_KEYS = (
