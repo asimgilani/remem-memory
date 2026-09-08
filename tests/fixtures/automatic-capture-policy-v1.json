@@ -1,5 +1,6 @@
 {
   "version": "automatic-capture-policy-v1",
+  "change_note": "Serialized detector scans use Python ensure_ascii JSON escaping while the raw walk is unchanged. Unicode letter suffixes on off-record phrases and ghp tokens reject; prefix letters still allow. Case-insensitive assignment and Bearer classes treat dotted/dotless I like Python re.IGNORECASE. Case-sensitive tokens, entropy, and path/id exemptions are unchanged.",
   "scope": {
     "applies_to": [
       "automatic durable conversation capture",
@@ -477,6 +478,147 @@
         "metadata": {
           "repo_root": "/"
         }
+      }
+    },
+    {
+      "id": "unicode-long-s-secret-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Python re.IGNORECASE case-folds U+017F LONG S to s, so this is a secret assignment.",
+      "needles": ["\u017fecret=x"],
+      "payload": {
+        "content": "\u017fecret=x"
+      }
+    },
+    {
+      "id": "unicode-kelvin-api-key-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Python re.IGNORECASE case-folds U+212A KELVIN SIGN to k, so api_key assignment still matches.",
+      "needles": ["api_\u212aey=x"],
+      "payload": {
+        "content": "api_\u212aey=x"
+      }
+    },
+    {
+      "id": "unicode-bom-token-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Python \\S includes U+FEFF. A BOM-only assignment value is non-whitespace and rejects.",
+      "needles": ["token=\ufeff"],
+      "payload": {
+        "content": "token=\ufeff"
+      }
+    },
+    {
+      "id": "unicode-letter-prefix-off-record-allow",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Python \\w includes Unicode letters, so a letter glued to off the record is not a word boundary. ensure_ascii escaping still ends on a word character.",
+      "payload": {
+        "content": "\u00e9off the record"
+      }
+    },
+    {
+      "id": "unicode-letter-space-off-record",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A Unicode letter followed by whitespace is a word boundary before off the record.",
+      "payload": {
+        "content": "\u00e9 off the record"
+      }
+    },
+    {
+      "id": "unicode-letter-suffix-off-record",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A Unicode letter glued after record removes the trailing word boundary on the raw walk. Python ensure_ascii serialization is record plus \\u00e9, which restores the boundary and rejects.",
+      "payload": {
+        "content": "off the record\u00e9"
+      }
+    },
+    {
+      "id": "github-token-unicode-letter-suffix",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "notes": "ghp_ plus twenty ASCII body characters plus a trailing Unicode letter misses the raw Unicode word boundary. The ensure_ascii serialized form is the token plus \\u00e9, which rejects. This value is below the entropy length threshold.",
+      "needles": ["ghp_aaaaaaaaaaaaaaaaaaaa"],
+      "payload": {
+        "content": "ghp_aaaaaaaaaaaaaaaaaaaa\u00e9"
+      }
+    },
+    {
+      "id": "dotless-i-api-key-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Python re.IGNORECASE treats U+0131 as i in case-insensitive literals, so this is an api_key assignment.",
+      "needles": ["ap\u0131_key=x"],
+      "payload": {
+        "content": "ap\u0131_key=x"
+      }
+    },
+    {
+      "id": "dotted-i-api-key-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Python re.IGNORECASE lowercases U+0130 to i, so this is an api_key assignment.",
+      "needles": ["ap\u0130_key=x"],
+      "payload": {
+        "content": "ap\u0130_key=x"
+      }
+    },
+    {
+      "id": "dotless-i-prefixed-token-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Python re.IGNORECASE [A-Za-z] includes U+0131, so this is a prefixed token assignment.",
+      "needles": ["\u0131_token=x"],
+      "payload": {
+        "content": "\u0131_token=x"
+      }
+    },
+    {
+      "id": "dotless-i-bearer-token-class",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "notes": "Python re.IGNORECASE [A-Za-z] includes U+0131, so nineteen ASCII letters plus dotless I satisfy the Bearer token class.",
+      "needles": ["Bearer aaaaaaaaaaaaaaaaaaa\u0131"],
+      "payload": {
+        "content": "Authorization: Bearer aaaaaaaaaaaaaaaaaaa\u0131"
+      }
+    },
+    {
+      "id": "dotless-i-api-key-prose-allow",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Dotless I in api_key prose is not an assignment and is not a credential field. Case-sensitive token patterns and entropy are not applied to this short value.",
+      "payload": {
+        "content": "The ap\u0131_key documentation has no assignment."
+      }
+    },
+    {
+      "id": "unicode-long-s-not-masked-by-trusted-path",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "notes": "Trusted path fragments do not hide a Unicode case-fold secret assignment in content.",
+      "trusted_fragments": ["/tmp/project"],
+      "needles": ["\u017fecret=x"],
+      "payload": {
+        "source_path": "/tmp/project",
+        "content": "\u017fecret=x"
       }
     }
   ]
