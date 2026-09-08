@@ -21,6 +21,8 @@
     "Return ordinary remem_summarize and remem_memory_query results as one canonical untrusted retrieval envelope instead of flattened synthesis or fact text.",
     "Retain declared canonical fact locators as an optional atomic envelope field instead of ordinary redacted prose.",
     "Retain declared synthesis source document locators as an optional atomic envelope list instead of ordinary redacted prose.",
-    "Return ordinary remem_query facts and synthesis with complete declared locators instead of raw fact dicts or ordinary synthesis source lists."
+    "Return ordinary remem_query facts and synthesis with complete declared locators instead of raw fact dicts or ordinary synthesis source lists.",
+    "Return ordinary query/search documents, document and chunk getters, entity list, entity facts, and extract-facts status as one canonical untrusted retrieval envelope with declared document, chunk, and entity ownership.",
+    "Expose explicit remem_get_raw_document and remem_get_raw_document_chunks tools that reuse the ordinary permission-checked requests and remain untrusted."
   ]
 }

@@ -44,6 +44,55 @@ import remem_routing as _ROUTING
 import auto_memory_hook as _AUTO
 
 
+def _query_document(
+    title: str,
+    content: str,
+    document_id: str = "11111111-1111-1111-1111-111111111111",
+    *,
+    extra_chunks: list | None = None,
+    score: float = 0.9,
+) -> dict:
+    chunks = [
+        {
+            "chunk_id": "22222222-2222-2222-2222-222222222222",
+            "document_id": document_id,
+            "content": content,
+            "score": score,
+            "metadata": {},
+        }
+    ]
+    if extra_chunks:
+        chunks.extend(extra_chunks)
+    return {
+        "document_id": document_id,
+        "title": title,
+        "source": "api",
+        "chunks": chunks,
+    }
+
+
+def _query_fact(
+    content: str,
+    *,
+    fact_id: str = "01234567-89ab-4def-8123-456789abcdef",
+    source_document_id: str = "11111111-1111-1111-1111-111111111111",
+    fact_type: str = "fact",
+) -> dict:
+    return {
+        "id": fact_id,
+        "content": content,
+        "fact_type": fact_type,
+        "confidence": 0.9,
+        "is_latest": True,
+        "is_provisional": False,
+        "valid_from": None,
+        "valid_until": None,
+        "source_document_id": source_document_id,
+        "entities": [],
+        "relationships": [],
+    }
+
+
 class FakeAPI:
     def __init__(self, query_response=None):
         self.query_response = (
@@ -1595,10 +1644,7 @@ class RememMemoryHookTests(unittest.TestCase):
         api = FakeAPI(
             query_response={
                 "results": [
-                    {
-                        "title": "Preference",
-                        "content": "Prefers concise answers.",
-                    }
+                    _query_document("Preference", "Prefers concise answers.")
                 ]
             }
         )
@@ -1619,6 +1665,61 @@ class RememMemoryHookTests(unittest.TestCase):
             "BEGIN UNTRUSTED REMEM MEMORY",
             output["hookSpecificOutput"]["additionalContext"],
         )
+        context = output["hookSpecificOutput"]["additionalContext"]
+        serialized = context.split("historical data.\n", 1)[1]
+        serialized = serialized.rsplit("\nEND UNTRUSTED REMEM MEMORY", 1)[0]
+        parsed = json.loads(serialized)
+        self.assertEqual(parsed["origin"], "python_hook")
+        self.assertEqual(parsed["access_mode"], "ordinary")
+        self.assertEqual(parsed["trust"], "untrusted_source")
+        self.assertIn("Prefers concise answers.", serialized)
+        self.assertLessEqual(len(context), 6000)
+
+    def test_invalid_sensitive_fields_skip_hook_retrieval(self) -> None:
+        api = FakeAPI(
+            query_response={
+                "results": [
+                    _query_document("Preference", "Prefers concise answers.")
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "{"},
+                clear=False,
+            ):
+                output = _HOOK.handle_event(
+                    prompt_payload("How should you format this for me?"),
+                    harness="codex",
+                    mode="user_prompt_submit",
+                    dependencies=self._dependencies(directory, api),
+                )
+        self.assertEqual(output, {})
+        self.assertEqual(api.queries, [])
+
+    def test_null_sensitive_fields_skip_hook_retrieval(self) -> None:
+        api = FakeAPI(
+            query_response={
+                "results": [
+                    _query_document("Preference", "Prefers concise answers.")
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "null"},
+                clear=False,
+            ):
+                output = _HOOK.handle_event(
+                    prompt_payload("How should you format this for me?"),
+                    harness="codex",
+                    mode="user_prompt_submit",
+                    dependencies=self._dependencies(directory, api),
+                )
+        self.assertEqual(output, {})
+        self.assertEqual(api.queries, [])
 
     def test_hook_initializes_legacy_routing_once_when_installer_was_skipped(
         self,
@@ -1724,11 +1825,19 @@ class RememMemoryHookTests(unittest.TestCase):
         apis = {
             "primary": RoutedAPI(
                 "primary",
-                {"results": [{"title": "Primary", "content": "primary"}]},
+                {"results": [_query_document("Primary", "primary")]},
             ),
             secondary.id: RoutedAPI(
                 secondary.id,
-                {"results": [{"title": "Secondary", "content": "secondary"}]},
+                {
+                    "results": [
+                        _query_document(
+                            "Secondary",
+                            "secondary",
+                            document_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        )
+                    ]
+                },
             ),
         }
 
@@ -1831,10 +1940,10 @@ class RememMemoryHookTests(unittest.TestCase):
                 api = FakeAPI(
                     query_response={
                         "results": [
-                            {
-                                "title": "Preference",
-                                "content": "Keep answers concise.",
-                            }
+                            _query_document(
+                                "Preference",
+                                "Keep answers concise.",
+                            )
                         ]
                     }
                 )
@@ -2272,11 +2381,11 @@ class RememMemoryHookTests(unittest.TestCase):
                 secondary.id,
                 {
                     "results": [
-                        {
-                            "title": "Available source",
-                            "content": "usable routed result",
-                            "score": 0.8,
-                        }
+                        _query_document(
+                            "Available source",
+                            "usable routed result",
+                            score=0.8,
+                        )
                     ]
                 },
             ),
@@ -2360,7 +2469,7 @@ class RememMemoryHookTests(unittest.TestCase):
             },
         )
         api = FakeAPI(
-            {"results": [{"title": "Decision", "content": "selected"}]}
+            {"results": [_query_document("Decision", "selected")]}
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2381,37 +2490,36 @@ class RememMemoryHookTests(unittest.TestCase):
         api = FakeAPI(
             query_response={
                 "results": [
-                    {
-                        "document_id": "doc-1",
-                        "title": "Family",
-                        "chunks": [
+                    _query_document(
+                        "Family",
+                        "The user's son's name is Sam.",
+                        extra_chunks=[
                             {
-                                "content": "The user's son's name is Sam.",
-                                "score": 0.95,
-                            },
-                            {
+                                "chunk_id": "33333333-3333-4333-8333-333333333333",
+                                "document_id": "11111111-1111-1111-1111-111111111111",
                                 "content": (
                                     "token=abcdefghijklmnopqrstuvwxyz123456"
                                 ),
                                 "score": 0.9,
-                            },
+                                "metadata": {},
+                            }
                         ],
-                    },
-                    {
-                        "document_id": "doc-2",
-                        "title": "api_key=vlt_abcdefghijklmnop",
-                        "chunks": [{"content": "Do not inject this document."}],
-                    },
+                    ),
+                    _query_document(
+                        "Unsafe",
+                        "Do not inject this document. token=abcdefghijklmnopqrstuvwxyz123456",
+                        document_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    ),
                 ],
                 "facts": [
-                    {
-                        "fact_type": "preference",
-                        "content": "The user prefers concise answers.",
-                    },
-                    {
-                        "fact_type": "fact",
-                        "content": "password=hunter2",
-                    },
+                    _query_fact(
+                        "The user prefers concise answers.",
+                        fact_type="preference",
+                    ),
+                    _query_fact(
+                        "password=hunter2",
+                        fact_id="0fedcba9-8765-4321-0fed-cba987654321",
+                    ),
                 ],
             }
         )
@@ -2439,7 +2547,7 @@ class RememMemoryHookTests(unittest.TestCase):
             first_api = FakeAPI(
                 {
                     "results": [
-                        {"title": "Context", "content": "Prior useful context."}
+                        _query_document("Context", "Prior useful context.")
                     ]
                 }
             )
@@ -6648,7 +6756,7 @@ class RememMemoryHookTests(unittest.TestCase):
         api = FakeAPI(
             {
                 "results": [
-                    {"title": "Decision", "content": "Use a Mac host."}
+                    _query_document("Decision", "Use a Mac host.")
                 ]
             }
         )

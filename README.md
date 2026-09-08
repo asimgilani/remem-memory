@@ -254,6 +254,23 @@ only when `REMEM_MEMORY_SUMMARY_PROVIDER` explicitly selects `claude_cli`,
 `codex_cli`, `anthropic`, or `openai`. See the security guide before sending
 transcript-derived material across that boundary.
 
+Ordinary MCP, helper, and hook recall returns one untrusted retrieval envelope.
+It suppresses baseline credential-like fields and any extra names listed in
+`REMEM_RETRIEVAL_SENSITIVE_FIELDS`. That setting is a local non-secret JSON
+array of field names, for example `["ssn","internal-note"]`. Leave it unset
+for no extras. A present value must be at most 65,536 UTF-8 bytes and decode
+as a JSON array; JSON null and other non-array values fail closed. The array
+may contain at most 64 names of at most 128 characters each. Names
+are stripped, lowercased, and hyphen-normalized to underscores. Invalid
+configuration fails closed before retrieval and does not disable the baseline
+protections.
+
+Explicit MCP tools `remem_get_raw_document` and
+`remem_get_raw_document_chunks` stay permission-checked on the same backend
+requests as the ordinary document getters. They can reveal sensitive source
+content within those existing permissions and remain untrusted. They are not
+used by search, query, hooks, or the recall CLI.
+
 ## Advanced routing
 
 The plugin has three neutral behavior routes:

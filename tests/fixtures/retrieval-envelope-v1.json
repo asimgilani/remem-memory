@@ -1,6 +1,6 @@
 {
   "version": "retrieval-envelope-v1",
-  "change_note": "Ordinary recall inspects each record fully, then redacts credential and sensitive mapping entries and secret-bearing keys, replaces secret-bearing strings with a fixed marker, and only then truncates structured leaves to the UTF-8 serialization budget. Declared locator slots retain exact canonical UUIDs atomically with their record or relationship; identical strings in ordinary prose still redact or clip. A synthesis-owned source_locators list retains exact canonical source_document_id maps in supplied order, including repeats, atomically with that synthesis record. Explicit sensitive-field names apply to declared locator roles; a denied required role suppresses its owning record or relationship instead of emitting a partial set. A denied declared source_document_id role suppresses the complete synthesis owner. Supplied required locator IDs reject null. Off-record raw or serialized hits drop the whole record and its locators, including source_locators. No automatic-capture path or generated-ID entropy exemptions apply. Continuation never echoes queries, filters, keys, snippets, or fingerprints.",
+  "change_note": "Ordinary recall inspects each record fully, then redacts credential and sensitive mapping entries and secret-bearing keys, replaces secret-bearing strings with a fixed marker, and only then truncates structured leaves to the UTF-8 serialization budget. Declared locator slots retain exact canonical UUIDs atomically with their record, nested owner, or relationship; identical strings in ordinary prose still redact or clip. A document owner may declare document_id and retain nested chunks whose chunk_id/document_id pair matches that parent. An entity owner may declare entity_id and retain nested existing fact records. A synthesis-owned source_locators list retains exact canonical source_document_id maps in supplied order, including repeats, atomically with that synthesis record. Explicit sensitive-field names apply to declared locator roles and to the original id/document_id/chunks/facts names after those fields move into locator or container slots; a denied required role suppresses its owning record or relationship instead of emitting a partial set. A denied declared source_document_id role suppresses the complete synthesis owner. A denied chunks or facts container suppresses that moved nested field. Off-record anywhere in a document/chunk or entity/fact group drops the parent and its children. Supplied required locator IDs reject null. No automatic-capture path or generated-ID entropy exemptions apply. Continuation never echoes queries, filters, keys, snippets, or fingerprints.",
   "scope": {
     "applies_to": [
       "ordinary structured recall envelopes"
@@ -46,10 +46,10 @@
     "exceeds_bounds": "retrieval input exceeds bounds"
   },
   "count_semantics": {
-    "redaction.fields": "Mapping entries removed because of credential-like names, additive sensitive names, or secret-bearing keys. Nested content inside a removed entry is not counted separately. Declared locator roles denied by additive sensitive names count here and suppress their owning record or relationship. Each denied declared source_document_id role on a synthesis source_locators member counts here once and suppresses that complete synthesis owner.",
+    "redaction.fields": "Mapping entries removed because of credential-like names, additive sensitive names, or secret-bearing keys. Nested content inside a removed entry is not counted separately. Declared locator roles denied by additive sensitive names, including original id/document_id names after those fields move into locator slots, count here and suppress their owning record, nested owner, or relationship. A denied chunks or facts container counts here once and suppresses that moved nested field. Each denied declared source_document_id role on a synthesis source_locators member counts here once and suppresses that complete synthesis owner.",
     "redaction.values": "String leaves replaced by the fixed redaction marker. The whole string is replaced; secrets are not cut into a prefix.",
-    "redaction.records": "Whole records omitted because an off-record indication appeared in the raw or serialized policy view.",
-    "truncation.omitted_items": "Records, object members, or array members dropped to satisfy the byte budget. Off-record redaction is counted under redaction.records instead. A retained record or relationship keeps its declared locator set whole, or that record or relationship is omitted. A retained synthesis keeps its declared source_locators list whole, or that synthesis is omitted.",
+    "redaction.records": "Whole records omitted because an off-record indication appeared in the raw or serialized policy view of the complete owner group, including nested chunks or facts.",
+    "truncation.omitted_items": "Records, nested owners, object members, or array members dropped to satisfy the byte budget. Off-record redaction is counted under redaction.records instead. A retained record or relationship keeps its declared locator set whole, or that record or relationship is omitted. Nested child omissions count only under a retained parent. Omitting a parent counts once and does not also count its children. A retained synthesis keeps its declared source_locators list whole, or that synthesis is omitted.",
     "truncation.omitted_characters": "Unicode code points removed from kept string leaves. Omitted items do not add their lengths here. Locator UUID strings are never clipped."
   },
   "python_only": [
@@ -60,7 +60,10 @@
     "relationship-locator-association-under-truncation",
     "source-locator-exact-budget-and-one-byte-short",
     "source-locator-all-or-nothing-ids",
-    "source-locator-association-under-truncation"
+    "source-locator-association-under-truncation",
+    "nested-chunk-exact-budget-and-one-byte-short",
+    "nested-chunk-parent-omission-not-double-counted",
+    "nested-fact-child-omission-under-retained-entity"
   ],
   "cases": [
     {
@@ -2383,6 +2386,454 @@
         "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
         "continuation": null
       }
+    },
+    {
+      "id": "document-nested-chunks-preserve-duplicates-and-metadata",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": {
+            "title": "safe-title-neighbor",
+            "source": "api",
+            "summary": null,
+            "extracted": {"ok": true, "count": 2}
+          },
+          "locators": {
+            "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "chunks": [
+            {
+              "locators": {
+                "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+              },
+              "value": {
+                "content": "first-chunk",
+                "score": 0.9,
+                "metadata": {"topic": "kept-meta"}
+              }
+            },
+            {
+              "locators": {
+                "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+              },
+              "value": {
+                "content": "duplicate-chunk",
+                "score": 0.1,
+                "metadata": {"topic": "again"}
+              }
+            }
+          ]
+        },
+        {
+          "kind": "document",
+          "value": {
+            "title": "empty-chunks-neighbor"
+          },
+          "locators": {
+            "document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "chunks": []
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "document",
+            "value": {
+              "title": "safe-title-neighbor",
+              "source": "api",
+              "summary": null,
+              "extracted": {"ok": true, "count": 2}
+            },
+            "locators": {
+              "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            },
+            "chunks": [
+              {
+                "locators": {
+                  "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                  "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+                },
+                "value": {
+                  "content": "first-chunk",
+                  "score": 0.9,
+                  "metadata": {"topic": "kept-meta"}
+                }
+              },
+              {
+                "locators": {
+                  "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                  "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+                },
+                "value": {
+                  "content": "duplicate-chunk",
+                  "score": 0.1,
+                  "metadata": {"topic": "again"}
+                }
+              }
+            ]
+          },
+          {
+            "kind": "document",
+            "value": {
+              "title": "empty-chunks-neighbor"
+            },
+            "locators": {
+              "document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            },
+            "chunks": []
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "off-record-in-last-child-drops-document-keeps-neighbor",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": {
+            "title": "hidden-parent"
+          },
+          "locators": {
+            "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "chunks": [
+            {
+              "locators": {
+                "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+              },
+              "value": {
+                "content": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB off the record"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "document",
+          "value": {
+            "title": "safe-title-neighbor"
+          },
+          "locators": {
+            "document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "chunks": []
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["STARLING-PRIVATE-CONTEXT", "hidden-parent", "off the record"],
+      "absent": ["hidden-parent", "off the record", "BBBBBBBBBB", "fedcba98-7654-3210-fedc-ba9876543210", "01234567-89ab-4def-8123-456789abcdef"],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_cli",
+        "records": [
+          {
+            "kind": "document",
+            "value": {
+              "title": "safe-title-neighbor"
+            },
+            "locators": {
+              "document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            },
+            "chunks": []
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 1},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "sensitive-original-id-and-chunks-container",
+      "origin": "python_hook",
+      "sensitive_fields": ["id", "chunks"],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": {
+            "title": "kept-document"
+          },
+          "locators": {
+            "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "chunks": [
+            {
+              "locators": {
+                "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+              },
+              "value": {
+                "content": "HIDDEN-CHUNK-CANARY"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "denied-fact",
+            "content": "DENIED-FACT-CANARY"
+          },
+          "locators": {
+            "fact_id": "0fedcba9-8765-4321-0fed-cba987654321",
+            "source_document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          }
+        },
+        {
+          "kind": "entity",
+          "value": {
+            "name": "denied-entity"
+          },
+          "locators": {
+            "entity_id": "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
+          },
+          "facts": []
+        },
+        {
+          "kind": "document",
+          "value": {
+            "title": "no-locator-neighbor",
+            "id": "still-dropped-value-id"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["HIDDEN-CHUNK-CANARY", "DENIED-FACT-CANARY", "denied-entity"],
+      "absent": [
+        "HIDDEN-CHUNK-CANARY",
+        "DENIED-FACT-CANARY",
+        "denied-entity",
+        "denied-fact",
+        "0fedcba9-8765-4321-0fed-cba987654321",
+        "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "still-dropped-value-id"
+      ],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {
+            "kind": "document",
+            "value": {
+              "title": "kept-document"
+            },
+            "locators": {
+              "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            }
+          },
+          {
+            "kind": "document",
+            "value": {
+              "title": "no-locator-neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 4, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "entity-nested-facts-and-empty-header",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "entity",
+          "value": {
+            "name": "Alice",
+            "entity_type": "person",
+            "mention_count": 2,
+            "note": null
+          },
+          "locators": {
+            "entity_id": "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
+          },
+          "facts": [
+            {
+              "kind": "fact",
+              "value": {
+                "content": "public fact",
+                "fact_type": "fact"
+              },
+              "locators": {
+                "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "entity",
+          "value": {
+            "name": "Empty Header"
+          },
+          "locators": {
+            "entity_id": "0fedcba9-8765-4321-0fed-cba987654321"
+          },
+          "facts": []
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "entity",
+            "value": {
+              "name": "Alice",
+              "entity_type": "person",
+              "mention_count": 2,
+              "note": null
+            },
+            "locators": {
+              "entity_id": "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
+            },
+            "facts": [
+              {
+                "kind": "fact",
+                "value": {
+                  "content": "public fact",
+                  "fact_type": "fact"
+                },
+                "locators": {
+                  "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                  "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+                }
+              }
+            ]
+          },
+          {
+            "kind": "entity",
+            "value": {
+              "name": "Empty Header"
+            },
+            "locators": {
+              "entity_id": "0fedcba9-8765-4321-0fed-cba987654321"
+            },
+            "facts": []
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "sensitive-facts-container-keeps-entity-header",
+      "origin": "openclaw_tool",
+      "sensitive_fields": ["facts"],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "entity",
+          "value": {
+            "name": "Bob"
+          },
+          "locators": {
+            "entity_id": "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
+          },
+          "facts": [
+            {
+              "kind": "fact",
+              "value": {
+                "content": "HIDDEN-FACT-CANARY"
+              },
+              "locators": {
+                "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["HIDDEN-FACT-CANARY"],
+      "absent": [
+        "HIDDEN-FACT-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef"
+      ],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "openclaw_tool",
+        "records": [
+          {
+            "kind": "entity",
+            "value": {
+              "name": "Bob"
+            },
+            "locators": {
+              "entity_id": "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
+            }
+          }
+        ],
+        "redaction": {"fields": 1, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "cross-parent-chunk-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": {
+            "title": "MISMATCH-CANARY"
+          },
+          "locators": {
+            "document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "chunks": [
+            {
+              "locators": {
+                "chunk_id": "01234567-89ab-4def-8123-456789abcdef",
+                "document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              },
+              "value": {
+                "content": "MISMATCH-CANARY"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": ["MISMATCH-CANARY", "fedcba98-7654-3210-fedc-ba9876543210"]
     }
   ]
 }

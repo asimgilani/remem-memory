@@ -33,6 +33,10 @@ _DOCUMENT_ID_B = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 _RELATED_ID = "0fedcba9-8765-4321-0fed-cba987654321"
 _RELATED_ID_B = "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
 _DOCUMENT_UUID = "11111111-1111-1111-1111-111111111111"
+_CHUNK_ID = "22222222-2222-2222-2222-222222222222"
+_CHUNK_ID_B = "33333333-3333-4333-8333-333333333333"
+_ENTITY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_ENTITY_ID_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 _OFF_RECORD_PREFIX = (
     "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
     "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB off the record"
@@ -176,6 +180,74 @@ def _expected_fact_record(item: dict) -> dict:
     return record
 
 
+def _document_result(**fields: object) -> dict:
+    payload = {
+        "document_id": _DOCUMENT_UUID,
+        "title": "safe-title-neighbor",
+        "source": "api",
+        "chunks": [
+            {
+                "chunk_id": _CHUNK_ID,
+                "document_id": _DOCUMENT_UUID,
+                "content": "chunk-body",
+                "score": 0.5,
+                "metadata": {"topic": "kept-meta"},
+            }
+        ],
+    }
+    payload.update(fields)
+    return payload
+
+
+def _expected_document_record(item: dict) -> dict:
+    record: dict[str, object] = {
+        "kind": "document",
+        "value": {
+            key: value
+            for key, value in item.items()
+            if key not in {"document_id", "chunks"}
+        },
+        "locators": {"document_id": item["document_id"]},
+    }
+    if "chunks" in item:
+        record["chunks"] = [
+            {
+                "locators": {
+                    "chunk_id": chunk["chunk_id"],
+                    "document_id": chunk["document_id"]
+                    if "document_id" in chunk
+                    else item["document_id"],
+                },
+                "value": {
+                    key: value
+                    for key, value in chunk.items()
+                    if key not in {"chunk_id", "document_id"}
+                },
+            }
+            for chunk in item["chunks"]
+        ]
+    return record
+
+
+def _expected_entity_record(item: dict, facts: list[dict] | None = None) -> dict:
+    record: dict[str, object] = {
+        "kind": "entity",
+        "value": {
+            key: value for key, value in item.items() if key != "id"
+        },
+        "locators": {"entity_id": item["id"]},
+    }
+    if facts is not None:
+        record["facts"] = [_expected_fact_record(fact) for fact in facts]
+    return record
+
+
+def _envelope_text(records: list, **fields: object) -> str:
+    payload = _canonical_envelope(records)
+    payload.update(fields)
+    return _dumps(payload)
+
+
 def _expected_synthesis_record(
     text: str,
     sources: list[str] | None = None,
@@ -302,7 +374,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
         text, parsed = _parse_text(result)
         expected_records = [
-            {"kind": "document", "value": document},
+            _expected_document_record(document),
             {
                 "kind": "fact",
                 "value": {
@@ -370,7 +442,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
                 ],
             },
         ]
-        self.assertEqual(text, _expected_text(expected_records))
+        self.assertEqual(text, _dumps(_canonical_envelope(expected_records)))
         self.assertEqual(response, original)
         self.assertEqual(
             [record["kind"] for record in parsed["records"]],
@@ -378,14 +450,19 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
         document_record = parsed["records"][0]
         document_value = document_record["value"]
-        self.assertNotIn("locators", document_record)
+        self.assertEqual(
+            document_record["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
         self.assertNotIn("source_locators", document_record)
         self.assertEqual(document_value["title"], "safe-title-neighbor")
-        self.assertEqual(document_value["chunks"][0]["content"], "chunk-body")
+        self.assertEqual(document_record["chunks"][0]["value"]["content"], "chunk-body")
         self.assertEqual(document_value["extracted"]["ok"], True)
-        self.assertEqual(document_value["chunks"][0]["metadata"]["count"], 2)
+        self.assertEqual(document_record["chunks"][0]["value"]["metadata"]["count"], 2)
         self.assertEqual(document_value["kind"], "trusted")
-        self.assertEqual(document_value["document_id"], _DOCUMENT_UUID)
+        self.assertNotIn("document_id", document_value)
+        self.assertNotIn("chunks", document_value)
+        self.assertNotIn("document_id", _dumps(document_record["chunks"][0]["value"]))
         first_record = parsed["records"][1]
         self.assertNotIn("source_locators", first_record)
         self.assertEqual(
@@ -501,12 +578,18 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         text, parsed = _parse_text(result)
         self.assertEqual(
             text,
-            _expected_text([{"kind": "document", "value": document}]),
+            _dumps(_canonical_envelope([_expected_document_record(document)])),
         )
         self.assertEqual(parsed["records"][0]["kind"], "document")
-        self.assertNotIn("locators", parsed["records"][0])
+        self.assertEqual(
+            parsed["records"][0]["locators"],
+            {"document_id": "11111111-1111-1111-1111-111111111111"},
+        )
         self.assertNotIn("source_locators", parsed["records"][0])
-        self.assertEqual(parsed["records"][0]["value"]["chunks"][0]["content"], "kept-chunk")
+        self.assertEqual(
+            parsed["records"][0]["chunks"][0]["value"]["content"],
+            "kept-chunk",
+        )
         self.assertNotIn("FACT-MUST-NOT-APPEAR-IN-SEARCH", text)
         self.assertNotIn("SYNTH-MUST-NOT-APPEAR-IN-SEARCH", text)
         self.assertNotIn(_FACT_ID, text)
@@ -532,8 +615,8 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             "extracted": {"notes": "kept-extracted"},
         }
         fact = _fact_result(content="public fact", confidence=0.8)
-        expected_document = _expected_text(
-            [{"kind": "document", "value": document}]
+        expected_document = _dumps(
+            _canonical_envelope([_expected_document_record(document)])
         )
         missing_facts = _backend_query_response(
             results=[document],
@@ -594,7 +677,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             filled_text,
             _expected_text(
                 [
-                    {"kind": "document", "value": document},
+                    _expected_document_record(document),
                     _expected_fact_record(fact),
                 ]
             ),
@@ -628,8 +711,10 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
 
     def test_query_missing_null_synthesis_does_not_select_sources(self) -> None:
-        document = {"title": "safe-title-neighbor"}
-        expected = _expected_text([{"kind": "document", "value": document}])
+        document = _document_result()
+        expected = _dumps(
+            _canonical_envelope([_expected_document_record(document)])
+        )
         missing_synthesis = _backend_query_response(
             results=[document],
             sources=[_DOCUMENT_ID, _DOCUMENT_ID_B, _DOCUMENT_ID],
@@ -679,7 +764,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
                 request.assert_awaited_once()
 
     def test_query_empty_synthesis_and_source_variants(self) -> None:
-        document = {"title": "safe-title-neighbor"}
+        document = _document_result()
         sources = [_DOCUMENT_ID, _DOCUMENT_ID_B, _DOCUMENT_ID]
         empty_text = _backend_query_response(
             results=[document],
@@ -696,7 +781,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             text,
             _expected_text(
                 [
-                    {"kind": "document", "value": document},
+                    _expected_document_record(document),
                     _expected_synthesis_record("", sources),
                 ]
             ),
@@ -717,7 +802,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         request.assert_awaited_once()
         expected_without_sources = _expected_text(
             [
-                {"kind": "document", "value": document},
+                _expected_document_record(document),
                 _expected_synthesis_record("public synthesis"),
             ]
         )
@@ -867,7 +952,18 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
 
     def test_off_record_after_long_prefix_drops_document_and_keeps_fact(self) -> None:
         case = _fixture_case("scan-before-clip-off-record-prefix")
-        document = {"title": "hidden", "body": _OFF_RECORD_PREFIX}
+        document = _document_result(
+            title="hidden",
+            chunks=[
+                {
+                    "chunk_id": _CHUNK_ID,
+                    "document_id": _DOCUMENT_UUID,
+                    "content": _OFF_RECORD_PREFIX,
+                    "score": 0.1,
+                    "metadata": {},
+                }
+            ],
+        )
         hidden_fact = _fact_result(content=_OFF_RECORD_PREFIX)
         neighbor = _fact_result(
             id=_RELATED_ID,
@@ -888,7 +984,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             text,
             _expected_text(
                 [
-                    {"kind": "document", "value": document},
+                    _expected_document_record(document),
                     _expected_fact_record(hidden_fact),
                     _expected_fact_record(neighbor),
                     _expected_synthesis_record(
@@ -921,24 +1017,77 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             self.assertNotIn(needle, _dumps(parsed["redaction"]))
 
     def test_search_scans_complete_document_before_clipping_secret_prefix(self) -> None:
-        document = {
-            "content": _SECRET_PREFIX,
-            "title": "safe-title-neighbor",
-        }
+        document = _document_result(
+            title="safe-title-neighbor",
+            chunks=[
+                {
+                    "chunk_id": _CHUNK_ID,
+                    "document_id": _DOCUMENT_UUID,
+                    "content": _SECRET_PREFIX,
+                    "score": 0.1,
+                    "metadata": {},
+                }
+            ],
+        )
         result, _request = _call(
             "remem_search",
             {"query": _QUERY_CANARY},
             {"results": [document]},
         )
         text, parsed = _parse_text(result)
+        expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_mcp",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "safe-title-neighbor",
+                        "source": "api",
+                    },
+                    "locators": {"document_id": _DOCUMENT_UUID},
+                    "chunks": [
+                        {
+                            "locators": {
+                                "chunk_id": _CHUNK_ID,
+                                "document_id": _DOCUMENT_UUID,
+                            },
+                            "value": {
+                                "content": "[redacted]",
+                                "score": 0.1,
+                                "metadata": {},
+                            },
+                        }
+                    ],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 1, "records": 0},
+            "truncation": {
+                "truncated": False,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": None,
+        }
+        self.assertEqual(text, _dumps(expected))
         self.assertEqual(
-            text,
-            _expected_text([{"kind": "document", "value": document}]),
+            parsed["records"][0]["chunks"][0]["value"]["content"],
+            "[redacted]",
         )
-        self.assertEqual(parsed["records"][0]["value"]["content"], "[redacted]")
         self.assertEqual(parsed["records"][0]["value"]["title"], "safe-title-neighbor")
+        self.assertEqual(
+            parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
+        self.assertEqual(
+            parsed["records"][0]["chunks"][0]["locators"],
+            {"chunk_id": _CHUNK_ID, "document_id": _DOCUMENT_UUID},
+        )
         self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz1234567890", text)
         self.assertNotIn("AAAAAAAAAAAAAAAAAA", text)
+        self.assertNotIn(_SECRET_PREFIX, text)
 
     def test_namespace_filters_and_synthesize_payloads_are_preserved(self) -> None:
         filters = {"checkpoint_project": ["remem"], "checkpoint_session": ["sess-alpha"]}
@@ -1174,7 +1323,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             "remem_search",
             {"query": _QUERY_CANARY},
             _backend_query_response(
-                results=[{"title": "kept-search"}],
+                results=[_document_result(title="kept-search")],
                 facts="FACT-SHAPE-CANARY",
                 synthesis={"text": "SYNTH-CANARY"},
                 sources="SOURCES-CANARY",
@@ -1182,6 +1331,10 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
         text, parsed = _parse_text(result)
         self.assertEqual(parsed["records"][0]["value"]["title"], "kept-search")
+        self.assertEqual(
+            parsed["records"][0]["locators"]["document_id"],
+            _DOCUMENT_UUID,
+        )
         self.assertNotIn("FACT-SHAPE-CANARY", text)
         self.assertNotIn("SYNTH-CANARY", text)
         self.assertNotIn("SOURCES-CANARY", text)
@@ -1191,7 +1344,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             "remem_query",
             {"query": _QUERY_CANARY},
             {
-                "results": [{"title": "kept-query"}],
+                "results": [_document_result(title="kept-query")],
                 "debug": "DEBUG-CANARY",
                 "fact_count": "FACT-COUNT-CANARY",
                 "latency_ms": "LATENCY-CANARY",
@@ -1224,7 +1377,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
         synthesis = "synthesis cites " + _DOCUMENT_ID
         response = {
-            "results": [{"title": "safe-title-neighbor"}],
+            "results": [_document_result()],
             "facts": [fact],
             "synthesis": synthesis,
             "sources": [_DOCUMENT_ID, _DOCUMENT_ID_B, _DOCUMENT_ID],
@@ -1282,18 +1435,29 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             value["note"],
             "caf\u00e9 \u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22",
         )
-        response = {"results": [value]}
-        records = [{"kind": "document", "value": value}]
-        full = _expected_text(records)
-        exact = _ADAPTER.serialize_query_response(response, budget=409)
+        document = {
+            "document_id": _DOCUMENT_UUID,
+            "chunks": [],
+            "ok": value["ok"],
+            "note": value["note"],
+        }
+        response = {"results": [document]}
+        record = _expected_document_record(document)
+        full_expected = _canonical_envelope([record])
+        full = _dumps(full_expected)
+        exact_budget = _utf8_size(full)
+        exact = _ADAPTER.serialize_query_response(response, budget=exact_budget)
         self.assertEqual(exact, full)
         json.loads(exact)
         self.assertEqual(exact, _dumps(json.loads(exact)))
-        self.assertEqual(_utf8_size(exact), 409)
-        self.assertEqual(_utf8_size(full), 409)
+        self.assertEqual(_utf8_size(exact), exact_budget)
         full_parsed = json.loads(full)
         self.assertEqual(full_parsed["origin"], "python_mcp")
         self.assertEqual(full_parsed["records"][0]["kind"], "document")
+        self.assertEqual(
+            full_parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
         self.assertFalse(full_parsed["truncation"]["truncated"])
         self.assertEqual(
             full_parsed["records"][0]["value"]["note"],
@@ -1304,13 +1468,47 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             full,
         )
 
-        tight_budget = 408
+        four_han_note = "caf\u00e9 \u6f22\u6f22\u6f22\u6f22"
+        five_han_note = four_han_note + "\u6f22"
+        clipped_record = _expected_document_record(
+            {
+                "document_id": _DOCUMENT_UUID,
+                "chunks": [],
+                "ok": True,
+                "note": four_han_note,
+            }
+        )
+        tight_expected = _canonical_envelope(
+            [clipped_record],
+            truncated=True,
+            omitted_items=0,
+            omitted_characters=4,
+        )
+        tight_text = _dumps(tight_expected)
+        tight_budget = exact_budget - 1
+        self.assertLessEqual(_utf8_size(tight_text), tight_budget)
+        five_han_text = _dumps(
+            _canonical_envelope(
+                [
+                    _expected_document_record(
+                        {
+                            "document_id": _DOCUMENT_UUID,
+                            "chunks": [],
+                            "ok": True,
+                            "note": five_han_note,
+                        }
+                    )
+                ],
+                truncated=True,
+                omitted_items=0,
+                omitted_characters=3,
+            )
+        )
+        self.assertGreater(_utf8_size(five_han_text), tight_budget)
         tight = _ADAPTER.serialize_query_response(response, budget=tight_budget)
-        expected_tight = _expected_text(records, budget=tight_budget)
-        self.assertEqual(tight, expected_tight)
+        self.assertEqual(tight, tight_text)
         parsed = json.loads(tight)
         self.assertEqual(tight, _dumps(parsed))
-        self.assertEqual(_utf8_size(tight), 404)
         self.assertLessEqual(_utf8_size(tight), tight_budget)
         self.assertEqual(parsed["origin"], "python_mcp")
         self.assertEqual(parsed["records"][0]["kind"], "document")
@@ -1318,59 +1516,65 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         self.assertEqual(parsed["truncation"]["omitted_items"], 0)
         self.assertEqual(parsed["truncation"]["omitted_characters"], 4)
         self.assertEqual(parsed["continuation"], {"kind": "narrow_query"})
-        four_han_note = "caf\u00e9 \u6f22\u6f22\u6f22\u6f22"
         four_han_wire = "caf\\u00e9 \\u6f22\\u6f22\\u6f22\\u6f22"
         five_han_wire = four_han_wire + "\\u6f22"
         self.assertEqual(parsed["records"][0]["value"]["note"], four_han_note)
         self.assertIn('"note": "caf\\u00e9 \\u6f22\\u6f22\\u6f22\\u6f22"', tight)
         self.assertNotIn(five_han_wire, tight)
-        self.assertEqual(
-            _utf8_size(tight.replace(four_han_wire, five_han_wire, 1)),
-            410,
-        )
-        self.assertGreater(410, tight_budget)
         self.assertNotIn(_QUERY_CANARY, tight)
         self.assertNotIn("cursor", tight)
 
-        minus_value = _fixture_case("clip-escaped-unicode-minus-one")["records"][0]["value"]
-        self.assertEqual(minus_value, value)
-        minus_records = [{"kind": "document", "value": minus_value}]
-        minus_response = {"results": [minus_value]}
-
-        cafe_budget = 379
+        cafe_record = _expected_document_record(
+            {
+                "document_id": _DOCUMENT_UUID,
+                "chunks": [],
+                "ok": True,
+                "note": "caf\u00e9",
+            }
+        )
+        cafe_expected = _canonical_envelope(
+            [cafe_record],
+            truncated=True,
+            omitted_items=0,
+            omitted_characters=9,
+        )
+        cafe_text_expected = _dumps(cafe_expected)
+        cafe_budget = _utf8_size(cafe_text_expected)
         cafe_text = _ADAPTER.serialize_query_response(
-            minus_response,
+            response,
             budget=cafe_budget,
         )
-        self.assertEqual(cafe_text, _expected_text(minus_records, budget=cafe_budget))
+        self.assertEqual(cafe_text, cafe_text_expected)
         cafe_parsed = json.loads(cafe_text)
-        self.assertEqual(cafe_text, _dumps(cafe_parsed))
-        self.assertEqual(_utf8_size(cafe_text), 379)
-        self.assertEqual(cafe_parsed["origin"], "python_mcp")
-        self.assertEqual(cafe_parsed["records"][0]["kind"], "document")
         self.assertEqual(cafe_parsed["records"][0]["value"]["note"], "caf\u00e9")
-        self.assertEqual(cafe_parsed["truncation"]["omitted_items"], 0)
         self.assertEqual(cafe_parsed["truncation"]["omitted_characters"], 9)
-        self.assertEqual(cafe_parsed["continuation"], {"kind": "narrow_query"})
         self.assertIn('"note": "caf\\u00e9"', cafe_text)
         self.assertNotIn("\\u6f22", cafe_text)
 
-        caf_budget = 378
+        caf_record = _expected_document_record(
+            {
+                "document_id": _DOCUMENT_UUID,
+                "chunks": [],
+                "ok": True,
+                "note": "caf",
+            }
+        )
+        caf_expected = _canonical_envelope(
+            [caf_record],
+            truncated=True,
+            omitted_items=0,
+            omitted_characters=10,
+        )
+        caf_text_expected = _dumps(caf_expected)
+        caf_budget = _utf8_size(caf_text_expected)
+        self.assertLess(caf_budget, cafe_budget)
         caf_text = _ADAPTER.serialize_query_response(
-            minus_response,
+            response,
             budget=caf_budget,
         )
-        self.assertEqual(caf_text, _expected_text(minus_records, budget=caf_budget))
+        self.assertEqual(caf_text, caf_text_expected)
         caf_parsed = json.loads(caf_text)
-        self.assertEqual(caf_text, _dumps(caf_parsed))
-        self.assertEqual(_utf8_size(caf_text), 374)
-        self.assertLessEqual(_utf8_size(caf_text), caf_budget)
-        self.assertEqual(caf_parsed["origin"], "python_mcp")
-        self.assertEqual(caf_parsed["records"][0]["kind"], "document")
         self.assertEqual(caf_parsed["records"][0]["value"]["note"], "caf")
-        self.assertEqual(caf_parsed["truncation"]["omitted_items"], 0)
-        self.assertEqual(caf_parsed["truncation"]["omitted_characters"], 10)
-        self.assertEqual(caf_parsed["continuation"], {"kind": "narrow_query"})
         self.assertIn('"note": "caf"', caf_text)
         self.assertNotIn("\\u00e9", caf_text)
         self.assertNotIn("\\u6f22", caf_text)
@@ -1382,7 +1586,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             note,
             "caf\u00e9 \u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22",
         )
-        document = {"title": "safe-title-neighbor", "body": "kept-body"}
+        document = _document_result(title="safe-title-neighbor", body="kept-body")
         fact = _fact_result(
             content=note,
             relationships=[
@@ -1404,7 +1608,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             "sources": sources,
         }
         records = [
-            {"kind": "document", "value": document},
+            _expected_document_record(document),
             _expected_fact_record(fact),
             _expected_fact_record(neighbor),
             _expected_synthesis_record(note, sources),
@@ -1431,8 +1635,14 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             [record["kind"] for record in full_parsed["records"]],
             ["document", "fact", "fact", "synthesis"],
         )
-        self.assertEqual(full_parsed["records"][0]["value"], document)
-        self.assertNotIn("locators", full_parsed["records"][0])
+        self.assertEqual(
+            full_parsed["records"][0],
+            _expected_document_record(document),
+        )
+        self.assertEqual(
+            full_parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
         self.assertEqual(
             full_parsed["records"][1]["value"]["content"],
             note,
@@ -1479,7 +1689,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         five_han_note = clipped_note + "\u6f22"
         tight_budget = exact_budget - 1
         expected_tight_records = [
-            {"kind": "document", "value": document},
+            _expected_document_record(document),
             _expected_fact_record(fact),
             _expected_fact_record(neighbor),
             _expected_synthesis_record(clipped_note, sources),
@@ -1495,7 +1705,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         five_han_text = _dumps(
             _canonical_envelope(
                 [
-                    {"kind": "document", "value": document},
+                    _expected_document_record(document),
                     _expected_fact_record(fact),
                     _expected_fact_record(neighbor),
                     _expected_synthesis_record(five_han_note, sources),
@@ -1522,8 +1732,11 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
         self.assertEqual(len(tight_parsed["records"]), 4)
         document_record = tight_parsed["records"][0]
-        self.assertEqual(document_record["value"], document)
-        self.assertNotIn("locators", document_record)
+        self.assertEqual(document_record, _expected_document_record(document))
+        self.assertEqual(
+            document_record["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
         self.assertNotIn("source_locators", document_record)
         first_fact = tight_parsed["records"][1]
         self.assertEqual(first_fact["value"]["content"], note)
@@ -1587,7 +1800,11 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         self.assertEqual(tight, _expected_text(records, budget=tight_budget))
 
     def test_call_tool_budgets_actual_serialized_text(self) -> None:
-        document = {"title": "safe-title-neighbor", "body": "x" * 60000}
+        document = _document_result(
+            title="safe-title-neighbor",
+            body="x" * 60000,
+            chunks=[],
+        )
         result, _request = _call(
             "remem_query",
             {"query": _QUERY_CANARY},
@@ -1595,17 +1812,21 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         )
         text, parsed = _parse_text(result)
         self.assertLessEqual(_utf8_size(text), 50000)
-        self.assertEqual(text, _expected_text([{"kind": "document", "value": document}]))
         self.assertTrue(parsed["truncation"]["truncated"])
         self.assertEqual(parsed["continuation"], {"kind": "narrow_query"})
+        self.assertEqual(
+            parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
         self.assertNotIn(_QUERY_CANARY, text)
         self.assertIn("safe-title-neighbor", text)
         self.assertNotIn("x" * 60000, text)
 
-        large_document = {
-            "title": "safe-title-neighbor",
-            "body": "d" * 29000,
-        }
+        large_document = _document_result(
+            title="safe-title-neighbor",
+            body="d" * 28980,
+            chunks=[],
+        )
         large_fact = _fact_result(
             content="safe-fact-neighbor " + ("f" * 20000),
             relationships=[
@@ -1627,7 +1848,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             "synthesis": large_synthesis,
             "sources": large_sources,
         }
-        large_document_record = {"kind": "document", "value": large_document}
+        large_document_record = _expected_document_record(large_document)
         large_fact_record = _expected_fact_record(large_fact)
         large_neighbor_record = _expected_fact_record(large_neighbor)
         large_synthesis_record = _expected_synthesis_record(
@@ -1710,8 +1931,11 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         self.assertEqual(large_parsed["records"], kept_records)
         document_record = large_parsed["records"][0]
         self.assertEqual(document_record["value"]["title"], "safe-title-neighbor")
-        self.assertEqual(document_record["value"]["body"], "d" * 29000)
-        self.assertNotIn("locators", document_record)
+        self.assertEqual(document_record["value"]["body"], "d" * 28980)
+        self.assertEqual(
+            document_record["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
         self.assertNotIn("source_locators", document_record)
         fact_record = large_parsed["records"][1]
         self.assertEqual(
@@ -1737,7 +1961,7 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertIn("d" * 29000, large_text)
+        self.assertIn("d" * 28980, large_text)
         self.assertIn("f" * 20000, large_text)
         self.assertIn("safe-title-neighbor", large_text)
         self.assertIn("safe-fact-neighbor ", large_text)
@@ -1753,7 +1977,6 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         self.assertNotIn('"sources"', large_text)
         self.assertNotIn("source_locators", large_text)
         large_request.assert_awaited_once()
-        self.assertEqual(large_text, _expected_text(large_records))
 
     def test_raw_bypass_and_origin_kwargs_are_rejected(self) -> None:
         with self.assertRaises(TypeError):
@@ -1768,6 +1991,20 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
             _ADAPTER.serialize_memory_query_response({}, origin="python_hook")
         with self.assertRaises(TypeError):
             _ADAPTER.serialize_summarize_response({}, access_mode="raw")
+        with self.assertRaises(TypeError):
+            _ADAPTER.serialize_document_response(
+                {},
+                requested_id=_DOCUMENT_UUID,
+                raw=True,
+            )
+        with self.assertRaises(TypeError):
+            _ADAPTER.serialize_entities_response({}, origin="python_hook")
+        with self.assertRaises(TypeError):
+            _ADAPTER.serialize_raw_document_response(
+                {},
+                requested_id=_DOCUMENT_UUID,
+                origin="python_cli",
+            )
 
     def test_summarize_and_memory_query_empty_states_are_canonical_envelopes(
         self,
@@ -2760,32 +2997,845 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
         self.assertNotIn("y" * 60000, memory_text)
         self.assertNotIn(_QUERY_CANARY, memory_text)
 
-    def test_later_mcp_tools_are_unchanged_in_this_unit(self) -> None:
-        entities, _request = _call(
+    def test_document_getter_maps_detail_without_invented_chunks(self) -> None:
+        detail = {
+            "document_id": _DOCUMENT_UUID,
+            "title": "getter-doc",
+            "content": "full-body",
+            "source": "api",
+            "source_type": "note",
+            "storage_type": "text",
+            "has_extractable_data": False,
+            "category": None,
+            "tags": ["a"],
+            "sensitivity": "internal",
+            "language": "en",
+            "summary": None,
+            "extracted": {"ok": True},
+            "status": "ready",
+            "version": 1,
+            "chunk_count": 2,
+            "keep_forever": False,
+            "user_starred": False,
+            "original_filename": None,
+            "source_path": None,
+            "metadata": {"topic": "kept"},
+            "created_at": None,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "deleted_at": None,
+            "source_timestamp": None,
+        }
+        original = copy.deepcopy(detail)
+        result, request = _call(
+            "remem_get_document",
+            {"document_id": _DOCUMENT_UUID, "namespaces": ["ns"]},
+            detail,
+        )
+        text, parsed = _parse_text(result)
+        expected = _canonical_envelope([_expected_document_record(detail)])
+        self.assertEqual(text, _dumps(expected))
+        self.assertEqual(detail, original)
+        self.assertNotIn("chunks", parsed["records"][0])
+        self.assertEqual(
+            parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
+        self.assertIsNone(parsed["records"][0]["value"]["category"])
+        self.assertEqual(parsed["records"][0]["value"]["metadata"]["topic"], "kept")
+        self.assertNotIn("cursor", text)
+        request.assert_awaited_once_with(
+            "GET",
+            f"/v1/documents/{_DOCUMENT_UUID}",
+            params={"namespaces": "ns"},
+        )
+
+    def test_document_chunks_getter_uses_wrapper_id_and_rejects_mismatch(self) -> None:
+        payload = {
+            "document_id": _DOCUMENT_UUID,
+            "chunks": [
+                {
+                    "chunk_id": _CHUNK_ID,
+                    "chunk_index": 0,
+                    "start_char": 0,
+                    "end_char": 4,
+                    "vector_id": "vec-1",
+                    "content_len": 4,
+                    "content": "body",
+                    "metadata": {"topic": "kept"},
+                },
+                {
+                    "chunk_id": _CHUNK_ID_B,
+                    "chunk_index": 1,
+                    "start_char": 4,
+                    "end_char": 8,
+                    "vector_id": "vec-2",
+                    "content_len": 4,
+                    "content": None,
+                    "metadata": {},
+                },
+            ],
+        }
+        result, request = _call(
+            "remem_get_document_chunks",
+            {
+                "document_id": _DOCUMENT_UUID,
+                "include_content": False,
+                "limit": 9,
+                "namespaces": ["alpha"],
+            },
+            payload,
+        )
+        text, parsed = _parse_text(result)
+        mapped = {
+            "document_id": _DOCUMENT_UUID,
+            "chunks": [
+                {
+                    "chunk_id": _CHUNK_ID,
+                    "document_id": _DOCUMENT_UUID,
+                    "chunk_index": 0,
+                    "start_char": 0,
+                    "end_char": 4,
+                    "vector_id": "vec-1",
+                    "content_len": 4,
+                    "content": "body",
+                    "metadata": {"topic": "kept"},
+                },
+                {
+                    "chunk_id": _CHUNK_ID_B,
+                    "document_id": _DOCUMENT_UUID,
+                    "chunk_index": 1,
+                    "start_char": 4,
+                    "end_char": 8,
+                    "vector_id": "vec-2",
+                    "content_len": 4,
+                    "content": None,
+                    "metadata": {},
+                },
+            ],
+        }
+        self.assertEqual(
+            text,
+            _dumps(_canonical_envelope([_expected_document_record(mapped)])),
+        )
+        self.assertEqual(
+            parsed["records"][0]["chunks"][0]["value"]["vector_id"],
+            "vec-1",
+        )
+        self.assertIsNone(parsed["records"][0]["chunks"][1]["value"]["content"])
+        self.assertNotIn("document_id", parsed["records"][0]["chunks"][0]["value"])
+        request.assert_awaited_once()
+        self.assertEqual(
+            request.await_args.kwargs["params"]["include_content"],
+            False,
+        )
+        self.assertEqual(request.await_args.kwargs["params"]["limit"], 9)
+        self.assertEqual(
+            request.await_args.kwargs["params"]["namespaces"],
+            "alpha",
+        )
+        mismatch, mismatch_request = _call(
+            "remem_get_document_chunks",
+            {"document_id": _DOCUMENT_UUID},
+            {
+                "document_id": _DOCUMENT_UUID,
+                "chunks": [
+                    {
+                        "chunk_id": _CHUNK_ID,
+                        "document_id": _DOCUMENT_ID,
+                        "content": "MISMATCH-CANARY",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(mismatch[0].text, _ERROR)
+        self.assertNotIn("MISMATCH-CANARY", mismatch[0].text)
+        mismatch_request.assert_awaited_once()
+
+    def test_entities_and_entity_facts_and_extract_status(self) -> None:
+        alice = {
+            "id": _ENTITY_ID,
+            "name": "Alice",
+            "entity_type": "person",
+            "mention_count": 2,
+            "fact_count": 1,
+            "first_seen": "2026-01-01T00:00:00Z",
+            "last_mentioned": "2026-01-02T00:00:00Z",
+            "note": None,
+        }
+        bob = {
+            "id": _ENTITY_ID_B,
+            "name": "Bob",
+            "entity_type": "org",
+            "mention_count": 0,
+            "fact_count": 0,
+            "first_seen": "2026-01-01T00:00:00Z",
+            "last_mentioned": "2026-01-01T00:00:00Z",
+        }
+        listed, list_request = _call(
+            "remem_list_entities",
+            {"entity_type": "person", "limit": 7, "offset": 1, "namespaces": ["ns"]},
+            {"entities": [alice, bob], "total": 9, "limit": 7, "offset": 1},
+        )
+        listed_text, listed_parsed = _parse_text(listed)
+        self.assertEqual(
+            listed_text,
+            _dumps(
+                _canonical_envelope(
+                    [
+                        _expected_entity_record(alice),
+                        _expected_entity_record(bob),
+                    ]
+                )
+            ),
+        )
+        self.assertNotIn('"total"', listed_text)
+        self.assertNotIn("cursor", listed_text)
+        list_request.assert_awaited_once()
+        self.assertEqual(list_request.await_args.kwargs["params"]["type"], "person")
+        empty, _empty_request = _call(
             "remem_list_entities",
             {},
             {"entities": [], "total": 0},
         )
-        self.assertIn("No entities found.", entities[0].text)
-        self.assertNotIn("policy_version", entities[0].text)
-        document, _request = _call(
-            "remem_get_document",
-            {"document_id": _DOCUMENT_UUID},
-            {"title": "raw-doc"},
-        )
-        self.assertIn("raw-doc", document[0].text)
-        self.assertNotIn("policy_version", document[0].text)
-        facts, _request = _call(
+        empty_text, empty_parsed = _parse_text(empty)
+        self.assertEqual(empty_text, _dumps(_canonical_envelope([])))
+        self.assertEqual(empty_parsed["records"], [])
+        fact = _fact_result()
+        grouped, facts_request = _call(
             "remem_get_entity_facts",
-            {"entity_id": _DOCUMENT_UUID},
+            {"entity_id": _ENTITY_ID, "namespaces": ["ns"]},
+            {"entity": alice, "facts": [fact], "total": 1},
+        )
+        grouped_text, grouped_parsed = _parse_text(grouped)
+        self.assertEqual(
+            grouped_text,
+            _dumps(
+                _canonical_envelope(
+                    [_expected_entity_record(alice, [fact])]
+                )
+            ),
+        )
+        self.assertEqual(
+            grouped_parsed["records"][0]["facts"][0]["locators"]["fact_id"],
+            _FACT_ID,
+        )
+        facts_request.assert_awaited_once_with(
+            "GET",
+            f"/v1/entities/{_ENTITY_ID}/facts",
+            params={"latest_only": True, "namespaces": "ns"},
+        )
+        empty_facts, _ef_request = _call(
+            "remem_get_entity_facts",
+            {"entity_id": _ENTITY_ID},
+            {"entity": alice, "facts": [], "total": 0},
+        )
+        _empty_facts_text, empty_facts_parsed = _parse_text(empty_facts)
+        self.assertEqual(
+            empty_facts_parsed["records"][0]["facts"],
+            [],
+        )
+        self.assertEqual(
+            empty_facts_parsed["records"][0]["locators"]["entity_id"],
+            _ENTITY_ID,
+        )
+        mismatch, mismatch_request = _call(
+            "remem_get_entity_facts",
+            {"entity_id": _ENTITY_ID},
+            {"entity": bob, "facts": []},
+        )
+        self.assertEqual(mismatch[0].text, _ERROR)
+        mismatch_request.assert_awaited_once()
+        status = {
+            "status": "accepted",
+            "document_id": _DOCUMENT_UUID,
+            "fact_extraction_status": "queued",
+        }
+        extracted, extract_request = _call(
+            "remem_extract_facts",
+            {"document_id": _DOCUMENT_UUID, "namespace": "writes"},
+            status,
+        )
+        extracted_text, extracted_parsed = _parse_text(extracted)
+        self.assertEqual(
+            extracted_text,
+            _dumps(
+                _canonical_envelope(
+                    [
+                        {
+                            "kind": "document",
+                            "value": {
+                                "status": "accepted",
+                                "fact_extraction_status": "queued",
+                            },
+                            "locators": {"document_id": _DOCUMENT_UUID},
+                        }
+                    ]
+                )
+            ),
+        )
+        self.assertNotIn("facts", extracted_parsed["records"][0])
+        extract_request.assert_awaited_once_with(
+            "POST",
+            f"/v1/documents/{_DOCUMENT_UUID}/extract-facts",
+            params={"namespace": "writes"},
+        )
+
+    def test_raw_document_tools_preserve_secrets_and_share_request_path(self) -> None:
+        secret_body = "use sk-abcdefghijklmnopqrstuvwxyz1234567890"
+        ordinary = {
+            "document_id": _DOCUMENT_UUID,
+            "title": "raw-doc",
+            "content": secret_body,
+            "password": _PASSWORD_CANARY,
+        }
+        ordinary_result, ordinary_request = _call(
+            "remem_get_document",
+            {"document_id": _DOCUMENT_UUID, "namespaces": ["ns"]},
+            ordinary,
+        )
+        ordinary_text, ordinary_parsed = _parse_text(ordinary_result)
+        self.assertEqual(ordinary_parsed["access_mode"], "ordinary")
+        self.assertNotIn(_PASSWORD_CANARY, ordinary_text)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz1234567890", ordinary_text)
+        self.assertEqual(ordinary_parsed["trust"], "untrusted_source")
+        ordinary_request.assert_awaited_once_with(
+            "GET",
+            f"/v1/documents/{_DOCUMENT_UUID}",
+            params={"namespaces": "ns"},
+        )
+        raw_result, raw_request = _call(
+            "remem_get_raw_document",
+            {"document_id": _DOCUMENT_UUID, "namespaces": ["ns"]},
+            ordinary,
+        )
+        raw_text, raw_parsed = _parse_text(raw_result)
+        self.assertEqual(raw_parsed["access_mode"], "raw")
+        self.assertEqual(raw_parsed["trust"], "untrusted_source")
+        self.assertEqual(raw_parsed["origin"], "python_mcp")
+        self.assertIn(secret_body, raw_text)
+        self.assertIn(_PASSWORD_CANARY, raw_text)
+        self.assertEqual(
+            raw_parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
+        raw_request.assert_awaited_once_with(
+            "GET",
+            f"/v1/documents/{_DOCUMENT_UUID}",
+            params={"namespaces": "ns"},
+        )
+        chunks_payload = {
+            "document_id": _DOCUMENT_UUID,
+            "chunks": [
+                {
+                    "chunk_id": _CHUNK_ID,
+                    "content": secret_body,
+                    "metadata": {"password": _PASSWORD_CANARY},
+                }
+            ],
+        }
+        raw_chunks, raw_chunks_request = _call(
+            "remem_get_raw_document_chunks",
+            {"document_id": _DOCUMENT_UUID, "include_content": True, "limit": 3},
+            chunks_payload,
+        )
+        raw_chunks_text, raw_chunks_parsed = _parse_text(raw_chunks)
+        self.assertEqual(raw_chunks_parsed["access_mode"], "raw")
+        self.assertIn(secret_body, raw_chunks_text)
+        self.assertIn(_PASSWORD_CANARY, raw_chunks_text)
+        raw_chunks_request.assert_awaited_once()
+        self.assertEqual(
+            raw_chunks_request.await_args.args[:2],
+            ("GET", f"/v1/documents/{_DOCUMENT_UUID}/chunks"),
+        )
+        invalid, invalid_request = _call(
+            "remem_get_raw_document",
+            {"document_id": "not-a-uuid"},
+            ordinary,
+        )
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("Invalid document_id", invalid[0].text)
+        self.assertNotIn(secret_body, invalid[0].text)
+        invalid_request.assert_not_awaited()
+        for status, kind in ((401, "auth"), (403, "permission"), (404, "namespace")):
+            with self.subTest(status=status):
+                failing = mock.AsyncMock(
+                    side_effect=_SERVER._RequestError(status, kind)
+                )
+                with mock.patch.object(_SERVER, "_request", failing):
+                    denied = asyncio.run(
+                        _SERVER.call_tool(
+                            "remem_get_raw_document",
+                            {"document_id": _DOCUMENT_UUID},
+                        )
+                    )
+                self.assertEqual(len(denied), 1)
+                self.assertIn(f"kind={kind}", denied[0].text)
+                self.assertNotIn(secret_body, denied[0].text)
+                self.assertNotIn("policy_version", denied[0].text)
+                failing.assert_awaited_once()
+        invalid_chunks, invalid_chunks_request = _call(
+            "remem_get_raw_document_chunks",
+            {"document_id": "not-a-uuid", "include_content": True, "limit": 3},
+            chunks_payload,
+        )
+        self.assertEqual(len(invalid_chunks), 1)
+        self.assertIn("Invalid document_id", invalid_chunks[0].text)
+        self.assertNotIn(secret_body, invalid_chunks[0].text)
+        invalid_chunks_request.assert_not_awaited()
+        ordinary_chunks, ordinary_chunks_request = _call(
+            "remem_get_document_chunks",
             {
-                "entity": {"name": "Alice", "entity_type": "person"},
-                "facts": [{"fact_type": "fact", "content": "FACT-KEEP"}],
+                "document_id": _DOCUMENT_UUID,
+                "include_content": True,
+                "limit": 3,
+                "namespaces": ["ns"],
+            },
+            chunks_payload,
+        )
+        ordinary_chunks_text, ordinary_chunks_parsed = _parse_text(ordinary_chunks)
+        self.assertEqual(ordinary_chunks_parsed["access_mode"], "ordinary")
+        self.assertNotIn(_PASSWORD_CANARY, ordinary_chunks_text)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz1234567890", ordinary_chunks_text)
+        ordinary_chunks_request.assert_awaited_once()
+        self.assertEqual(
+            ordinary_chunks_request.await_args.kwargs["params"],
+            {
+                "include_content": True,
+                "limit": 3,
+                "namespaces": "ns",
             },
         )
-        self.assertIn("FACT-KEEP", facts[0].text)
-        self.assertIn("**Alice**", facts[0].text)
-        self.assertNotIn("policy_version", facts[0].text)
+        raw_chunks_ns, raw_chunks_ns_request = _call(
+            "remem_get_raw_document_chunks",
+            {
+                "document_id": _DOCUMENT_UUID,
+                "include_content": False,
+                "limit": 9,
+                "namespaces": ["alpha"],
+            },
+            chunks_payload,
+        )
+        raw_ns_text, raw_ns_parsed = _parse_text(raw_chunks_ns)
+        self.assertEqual(raw_ns_parsed["access_mode"], "raw")
+        self.assertIn(secret_body, raw_ns_text)
+        self.assertIn(_PASSWORD_CANARY, raw_ns_text)
+        raw_chunks_ns_request.assert_awaited_once()
+        self.assertEqual(
+            raw_chunks_ns_request.await_args.kwargs["params"],
+            {
+                "include_content": False,
+                "limit": 9,
+                "namespaces": "alpha",
+            },
+        )
+        for status, kind in ((401, "auth"), (403, "permission"), (404, "namespace")):
+            with self.subTest(tool="remem_get_raw_document_chunks", status=status):
+                failing = mock.AsyncMock(
+                    side_effect=_SERVER._RequestError(status, kind)
+                )
+                with mock.patch.object(_SERVER, "_request", failing):
+                    denied = asyncio.run(
+                        _SERVER.call_tool(
+                            "remem_get_raw_document_chunks",
+                            {
+                                "document_id": _DOCUMENT_UUID,
+                                "include_content": True,
+                                "limit": 3,
+                            },
+                        )
+                    )
+                self.assertEqual(len(denied), 1)
+                self.assertIn(f"kind={kind}", denied[0].text)
+                self.assertNotIn(secret_body, denied[0].text)
+                self.assertNotIn(_PASSWORD_CANARY, denied[0].text)
+                self.assertNotIn("policy_version", denied[0].text)
+                failing.assert_awaited_once()
+                self.assertEqual(
+                    failing.await_args.args[:2],
+                    ("GET", f"/v1/documents/{_DOCUMENT_UUID}/chunks"),
+                )
+        raw_document_body = "R" * 60000
+        raw_document_kept = 49544
+        raw_document_omitted = 10456
+        raw_document_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "raw",
+            "trust": "untrusted_source",
+            "origin": "python_mcp",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "raw-budget-doc",
+                        "content": "R" * raw_document_kept,
+                    },
+                    "locators": {"document_id": _DOCUMENT_UUID},
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": raw_document_omitted,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        raw_document_next = copy.deepcopy(raw_document_expected)
+        raw_document_next["records"][0]["value"]["content"] = "R" * (
+            raw_document_kept + 1
+        )
+        raw_document_next["truncation"]["omitted_characters"] = (
+            raw_document_omitted - 1
+        )
+        raw_document_expected_text = _dumps(raw_document_expected)
+        self.assertGreater(
+            _utf8_size(
+                _dumps(
+                    {
+                        **raw_document_expected,
+                        "truncation": {
+                            "truncated": False,
+                            "omitted_items": 0,
+                            "omitted_characters": 0,
+                        },
+                        "continuation": None,
+                        "records": [
+                            {
+                                "kind": "document",
+                                "value": {
+                                    "title": "raw-budget-doc",
+                                    "content": raw_document_body,
+                                },
+                                "locators": {"document_id": _DOCUMENT_UUID},
+                            }
+                        ],
+                    }
+                )
+            ),
+            50000,
+        )
+        self.assertLessEqual(_utf8_size(raw_document_expected_text), 50000)
+        self.assertGreater(_utf8_size(_dumps(raw_document_next)), 50000)
+        raw_budget_result, raw_budget_request = _call(
+            "remem_get_raw_document",
+            {"document_id": _DOCUMENT_UUID, "namespaces": ["ns"]},
+            {
+                "document_id": _DOCUMENT_UUID,
+                "title": "raw-budget-doc",
+                "content": raw_document_body,
+            },
+        )
+        raw_budget_text, raw_budget_parsed = _parse_text(raw_budget_result)
+        self.assertLessEqual(_utf8_size(raw_budget_text), 50000)
+        self.assertEqual(raw_budget_text, raw_document_expected_text)
+        self.assertEqual(raw_budget_parsed["access_mode"], "raw")
+        self.assertEqual(raw_budget_parsed["trust"], "untrusted_source")
+        self.assertEqual(raw_budget_parsed["origin"], "python_mcp")
+        self.assertEqual(
+            raw_budget_parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
+        self.assertEqual(
+            raw_budget_parsed["truncation"],
+            {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": raw_document_omitted,
+            },
+        )
+        self.assertNotIn("R" * 60000, raw_budget_text)
+        raw_budget_request.assert_awaited_once_with(
+            "GET",
+            f"/v1/documents/{_DOCUMENT_UUID}",
+            params={"namespaces": "ns"},
+        )
+        raw_chunk_body = "C" * 60000
+        raw_chunk_kept = 49423
+        raw_chunk_omitted = 10577
+        raw_chunks_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "raw",
+            "trust": "untrusted_source",
+            "origin": "python_mcp",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {},
+                    "locators": {"document_id": _DOCUMENT_UUID},
+                    "chunks": [
+                        {
+                            "locators": {
+                                "chunk_id": _CHUNK_ID,
+                                "document_id": _DOCUMENT_UUID,
+                            },
+                            "value": {"content": "C" * raw_chunk_kept},
+                        }
+                    ],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": raw_chunk_omitted,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        raw_chunks_next = copy.deepcopy(raw_chunks_expected)
+        raw_chunks_next["records"][0]["chunks"][0]["value"]["content"] = "C" * (
+            raw_chunk_kept + 1
+        )
+        raw_chunks_next["truncation"]["omitted_characters"] = (
+            raw_chunk_omitted - 1
+        )
+        raw_chunks_expected_text = _dumps(raw_chunks_expected)
+        self.assertLessEqual(_utf8_size(raw_chunks_expected_text), 50000)
+        self.assertGreater(_utf8_size(_dumps(raw_chunks_next)), 50000)
+        raw_chunks_budget, raw_chunks_budget_request = _call(
+            "remem_get_raw_document_chunks",
+            {
+                "document_id": _DOCUMENT_UUID,
+                "include_content": True,
+                "limit": 3,
+                "namespaces": ["ns"],
+            },
+            {
+                "document_id": _DOCUMENT_UUID,
+                "chunks": [
+                    {
+                        "chunk_id": _CHUNK_ID,
+                        "content": raw_chunk_body,
+                    }
+                ],
+            },
+        )
+        raw_chunks_budget_text, raw_chunks_budget_parsed = _parse_text(
+            raw_chunks_budget
+        )
+        self.assertLessEqual(_utf8_size(raw_chunks_budget_text), 50000)
+        self.assertEqual(raw_chunks_budget_text, raw_chunks_expected_text)
+        self.assertEqual(raw_chunks_budget_parsed["access_mode"], "raw")
+        self.assertEqual(raw_chunks_budget_parsed["trust"], "untrusted_source")
+        self.assertEqual(raw_chunks_budget_parsed["origin"], "python_mcp")
+        self.assertEqual(
+            raw_chunks_budget_parsed["records"][0]["locators"],
+            {"document_id": _DOCUMENT_UUID},
+        )
+        self.assertEqual(
+            raw_chunks_budget_parsed["records"][0]["chunks"][0]["locators"],
+            {
+                "chunk_id": _CHUNK_ID,
+                "document_id": _DOCUMENT_UUID,
+            },
+        )
+        self.assertEqual(
+            raw_chunks_budget_parsed["truncation"],
+            {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": raw_chunk_omitted,
+            },
+        )
+        self.assertNotIn("C" * 60000, raw_chunks_budget_text)
+        raw_chunks_budget_request.assert_awaited_once()
+        self.assertEqual(
+            raw_chunks_budget_request.await_args.args[:2],
+            ("GET", f"/v1/documents/{_DOCUMENT_UUID}/chunks"),
+        )
+        self.assertEqual(
+            raw_chunks_budget_request.await_args.kwargs["params"],
+            {
+                "include_content": True,
+                "limit": 3,
+                "namespaces": "ns",
+            },
+        )
+
+    def test_document_getter_keeps_extra_chunks_for_off_record_and_bounds(
+        self,
+    ) -> None:
+        late = {
+            "document_id": _DOCUMENT_UUID,
+            "title": "safe-title-neighbor",
+            "content": "kept body",
+            "chunks": [
+                {
+                    "chunk_id": _CHUNK_ID,
+                    "content": "safe-child",
+                },
+                {
+                    "chunk_id": _CHUNK_ID_B,
+                    "content": _OFF_RECORD_PREFIX,
+                },
+            ],
+        }
+        result, request = _call(
+            "remem_get_document",
+            {"document_id": _DOCUMENT_UUID},
+            late,
+        )
+        text, parsed = _parse_text(result)
+        self.assertEqual(parsed["records"], [])
+        self.assertEqual(parsed["redaction"]["records"], 1)
+        self.assertNotIn("off the record", text)
+        self.assertNotIn("BBBBBBBBBB", text)
+        self.assertNotIn("safe-title-neighbor", text)
+        self.assertNotIn(_DOCUMENT_UUID, text)
+        request.assert_awaited_once()
+        nested: object = "DEPTH-CANARY"
+        for _ in range(40):
+            nested = {"child": nested}
+        deep = {
+            "document_id": _DOCUMENT_UUID,
+            "title": "safe-title-neighbor",
+            "extra": nested,
+        }
+        deep_result, deep_request = _call(
+            "remem_get_document",
+            {"document_id": _DOCUMENT_UUID},
+            deep,
+        )
+        self.assertEqual(deep_result[0].text, _ERROR)
+        self.assertNotIn("DEPTH-CANARY", deep_result[0].text)
+        deep_request.assert_awaited_once()
+        raw_late, raw_request = _call(
+            "remem_get_raw_document",
+            {"document_id": _DOCUMENT_UUID},
+            late,
+        )
+        raw_text, raw_parsed = _parse_text(raw_late)
+        self.assertEqual(raw_parsed["access_mode"], "raw")
+        self.assertIn("off the record", raw_text)
+        self.assertIn("safe-title-neighbor", raw_text)
+        self.assertIn("chunks", raw_text)
+        raw_request.assert_awaited_once()
+        raw_deep, raw_deep_request = _call(
+            "remem_get_raw_document",
+            {"document_id": _DOCUMENT_UUID},
+            deep,
+        )
+        self.assertEqual(raw_deep[0].text, _ERROR)
+        self.assertNotIn("DEPTH-CANARY", raw_deep[0].text)
+        raw_deep_request.assert_awaited_once()
+
+    def test_invalid_sensitive_fields_fail_closed_before_request(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "{"},
+            clear=False,
+        ):
+            result, request = _call(
+                "remem_query",
+                {"query": _QUERY_CANARY},
+                {"results": [_document_result()]},
+            )
+        self.assertEqual(result[0].text, _ERROR)
+        request.assert_not_awaited()
+        with mock.patch.dict(
+            os.environ,
+            {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "null"},
+            clear=False,
+        ):
+            null_result, null_request = _call(
+                "remem_query",
+                {"query": _QUERY_CANARY},
+                {"results": [_document_result()]},
+            )
+        self.assertEqual(null_result[0].text, _ERROR)
+        null_request.assert_not_awaited()
+        with mock.patch.dict(
+            os.environ,
+            {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": '["title"]'},
+            clear=False,
+        ):
+            configured, configured_request = _call(
+                "remem_query",
+                {"query": _QUERY_CANARY},
+                {"results": [_document_result()]},
+            )
+        text, parsed = _parse_text(configured)
+        self.assertNotIn("safe-title-neighbor", text)
+        self.assertEqual(parsed["redaction"]["fields"], 1)
+        configured_request.assert_awaited_once()
+
+    def test_query_malformed_documents_are_nonreflecting(self) -> None:
+        cases = (
+            {"results": [{"title": "MISSING-ID-CANARY", "chunks": []}]},
+            {
+                "results": [
+                    {
+                        "document_id": _DOCUMENT_UUID,
+                        "title": "MISSING-CHUNKS-CANARY",
+                    }
+                ]
+            },
+            {
+                "results": [
+                    {
+                        "document_id": _DOCUMENT_UUID,
+                        "chunks": None,
+                        "title": "NULL-CHUNKS-CANARY",
+                    }
+                ]
+            },
+            {
+                "results": [
+                    {
+                        "document_id": _DOCUMENT_UUID,
+                        "chunks": [
+                            {
+                                "document_id": _DOCUMENT_UUID,
+                                "content": "MISSING-CHUNK-ID-CANARY",
+                            }
+                        ],
+                    }
+                ]
+            },
+            {
+                "results": [
+                    {
+                        "document_id": _DOCUMENT_UUID,
+                        "chunks": [
+                            {
+                                "chunk_id": _CHUNK_ID,
+                                "document_id": _DOCUMENT_ID,
+                                "content": "CROSS-PARENT-CANARY",
+                            }
+                        ],
+                    }
+                ]
+            },
+            {
+                "results": [
+                    {
+                        "document_id": "A8098C1A-F86E-11DA-BD1A-00112444BE1E",
+                        "chunks": [],
+                        "title": "UPPER-DOC-CANARY",
+                    }
+                ]
+            },
+        )
+        for response in cases:
+            with self.subTest(response=response):
+                result, request = _call(
+                    "remem_query",
+                    {"query": _QUERY_CANARY},
+                    response,
+                )
+                self.assertEqual(result[0].text, _ERROR)
+                for needle in (
+                    "MISSING-ID-CANARY",
+                    "MISSING-CHUNKS-CANARY",
+                    "NULL-CHUNKS-CANARY",
+                    "MISSING-CHUNK-ID-CANARY",
+                    "CROSS-PARENT-CANARY",
+                    "UPPER-DOC-CANARY",
+                    _DOCUMENT_UUID,
+                    _CHUNK_ID,
+                    _QUERY_CANARY,
+                ):
+                    self.assertNotIn(needle, result[0].text)
+                request.assert_awaited_once()
 
     def test_packaged_import_uses_plugin_local_policy_under_isolated_python(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2907,9 +3957,11 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 payload = {
     "results": [{
+        "document_id": "11111111-1111-1111-1111-111111111111",
         "title": "safe-title-neighbor",
         "password": "hunter2-not-a-real-password",
         "body": "vlt_adapterpoison001",
+        "chunks": [],
     }]
 }
 request = mock.AsyncMock(return_value=payload)

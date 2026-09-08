@@ -1,22 +1,31 @@
 import importlib.util
+import json
 import sys
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
 
 
-_SCRIPT_PATH = (
+_SCRIPTS_DIR = (
     Path(__file__).resolve().parents[1]
     / "plugins"
     / "remem-memory"
     / "scripts"
-    / "memory_policy.py"
 )
+_SCRIPT_PATH = _SCRIPTS_DIR / "memory_policy.py"
 _SPEC = importlib.util.spec_from_file_location("memory_policy", _SCRIPT_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC and _SPEC.loader
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
+_RP_SPEC = importlib.util.spec_from_file_location(
+    "retrieval_policy",
+    _SCRIPTS_DIR / "retrieval_policy.py",
+)
+_RP = importlib.util.module_from_spec(_RP_SPEC)
+assert _RP_SPEC and _RP_SPEC.loader
+sys.modules["retrieval_policy"] = _RP
+_RP_SPEC.loader.exec_module(_RP)
 
 
 class MemoryPolicyTests(unittest.TestCase):
@@ -226,12 +235,27 @@ class MemoryPolicyTests(unittest.TestCase):
     def test_untrusted_context_omits_secret_results_and_is_bounded(self) -> None:
         rendered = _MODULE.render_untrusted_context(
             [
-                {"title": "Safe", "content": "Use the blue theme."},
                 {
-                    "title": "Unsafe",
-                    "content": "token=abcdefghijklmnopqrstuvwxyz123456",
+                    "kind": "document",
+                    "value": {
+                        "title": "Safe",
+                        "content": "Use the blue theme.",
+                    },
                 },
-                {"title": "Large", "content": "context " * 2000},
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "Unsafe",
+                        "content": "token=abcdefghijklmnopqrstuvwxyz123456",
+                    },
+                },
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "Large",
+                        "content": "context " * 2000,
+                    },
+                },
             ]
         )
 
@@ -240,6 +264,12 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertIn("Use the blue theme.", rendered)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", rendered)
         self.assertLessEqual(len(rendered), 6000)
+        serialized = rendered.split("historical data.\n", 1)[1]
+        serialized = serialized.rsplit("\nEND UNTRUSTED REMEM MEMORY", 1)[0]
+        parsed = json.loads(serialized)
+        self.assertEqual(parsed["origin"], "python_hook")
+        self.assertEqual(parsed["access_mode"], "ordinary")
+        self.assertEqual(parsed["trust"], "untrusted_source")
 
     def test_recall_merge_deduplicates_by_identity_then_normalized_content(
         self,
@@ -247,22 +277,29 @@ class MemoryPolicyTests(unittest.TestCase):
         merge = getattr(_MODULE, "merge_recall_items", None)
         self.assertIsNotNone(merge)
         assert merge is not None
+        shared = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         sources = [
             self._recall_source(
                 {
-                    "results": [
+                    "records": [
                         {
-                            "document_id": "doc-shared",
-                            "title": "Older duplicate",
-                            "namespace": "alpha",
-                            "content": "older identity content",
-                            "score": 0.4,
+                            "kind": "document",
+                            "locators": {"document_id": shared},
+                            "value": {
+                                "title": "Older duplicate",
+                                "namespace": "alpha",
+                                "content": "older identity content",
+                                "score": 0.4,
+                            },
                         },
                         {
-                            "title": "Whitespace duplicate",
-                            "namespace": "alpha",
-                            "content": "same   normalized\ncontent",
-                            "score": 0.8,
+                            "kind": "document",
+                            "value": {
+                                "title": "Whitespace duplicate",
+                                "namespace": "alpha",
+                                "content": "same normalized content",
+                                "score": 0.8,
+                            },
                         },
                     ]
                 },
@@ -271,19 +308,25 @@ class MemoryPolicyTests(unittest.TestCase):
             ),
             self._recall_source(
                 {
-                    "results": [
+                    "records": [
                         {
-                            "document_id": "doc-shared",
-                            "title": "Newer duplicate",
-                            "namespace": "beta",
-                            "content": "higher scored identity content",
-                            "score": 0.9,
+                            "kind": "document",
+                            "locators": {"document_id": shared},
+                            "value": {
+                                "title": "Newer duplicate",
+                                "namespace": "beta",
+                                "content": "higher scored identity content",
+                                "score": 0.9,
+                            },
                         },
                         {
-                            "title": "Normalized duplicate",
-                            "namespace": "beta",
-                            "content": "same normalized content",
-                            "score": 0.7,
+                            "kind": "document",
+                            "value": {
+                                "title": "Normalized duplicate",
+                                "namespace": "beta",
+                                "content": "same normalized content",
+                                "score": 0.7,
+                            },
                         },
                     ]
                 },
@@ -295,9 +338,119 @@ class MemoryPolicyTests(unittest.TestCase):
         merged = merge(sources)
 
         self.assertEqual(
-            [item["title"] for item in merged],
+            [item["value"]["title"] for item in merged],
             ["Newer duplicate", "Whitespace duplicate"],
         )
+
+    def test_isolated_renderer_uses_sibling_retrieval_policy(self) -> None:
+        self.assertEqual(
+            Path(_MODULE.__file__).resolve(),
+            _SCRIPT_PATH.resolve(),
+        )
+        self.assertEqual(
+            Path(_RP.__file__).resolve(),
+            (_SCRIPTS_DIR / "retrieval_policy.py").resolve(),
+        )
+        self.assertIs(sys.modules["retrieval_policy"], _RP)
+        rendered = _MODULE.render_untrusted_context(
+            [
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "Safe",
+                        "content": "kept-neighbor",
+                    },
+                }
+            ]
+        )
+        self.assertIn("BEGIN UNTRUSTED REMEM MEMORY", rendered)
+        self.assertIn("kept-neighbor", rendered)
+        serialized = rendered.split("historical data.\n", 1)[1]
+        serialized = serialized.rsplit("\nEND UNTRUSTED REMEM MEMORY", 1)[0]
+        parsed = json.loads(serialized)
+        self.assertEqual(parsed["origin"], "python_hook")
+        self.assertEqual(parsed["access_mode"], "ordinary")
+        self.assertEqual(parsed["trust"], "untrusted_source")
+        self.assertEqual(_RP.build_retrieval_envelope.__module__, "retrieval_policy")
+
+    def test_recall_merge_keeps_distinct_synthesis_and_drops_duplicate_content(
+        self,
+    ) -> None:
+        merge = getattr(_MODULE, "merge_recall_items", None)
+        self.assertIsNotNone(merge)
+        assert merge is not None
+        first_sources = [
+            {"source_document_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+        ]
+        second_sources = [
+            {"source_document_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+            {"source_document_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+        ]
+        sources = [
+            self._recall_source(
+                {
+                    "records": [
+                        {
+                            "kind": "synthesis",
+                            "value": "alpha synthesis body",
+                            "source_locators": first_sources,
+                        },
+                        {
+                            "kind": "synthesis",
+                            "value": "shared synthesis body",
+                            "source_locators": first_sources,
+                        },
+                    ]
+                },
+                connection_order=0,
+                namespace_order={"alpha": 0},
+            ),
+            self._recall_source(
+                {
+                    "records": [
+                        {
+                            "kind": "synthesis",
+                            "value": "beta synthesis body",
+                            "source_locators": second_sources,
+                        },
+                        {
+                            "kind": "synthesis",
+                            "value": "shared synthesis body",
+                            "source_locators": second_sources,
+                        },
+                    ]
+                },
+                connection_order=1,
+                namespace_order={"beta": 0},
+            ),
+        ]
+        merged = merge(sources)
+        self.assertEqual(
+            [item["value"] for item in merged],
+            [
+                "alpha synthesis body",
+                "shared synthesis body",
+                "beta synthesis body",
+            ],
+        )
+        self.assertEqual(merged[0]["source_locators"], first_sources)
+        self.assertEqual(merged[1]["source_locators"], first_sources)
+        self.assertEqual(merged[2]["source_locators"], second_sources)
+        empty = merge(
+            [
+                self._recall_source(
+                    {
+                        "records": [
+                            {"kind": "synthesis", "value": ""},
+                            {"kind": "synthesis", "value": "   "},
+                        ]
+                    },
+                    connection_order=0,
+                    namespace_order={},
+                )
+            ]
+        )
+        self.assertEqual(len(empty), 2)
 
     def test_recall_merge_orders_globally_and_caps_four(self) -> None:
         merge = getattr(_MODULE, "merge_recall_items", None)
@@ -306,24 +459,33 @@ class MemoryPolicyTests(unittest.TestCase):
         sources = [
             self._recall_source(
                 {
-                    "results": [
+                    "records": [
                         {
-                            "title": "connection-one",
-                            "namespace": "beta",
-                            "content": "one",
-                            "score": 0.5,
+                            "kind": "document",
+                            "value": {
+                                "title": "connection-one",
+                                "namespace": "beta",
+                                "content": "one",
+                                "score": 0.5,
+                            },
                         },
                         {
-                            "title": "namespace-first",
-                            "namespace": "alpha",
-                            "content": "two",
-                            "score": 0.5,
+                            "kind": "document",
+                            "value": {
+                                "title": "namespace-first",
+                                "namespace": "alpha",
+                                "content": "two",
+                                "score": 0.5,
+                            },
                         },
                         {
-                            "title": "namespace-first-second-result",
-                            "namespace": "alpha",
-                            "content": "three",
-                            "score": 0.5,
+                            "kind": "document",
+                            "value": {
+                                "title": "namespace-first-second-result",
+                                "namespace": "alpha",
+                                "content": "three",
+                                "score": 0.5,
+                            },
                         },
                     ]
                 },
@@ -332,18 +494,24 @@ class MemoryPolicyTests(unittest.TestCase):
             ),
             self._recall_source(
                 {
-                    "results": [
+                    "records": [
                         {
-                            "title": "highest",
-                            "namespace": "gamma",
-                            "content": "four",
-                            "score": 0.99,
+                            "kind": "document",
+                            "value": {
+                                "title": "highest",
+                                "namespace": "gamma",
+                                "content": "four",
+                                "score": 0.99,
+                            },
                         },
                         {
-                            "title": "connection-zero",
-                            "namespace": "gamma",
-                            "content": "five",
-                            "score": 0.5,
+                            "kind": "document",
+                            "value": {
+                                "title": "connection-zero",
+                                "namespace": "gamma",
+                                "content": "five",
+                                "score": 0.5,
+                            },
                         },
                     ]
                 },
@@ -355,7 +523,7 @@ class MemoryPolicyTests(unittest.TestCase):
         merged = merge(sources)
 
         self.assertEqual(
-            [item["title"] for item in merged],
+            [item["value"]["title"] for item in merged],
             [
                 "highest",
                 "connection-zero",
@@ -371,26 +539,38 @@ class MemoryPolicyTests(unittest.TestCase):
         merge = _MODULE.merge_recall_items
         source = self._recall_source(
             {
-                "results": [
+                "records": [
                     {
-                        "title": "huge",
-                        "content": "huge numeric result",
-                        "score": 10**10_000,
+                        "kind": "document",
+                        "value": {
+                            "title": "huge",
+                            "content": "huge numeric result",
+                            "score": 10**10_000,
+                        },
                     },
                     {
-                        "title": "infinite",
-                        "content": "infinite numeric result",
-                        "score": float("inf"),
+                        "kind": "document",
+                        "value": {
+                            "title": "infinite",
+                            "content": "infinite numeric result",
+                            "score": float("inf"),
+                        },
                     },
                     {
-                        "title": "nan",
-                        "content": "not a number result",
-                        "score": float("nan"),
+                        "kind": "document",
+                        "value": {
+                            "title": "nan",
+                            "content": "not a number result",
+                            "score": float("nan"),
+                        },
                     },
                     {
-                        "title": "valid",
-                        "content": "valid scored result",
-                        "score": 0.9,
+                        "kind": "document",
+                        "value": {
+                            "title": "valid",
+                            "content": "valid scored result",
+                            "score": 0.9,
+                        },
                     },
                 ]
             },
@@ -400,9 +580,9 @@ class MemoryPolicyTests(unittest.TestCase):
 
         merged = merge([source])
 
-        self.assertEqual(merged[0]["title"], "valid")
+        self.assertEqual(merged[0]["value"]["title"], "valid")
         self.assertEqual(
-            {item["title"] for item in merged},
+            {item["value"]["title"] for item in merged},
             {"huge", "infinite", "nan", "valid"},
         )
 
@@ -425,12 +605,15 @@ class MemoryPolicyTests(unittest.TestCase):
 
         malformed_item_source = self._recall_source(
             {
-                "results": [
+                "records": [
                     ExplodingMapping(),
                     {
-                        "title": "same source valid",
-                        "content": "usable result after malformed item",
-                        "score": 0.8,
+                        "kind": "document",
+                        "value": {
+                            "title": "same source valid",
+                            "content": "usable result after malformed item",
+                            "score": 0.8,
+                        },
                     },
                 ]
             },
@@ -444,11 +627,14 @@ class MemoryPolicyTests(unittest.TestCase):
         )
         valid_source = self._recall_source(
             {
-                "results": [
+                "records": [
                     {
-                        "title": "other source valid",
-                        "content": "usable result from another source",
-                        "score": 0.9,
+                        "kind": "document",
+                        "value": {
+                            "title": "other source valid",
+                            "content": "usable result from another source",
+                            "score": 0.9,
+                        },
                     }
                 ]
             },
@@ -461,32 +647,42 @@ class MemoryPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [item["title"] for item in merged],
+            [item["value"]["title"] for item in merged],
             ["other source valid", "same source valid"],
         )
 
     def test_recall_normalization_preserves_grouped_fact_rendering(self) -> None:
         normalized = _MODULE.normalize_recall_items(
             {
-                "facts": [
+                "records": [
                     {
-                        "fact_type": "preference",
-                        "content": "Prefers concise answers.",
+                        "kind": "fact",
+                        "value": {
+                            "fact_type": "preference",
+                            "content": "Prefers concise answers.",
+                            "score": 0.8,
+                        },
                     },
                     {
-                        "fact_type": "decision",
-                        "content": "Uses the stable deployment path.",
+                        "kind": "fact",
+                        "value": {
+                            "fact_type": "decision",
+                            "content": "Uses the stable deployment path.",
+                            "score": 0.7,
+                        },
                     },
                 ]
             }
         )
 
-        self.assertEqual(len(normalized), 1)
-        self.assertEqual(normalized[0]["title"], "Relevant facts")
-        self.assertIn("Prefers concise answers.", normalized[0]["content"])
-        self.assertIn(
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual(
+            normalized[0]["value"]["content"],
+            "Prefers concise answers.",
+        )
+        self.assertEqual(
+            normalized[1]["value"]["content"],
             "Uses the stable deployment path.",
-            normalized[0]["content"],
         )
 
     def test_capture_levels_are_predictable(self) -> None:
