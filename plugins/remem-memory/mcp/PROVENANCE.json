@@ -16,6 +16,7 @@
     "Validate document and entity identifiers as canonical UUIDs before constructing API paths.",
     "Delegate omitted read and write namespaces to the selected API key instead of injecting a plugin default.",
     "Retry only the audited transient matrix with stable requests and return fixed status/kind errors without response bodies.",
-    "Reject explicit empty or whitespace-only namespace intent instead of broadening it to server-default or all-readable scope."
+    "Reject explicit empty or whitespace-only namespace intent instead of broadening it to server-default or all-readable scope.",
+    "Return ordinary remem_query and remem_search results as one canonical untrusted retrieval envelope instead of raw JSON or flattened search text."
   ]
 }
