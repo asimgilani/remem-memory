@@ -195,6 +195,14 @@ def is_off_record(text: str) -> bool:
     return bool(_OFF_RECORD.search(text))
 
 
+def is_credential_field_name(key: str) -> bool:
+    """Return whether a mapping key uses a credential field name."""
+
+    if not isinstance(key, str):
+        return False
+    return _credential_field_name(key)
+
+
 def _credential_field_name(key: str) -> bool:
     normalized = key.strip().lower().replace("-", "_")
     if normalized in _CREDENTIAL_FIELD_NAMES:
@@ -774,6 +782,7 @@ __all__ = [
     "contains_explicit_secret",
     "contains_secret",
     "evaluate_automatic_capture",
+    "is_credential_field_name",
     "is_off_record",
     "merge_recall_items",
     "normalize_recall_items",
