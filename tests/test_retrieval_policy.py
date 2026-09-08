@@ -133,10 +133,42 @@ class RetrievalPolicyTests(unittest.TestCase):
             "scan-before-clip-secret-prefix",
             "scan-before-clip-off-record-prefix",
             "mixed-redaction-and-string-clip",
+            "declared-high-entropy-uuid-locator-kept-identical-prose-redacted",
+            "malformed-locator-rejected",
+            "uppercase-locator-rejected",
+            "empty-locator-string-rejected",
+            "truncated-locator-rejected",
+            "secret-bearing-locator-rejected",
+            "extra-id-key-locator-rejected",
+            "related-fact-id-at-record-locator-rejected",
+            "generated-turn-id-not-a-locator",
+            "null-locator-object-absent",
+            "null-fact-id-locator-rejected",
+            "null-source-document-id-locator-rejected",
+            "null-related-fact-id-locator-rejected",
+            "incomplete-record-locator-rejected",
+            "required-locator-set-kept-with-null-value-and-no-locator-neighbor",
+            "sensitive-source-document-id-locator-denied-keeps-neighbor",
+            "sensitive-related-fact-id-locator-denied-keeps-parent-locators",
+            "off-record-after-long-prefix-drops-record-and-locators",
+            "nested-relationship-locators-stay-with-relationship",
         ):
             self.assertIn(required, categories)
+        self.assertEqual(
+            fixture["errors"]["invalid_locators"],
+            "invalid retrieval locators",
+        )
         self.assertIn(
             "shared-references-checked-in-each-field-context",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "locator-exact-budget-and-one-byte-short",
+            fixture["python_only"],
+        )
+        self.assertIn("locator-all-or-nothing-ids", fixture["python_only"])
+        self.assertIn(
+            "relationship-locator-association-under-truncation",
             fixture["python_only"],
         )
 
@@ -429,6 +461,500 @@ class RetrievalPolicyTests(unittest.TestCase):
             result["records"][0],
             {"kind": "document", "value": {"title": "plain"}},
         )
+
+    def test_wrapper_id_keys_are_not_locators(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        related_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        records = [
+            {
+                "kind": "fact",
+                "value": {"title": "plain"},
+                "id": fact_id,
+                "source_document_id": document_id,
+                "related_fact_id": related_id,
+                "entity_id": related_id,
+                "trust": "trusted",
+                "access_mode": "raw",
+            }
+        ]
+        original = copy.deepcopy(records)
+        result = _RP.build_retrieval_envelope(
+            records,
+            origin="openclaw_tool",
+        )
+        self.assertEqual(records, original)
+        self.assertEqual(result["trust"], "untrusted_source")
+        self.assertEqual(result["access_mode"], "ordinary")
+        self.assertEqual(
+            result["records"][0],
+            {"kind": "fact", "value": {"title": "plain"}},
+        )
+        serialized = _dumps(result)
+        self.assertNotIn(fact_id, serialized)
+        self.assertNotIn(document_id, serialized)
+        self.assertNotIn(related_id, serialized)
+        self.assertNotIn("locators", serialized)
+
+    def test_empty_locator_object_is_absent(self) -> None:
+        records = [
+            {
+                "kind": "fact",
+                "value": {"title": "plain"},
+                "locators": {},
+            }
+        ]
+        result = _RP.build_retrieval_envelope(
+            records,
+            origin="python_hook",
+        )
+        self.assertEqual(
+            result["records"][0],
+            {"kind": "fact", "value": {"title": "plain"}},
+        )
+        self.assertNotIn("locators", _dumps(result["records"][0]))
+
+    def test_fact_id_on_relationship_locator_is_rejected(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        records = [
+            {
+                "kind": "fact",
+                "value": {"content": "REL-ROLE-CANARY"},
+                "relationships": [
+                    {
+                        "value": {"rel_type": "updates"},
+                        "locators": {"fact_id": fact_id},
+                    }
+                ],
+            }
+        ]
+        original = copy.deepcopy(records)
+        with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+            _RP.build_retrieval_envelope(records, origin="python_hook")
+        message = str(ctx.exception)
+        self.assertEqual(message, "invalid retrieval locators")
+        self.assertNotIn(fact_id, message)
+        self.assertNotIn("REL-ROLE-CANARY", message)
+        self.assertEqual(records, original)
+
+    def test_locator_list_is_rejected_without_reflecting_content(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        records = [
+            {
+                "kind": "fact",
+                "value": {"content": "LIST-LOCATOR-CANARY"},
+                "locators": [fact_id],
+            }
+        ]
+        with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+            _RP.build_retrieval_envelope(records, origin="python_cli")
+        message = str(ctx.exception)
+        self.assertEqual(message, "invalid retrieval locators")
+        self.assertNotIn(fact_id, message)
+        self.assertNotIn("LIST-LOCATOR-CANARY", message)
+
+    def test_locator_exact_budget_and_one_byte_short(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        records = [
+            {
+                "kind": "fact",
+                "value": {"title": "alpha-neighbor", "body": "bravo"},
+                "locators": {
+                    "fact_id": fact_id,
+                    "source_document_id": document_id,
+                },
+            }
+        ]
+        full = _RP.build_retrieval_envelope(records, origin="python_cli")
+        size = _utf8_size(full)
+        exact = _RP.build_retrieval_envelope(
+            records,
+            origin="python_cli",
+            budget=size,
+        )
+        self.assertEqual(exact, full)
+        self.assertFalse(exact["truncation"]["truncated"])
+        self.assertEqual(
+            exact["records"][0]["locators"],
+            {"fact_id": fact_id, "source_document_id": document_id},
+        )
+        tight = _RP.build_retrieval_envelope(
+            records,
+            origin="python_cli",
+            budget=size - 1,
+        )
+        self.assertTrue(tight["truncation"]["truncated"])
+        self.assertEqual(tight["continuation"], {"kind": "narrow_query"})
+        self.assertLessEqual(_utf8_size(tight), size - 1)
+        json.loads(_dumps(tight))
+        self._assert_atomic_locators(
+            tight,
+            {"fact_id": fact_id, "source_document_id": document_id},
+        )
+        self.assertNotIn("alpha-neighbor", _diagnostics(tight))
+
+    def test_locator_all_or_nothing_ids(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        required = {"fact_id": fact_id, "source_document_id": document_id}
+        records = [
+            {
+                "kind": "fact",
+                "value": {"body": "n" * 180},
+                "locators": required,
+            }
+        ]
+        full = _RP.build_retrieval_envelope(records, origin="python_hook")
+        full_size = _utf8_size(full)
+        for budget in range(1, full_size + 1):
+            try:
+                result = _RP.build_retrieval_envelope(
+                    records,
+                    origin="python_hook",
+                    budget=budget,
+                )
+            except _RP.RetrievalEnvelopeError as exc:
+                self.assertEqual(
+                    str(exc),
+                    "retrieval budget below minimum envelope",
+                )
+                continue
+            self.assertLessEqual(_utf8_size(result), budget)
+            self._assert_atomic_locators(result, required)
+
+    def test_relationship_locator_association_under_truncation(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        related_a = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        related_b = "0fedcba9-8765-4321-0fed-cba987654321"
+        first_content = "first-related-" + ("c" * 360)
+        records = [
+            {
+                "kind": "fact",
+                "value": {"content": "parent fact"},
+                "locators": {
+                    "fact_id": fact_id,
+                    "source_document_id": document_id,
+                },
+                "relationships": [
+                    {
+                        "value": {
+                            "rel_type": "updates",
+                            "related_fact_content": first_content,
+                        },
+                        "locators": {"related_fact_id": related_a},
+                    },
+                    {
+                        "value": {
+                            "rel_type": "extends",
+                            "related_fact_content": "second related",
+                        },
+                        "locators": {"related_fact_id": related_b},
+                    },
+                ],
+            }
+        ]
+        full = _RP.build_retrieval_envelope(records, origin="python_hook")
+        full_size = _utf8_size(full)
+        required = {"fact_id": fact_id, "source_document_id": document_id}
+        for budget in range(1, full_size + 1):
+            try:
+                result = _RP.build_retrieval_envelope(
+                    records,
+                    origin="python_hook",
+                    budget=budget,
+                )
+            except _RP.RetrievalEnvelopeError as exc:
+                self.assertEqual(
+                    str(exc),
+                    "retrieval budget below minimum envelope",
+                )
+                continue
+            self.assertLessEqual(_utf8_size(result), budget)
+            self._assert_atomic_locators(result, required)
+            serialized = _dumps(result)
+            for record in result["records"]:
+                relationships = record.get("relationships") or []
+                ids = []
+                for relationship in relationships:
+                    locators = relationship.get("locators")
+                    self.assertIsInstance(locators, dict)
+                    self.assertEqual(set(locators), {"related_fact_id"})
+                    related_id = locators["related_fact_id"]
+                    self.assertIn(related_id, {related_a, related_b})
+                    self.assertRegex(
+                        related_id,
+                        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    )
+                    ids.append(related_id)
+                    value = relationship.get("value")
+                    content = ""
+                    if type(value) is dict:
+                        raw = value.get("related_fact_content")
+                        if type(raw) is str:
+                            content = raw
+                    if related_id == related_a:
+                        self.assertNotEqual(content, "second related")
+                    if related_id == related_b:
+                        self.assertNotIn("first-related-", content)
+                if related_a in ids and related_b in ids:
+                    self.assertEqual(ids, [related_a, related_b])
+                if related_a not in ids:
+                    self.assertNotIn(related_a, serialized)
+                if related_b not in ids:
+                    self.assertNotIn(related_b, serialized)
+
+    def test_null_required_locator_roles_are_rejected(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        related_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        cases = [
+            (
+                "NULL-FACT-CANARY",
+                {
+                    "kind": "fact",
+                    "value": {"content": "NULL-FACT-CANARY", "valid_until": None},
+                    "locators": {
+                        "fact_id": None,
+                        "source_document_id": document_id,
+                    },
+                },
+            ),
+            (
+                "NULL-DOC-CANARY",
+                {
+                    "kind": "fact",
+                    "value": {"content": "NULL-DOC-CANARY", "valid_until": None},
+                    "locators": {
+                        "fact_id": fact_id,
+                        "source_document_id": None,
+                    },
+                },
+            ),
+            (
+                "NULL-REL-CANARY",
+                {
+                    "kind": "fact",
+                    "value": {"content": "NULL-REL-CANARY", "valid_until": None},
+                    "locators": {
+                        "fact_id": fact_id,
+                        "source_document_id": document_id,
+                    },
+                    "relationships": [
+                        {
+                            "value": {"rel_type": "updates"},
+                            "locators": {"related_fact_id": None},
+                        }
+                    ],
+                },
+            ),
+        ]
+        for canary, record in cases:
+            with self.subTest(canary=canary):
+                records = [record]
+                original = copy.deepcopy(records)
+                with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+                    _RP.build_retrieval_envelope(records, origin="python_hook")
+                message = str(ctx.exception)
+                self.assertEqual(message, "invalid retrieval locators")
+                self.assertNotIn(fact_id, message)
+                self.assertNotIn(document_id, message)
+                self.assertNotIn(related_id, message)
+                self.assertNotIn(canary, message)
+                self.assertEqual(records, original)
+
+    def test_incomplete_required_locator_set_is_rejected(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        for locators, canary in (
+            ({"fact_id": fact_id}, "INCOMPLETE-FACT-CANARY"),
+            ({"source_document_id": document_id}, "INCOMPLETE-DOC-CANARY"),
+        ):
+            with self.subTest(canary=canary):
+                records = [
+                    {
+                        "kind": "fact",
+                        "value": {"content": canary},
+                        "locators": locators,
+                    }
+                ]
+                original = copy.deepcopy(records)
+                with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+                    _RP.build_retrieval_envelope(records, origin="python_cli")
+                message = str(ctx.exception)
+                self.assertEqual(message, "invalid retrieval locators")
+                self.assertNotIn(fact_id, message)
+                self.assertNotIn(document_id, message)
+                self.assertNotIn(canary, message)
+                self.assertEqual(records, original)
+
+    def test_no_locator_paths_remain_optional(self) -> None:
+        variants: list[object] = ["missing", None, {}]
+        for locators_key in variants:
+            with self.subTest(locators=locators_key):
+                record: dict[str, object] = {
+                    "kind": "fact",
+                    "value": {"title": "plain", "valid_until": None},
+                }
+                if locators_key != "missing":
+                    record["locators"] = locators_key
+                records = [record]
+                original = copy.deepcopy(records)
+                result = _RP.build_retrieval_envelope(
+                    records,
+                    origin="python_hook",
+                )
+                self.assertEqual(records, original)
+                self.assertEqual(
+                    result["records"][0],
+                    {
+                        "kind": "fact",
+                        "value": {"title": "plain", "valid_until": None},
+                    },
+                )
+                self.assertNotIn("locators", _dumps(result["records"][0]))
+
+    def test_sensitive_fields_apply_to_declared_locator_roles(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        value_document_id = "11111111-2222-3333-4444-555555555555"
+        related_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        value_related_id = "99999999-8888-7777-6666-555555555555"
+        denied_top = _RP.build_retrieval_envelope(
+            [
+                {
+                    "kind": "fact",
+                    "value": {
+                        "title": "denied-locator-owner",
+                        "content": "DENIED-TOP-CANARY",
+                    },
+                    "locators": {
+                        "fact_id": fact_id,
+                        "source_document_id": document_id,
+                    },
+                },
+                {
+                    "kind": "fact",
+                    "value": {
+                        "title": "safe neighbor",
+                        "source_document_id": value_document_id,
+                        "notes": "kept notes",
+                    },
+                },
+            ],
+            origin="python_hook",
+            sensitive_fields=["source-document-id"],
+        )
+        serialized_top = _dumps(denied_top)
+        self.assertEqual(denied_top["trust"], "untrusted_source")
+        self.assertEqual(denied_top["access_mode"], "ordinary")
+        self.assertEqual(
+            denied_top["records"],
+            [
+                {
+                    "kind": "fact",
+                    "value": {"title": "safe neighbor", "notes": "kept notes"},
+                }
+            ],
+        )
+        self.assertEqual(
+            denied_top["redaction"],
+            {"fields": 2, "values": 0, "records": 0},
+        )
+        self.assertNotIn(fact_id, serialized_top)
+        self.assertNotIn(document_id, serialized_top)
+        self.assertNotIn(value_document_id, serialized_top)
+        self.assertNotIn("DENIED-TOP-CANARY", serialized_top)
+        self.assertNotIn("denied-locator-owner", serialized_top)
+        self.assertNotIn(fact_id, _diagnostics(denied_top))
+        self.assertNotIn(document_id, _diagnostics(denied_top))
+
+        denied_rel = _RP.build_retrieval_envelope(
+            [
+                {
+                    "kind": "fact",
+                    "value": {
+                        "content": "parent fact",
+                        "related_fact_id": value_related_id,
+                        "title": "kept parent",
+                    },
+                    "locators": {
+                        "fact_id": fact_id,
+                        "source_document_id": document_id,
+                    },
+                    "relationships": [
+                        {
+                            "value": {
+                                "rel_type": "updates",
+                                "related_fact_content": "DENIED-REL-CANARY",
+                            },
+                            "locators": {"related_fact_id": related_id},
+                        },
+                        {
+                            "value": {
+                                "rel_type": "extends",
+                                "related_fact_content": "kept related",
+                            },
+                        },
+                    ],
+                }
+            ],
+            origin="python_cli",
+            sensitive_fields=["related_fact_id"],
+        )
+        serialized_rel = _dumps(denied_rel)
+        self.assertEqual(denied_rel["trust"], "untrusted_source")
+        self.assertEqual(denied_rel["access_mode"], "ordinary")
+        self.assertEqual(
+            denied_rel["records"][0]["locators"],
+            {"fact_id": fact_id, "source_document_id": document_id},
+        )
+        self.assertEqual(
+            denied_rel["records"][0]["value"],
+            {"content": "parent fact", "title": "kept parent"},
+        )
+        self.assertEqual(
+            denied_rel["records"][0]["relationships"],
+            [
+                {
+                    "value": {
+                        "rel_type": "extends",
+                        "related_fact_content": "kept related",
+                    }
+                }
+            ],
+        )
+        self.assertEqual(
+            denied_rel["redaction"],
+            {"fields": 2, "values": 0, "records": 0},
+        )
+        self.assertNotIn(related_id, serialized_rel)
+        self.assertNotIn(value_related_id, serialized_rel)
+        self.assertNotIn("DENIED-REL-CANARY", serialized_rel)
+        self.assertIn(fact_id, serialized_rel)
+        self.assertIn(document_id, serialized_rel)
+        self.assertNotIn(related_id, _diagnostics(denied_rel))
+        self.assertNotIn(value_related_id, _diagnostics(denied_rel))
+
+    def _assert_atomic_locators(
+        self,
+        result: dict,
+        required: dict[str, str],
+    ) -> None:
+        serialized = _dumps(result)
+        for record in result["records"]:
+            locators = record.get("locators")
+            self.assertEqual(locators, required)
+            for value in locators.values():
+                self.assertRegex(
+                    value,
+                    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                )
+                self.assertNotEqual(value, "")
+        if not result["records"]:
+            for value in required.values():
+                self.assertNotIn(value, serialized)
 
 
 if __name__ == "__main__":
