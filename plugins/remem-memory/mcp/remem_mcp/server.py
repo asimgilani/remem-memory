@@ -615,13 +615,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "/v1/query",
                 json_body=payload,
             )
-            synthesis = data.get("synthesis")
-            if synthesis:
-                sources = data.get("sources") or []
-                sources_text = "\n".join(str(s) for s in sources) if sources else "(none)"
-                text = f"{synthesis}\n\n**Sources:**\n{sources_text}"
-                return [TextContent(type="text", text=_truncate_response(text))]
-            return [TextContent(type="text", text="No synthesis returned.")]
+            try:
+                text = _RETRIEVAL_ADAPTER.serialize_summarize_response(data)
+            except _ADAPTER_ERROR as exc:
+                return [TextContent(type="text", text=str(exc))]
+            return [TextContent(type="text", text=text)]
 
         if name == "remem_get_document":
             document_id = _canonical_resource_id(
@@ -668,21 +666,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             _inject_namespaces_post(payload, _resolve_read_namespaces(arguments))
 
             data = await _request("POST", "/v1/query", json_body=payload)
-
-            facts = data.get("facts", [])
-            if not facts:
-                return [TextContent(type="text", text="No facts found.")]
-
-            lines = []
-            for f in facts:
-                line = f"- [{f.get('fact_type', 'fact')}] {f.get('content', '')}"
-                if f.get("confidence"):
-                    line += f" (confidence: {f['confidence']:.1f})"
-                if f.get("entities"):
-                    line += f" | entities: {', '.join(f['entities'])}"
-                lines.append(line)
-
-            return [TextContent(type="text", text=_truncate_response("\n".join(lines)))]
+            try:
+                text = _RETRIEVAL_ADAPTER.serialize_memory_query_response(data)
+            except _ADAPTER_ERROR as exc:
+                return [TextContent(type="text", text=str(exc))]
+            return [TextContent(type="text", text=text)]
 
         if name == "remem_list_entities":
             params: dict[str, Any] = {

@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Map MCP query/search responses onto the ordinary retrieval envelope."""
+"""Map MCP query, search, summarize, and memory_query onto the ordinary envelope."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
 ORIGIN = "python_mcp"
 _ERROR = "invalid retrieval response"
 _JSON_SEPARATORS = (", ", ": ")
+_CANONICAL_UUID = re.compile(
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+_FACT_DROPPED = frozenset({"id", "source_document_id", "relationships"})
+_RELATIONSHIP_DROPPED = frozenset({"related_fact_id"})
 
 
 class RetrievalAdapterError(ValueError):
-    """Fixed bounded failure for MCP query/search envelope mapping."""
+    """Fixed bounded failure for MCP retrieval envelope mapping."""
 
 
 def _sibling_path(name: str) -> Path:
@@ -74,6 +80,26 @@ def serialize_search_response(
     return _serialize(_search_records(response), budget)
 
 
+def serialize_summarize_response(
+    response: object,
+    *,
+    budget: object = DEFAULT_OUTPUT_BUDGET,
+) -> str:
+    """Serialize selected query synthesis as one ordinary python_mcp envelope."""
+
+    return _serialize(_summarize_records(response), budget)
+
+
+def serialize_memory_query_response(
+    response: object,
+    *,
+    budget: object = DEFAULT_OUTPUT_BUDGET,
+) -> str:
+    """Serialize selected query facts as one ordinary python_mcp envelope."""
+
+    return _serialize(_memory_query_records(response), budget)
+
+
 def _serialize(records: list[dict[str, object]], budget: object) -> str:
     try:
         envelope = _retrieval_policy.build_retrieval_envelope(
@@ -112,6 +138,89 @@ def _search_records(response: object) -> list[dict[str, object]]:
         {"kind": "document", "value": item}
         for item in _collection(data, "results")
     ]
+
+
+def _summarize_records(response: object) -> list[dict[str, object]]:
+    data = _require_mapping(response)
+    if "synthesis" not in data or data["synthesis"] is None:
+        return []
+    text = data["synthesis"]
+    if type(text) is not str:
+        raise RetrievalAdapterError(_ERROR)
+    record: dict[str, object] = {"kind": "synthesis", "value": text}
+    source_locators = _source_locators(data)
+    if source_locators:
+        record["source_locators"] = source_locators
+    return [record]
+
+
+def _memory_query_records(response: object) -> list[dict[str, object]]:
+    data = _require_mapping(response)
+    return [_fact_record(item) for item in _optional_collection(data, "facts")]
+
+
+def _source_locators(data: dict[str, object]) -> list[dict[str, str]] | None:
+    if "sources" not in data:
+        return None
+    raw = data["sources"]
+    if raw is None:
+        raise RetrievalAdapterError(_ERROR)
+    members = _string_list(raw)
+    if not members:
+        return None
+    return [{"source_document_id": _canonical_uuid(item)} for item in members]
+
+
+def _fact_record(item: dict[str, object]) -> dict[str, object]:
+    if "id" not in item or "source_document_id" not in item:
+        raise RetrievalAdapterError(_ERROR)
+    locators = {
+        "fact_id": _canonical_uuid(item["id"]),
+        "source_document_id": _canonical_uuid(item["source_document_id"]),
+    }
+    relationships = None
+    if "relationships" in item:
+        relationships = _relationship_records(item["relationships"])
+    record: dict[str, object] = {
+        "kind": "fact",
+        "value": _mapping_without(item, _FACT_DROPPED),
+        "locators": locators,
+    }
+    if relationships:
+        record["relationships"] = relationships
+    return record
+
+
+def _relationship_records(value: object) -> list[dict[str, object]] | None:
+    members = _object_list(value)
+    if not members:
+        return None
+    relationships: list[dict[str, object]] = []
+    for item in members:
+        if "related_fact_id" not in item:
+            raise RetrievalAdapterError(_ERROR)
+        relationships.append(
+            {
+                "value": _mapping_without(item, _RELATIONSHIP_DROPPED),
+                "locators": {
+                    "related_fact_id": _canonical_uuid(item["related_fact_id"]),
+                },
+            }
+        )
+    return relationships
+
+
+def _mapping_without(
+    item: dict[str, object],
+    dropped: frozenset[str],
+) -> dict[str, object]:
+    return {key: value for key, value in item.items() if key not in dropped}
+
+
+def _canonical_uuid(value: object) -> str:
+    if type(value) is not str or _CANONICAL_UUID.fullmatch(value) is None:
+        raise RetrievalAdapterError(_ERROR)
+    return value
 
 
 def _synthesis_value(data: dict[str, object]) -> dict[str, object]:
@@ -178,6 +287,8 @@ __all__ = [
     "DEFAULT_OUTPUT_BUDGET",
     "ORIGIN",
     "RetrievalAdapterError",
+    "serialize_memory_query_response",
     "serialize_query_response",
     "serialize_search_response",
+    "serialize_summarize_response",
 ]
