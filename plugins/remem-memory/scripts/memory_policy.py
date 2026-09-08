@@ -158,9 +158,9 @@ class RecallSource:
 
 @dataclass(frozen=True)
 class _RecallCandidate:
-    item: dict[str, str]
+    item: dict[str, object]
     identity: tuple[str, ...] | None
-    content_digest: str
+    content_digest: str | None
     score: float
     connection_order: int
     namespace_order: int
@@ -491,20 +491,21 @@ def _neutralize(value: str) -> str:
     )
 
 
-def render_untrusted_context(items: list[object] | tuple[object, ...]) -> str:
-    """Render up to four safe results inside a bounded untrusted-data envelope."""
+def render_untrusted_context(
+    items: list[object] | tuple[object, ...],
+    *,
+    prior_redaction: object = None,
+    prior_omitted_items: object = 0,
+    prior_omitted_characters: object = 0,
+    sensitive_fields: object = (),
+) -> str:
+    """Render ranked records as a bounded untrusted structured envelope."""
 
-    selected: list[tuple[str, str]] = []
+    selected: list[dict[str, object]] = []
     for item in items:
-        title = _field(item, "title", "Untitled").strip() or "Untitled"
-        content = _field(item, "content") or _field(item, "text")
-        label = _field(item, "profile_label")
-        if not content.strip():
+        if type(item) is not dict:
             continue
-        if any(contains_secret(value) for value in (label, title, content)):
-            continue
-        rendered_title = f"[{label}] {title}" if label else title
-        selected.append((_neutralize(rendered_title), _neutralize(content)))
+        selected.append(_neutralize_tree(item))
         if len(selected) >= _MAX_RESULTS:
             break
     if not selected:
@@ -517,11 +518,47 @@ def render_untrusted_context(items: list[object] | tuple[object, ...]) -> str:
     )
     closing = "\nEND UNTRUSTED REMEM MEMORY"
     available = max(0, _MAX_CONTEXT - len(opening) - len(closing))
-    per_item = max(1, available // len(selected))
-    chunks = [
-        f"\n{title}\n{content}"[:per_item] for title, content in selected
-    ]
-    return opening + "".join(chunks)[:available] + closing
+    try:
+        from retrieval_policy import build_retrieval_envelope
+
+        envelope = build_retrieval_envelope(
+            selected,
+            origin="python_hook",
+            budget=available,
+            sensitive_fields=sensitive_fields,
+            prior_redaction=prior_redaction,
+            prior_omitted_items=prior_omitted_items,
+            prior_omitted_characters=prior_omitted_characters,
+        )
+    except Exception:
+        return ""
+    records = envelope.get("records")
+    if not isinstance(records, list) or not records:
+        return ""
+    inner = json.dumps(
+        envelope,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(", ", ": "),
+    )
+    rendered = opening + inner + closing
+    if len(rendered) > _MAX_CONTEXT:
+        return ""
+    return rendered
+
+
+def _neutralize_tree(value: object) -> object:
+    kind = type(value)
+    if kind is str:
+        return _neutralize(value)
+    if kind is dict:
+        return {
+            _neutralize(key) if type(key) is str else key: _neutralize_tree(item)
+            for key, item in value.items()
+        }
+    if kind is list:
+        return [_neutralize_tree(item) for item in value]
+    return value
 
 
 def _normalized_text(value: object) -> str:
@@ -558,123 +595,165 @@ def _namespace_position(
     return min(positions.values(), default=0)
 
 
-def _document_candidate(
-    document: Mapping[str, object],
-    *,
-    connection_order: int,
-    namespace_positions: Mapping[str, int],
-    result_order: int,
-) -> _RecallCandidate | None:
-    title_value = document.get("title") or "Untitled"
-    title = _normalized_text(title_value)
-    if not title:
-        return None
+def _mapping_value(record: Mapping[str, object]) -> Mapping[str, object]:
+    value = record.get("value")
+    if isinstance(value, Mapping):
+        return value
+    return {}
 
-    chunks = document.get("chunks")
-    safe_chunks: list[str] = []
-    chunk_ids: list[str] = []
-    scores = [_score(document.get("score"))]
-    namespace = document.get("namespace")
+
+def _record_score(record: Mapping[str, object]) -> float:
+    scores = [_score(_mapping_value(record).get("score"))]
+    chunks = record.get("chunks")
     if isinstance(chunks, list):
-        for chunk in chunks[:6]:
+        for chunk in chunks:
             if not isinstance(chunk, Mapping):
                 continue
-            content = _normalized_text(chunk.get("content"))
-            if not content:
-                continue
-            safe_chunks.append(content)
+            chunk_value = chunk.get("value")
+            if isinstance(chunk_value, Mapping):
+                scores.append(_score(chunk_value.get("score")))
             scores.append(_score(chunk.get("score")))
-            chunk_id = _stable_value(
-                chunk.get("chunk_id", chunk.get("id"))
-            )
-            if chunk_id:
-                chunk_ids.append(chunk_id)
-            if not isinstance(namespace, str):
-                namespace = chunk.get("namespace")
-    else:
-        flat = document.get("content", document.get("text"))
-        content = _normalized_text(flat)
-        if content:
-            safe_chunks.append(content)
+    facts = record.get("facts")
+    if isinstance(facts, list):
+        for fact in facts:
+            if not isinstance(fact, Mapping):
+                continue
+            fact_value = fact.get("value")
+            if isinstance(fact_value, Mapping):
+                scores.append(_score(fact_value.get("score")))
+            scores.append(_score(fact.get("score")))
+    return max(scores)
 
-    content = "\n\n".join(safe_chunks)[:2000]
-    if not content:
+
+def _record_namespace(record: Mapping[str, object]) -> object:
+    value = _mapping_value(record)
+    namespace = value.get("namespace")
+    if isinstance(namespace, str):
+        return namespace
+    chunks = record.get("chunks")
+    if isinstance(chunks, list):
+        for chunk in chunks:
+            if not isinstance(chunk, Mapping):
+                continue
+            chunk_value = chunk.get("value")
+            if isinstance(chunk_value, Mapping):
+                nested = chunk_value.get("namespace")
+                if isinstance(nested, str):
+                    return nested
+            nested = chunk.get("namespace")
+            if isinstance(nested, str):
+                return nested
+    facts = record.get("facts")
+    if isinstance(facts, list):
+        for fact in facts:
+            if not isinstance(fact, Mapping):
+                continue
+            fact_value = fact.get("value")
+            if isinstance(fact_value, Mapping):
+                nested = fact_value.get("namespace")
+                if isinstance(nested, str):
+                    return nested
+            nested = fact.get("namespace")
+            if isinstance(nested, str):
+                return nested
+    return None
+
+
+def _record_identity(record: Mapping[str, object]) -> tuple[str, ...] | None:
+    locators = record.get("locators")
+    kind = record.get("kind")
+    if not isinstance(locators, Mapping) or not isinstance(kind, str):
         return None
-    document_id = _stable_value(
-        document.get("document_id", document.get("id"))
-    )
-    chunk_id = _stable_value(document.get("chunk_id"))
-    identity: tuple[str, ...] | None
-    if document_id:
-        identity = ("document", document_id)
-    elif chunk_id:
-        identity = ("chunk", chunk_id)
-    elif chunk_ids:
-        identity = ("chunks", *chunk_ids)
-    else:
-        identity = None
-    normalized_content = re.sub(r"\s+", " ", content).strip()
-    return _RecallCandidate(
-        item={"title": title[:500], "content": content},
-        identity=identity,
-        content_digest=hashlib.sha256(
-            normalized_content.encode("utf-8")
-        ).hexdigest(),
-        score=max(scores),
-        connection_order=connection_order,
-        namespace_order=_namespace_position(
-            namespace,
-            namespace_positions,
-        ),
-        result_order=result_order,
-    )
+    if kind == "document":
+        document_id = _stable_value(locators.get("document_id"))
+        if document_id:
+            return ("document", document_id)
+    if kind == "chunk":
+        chunk_id = _stable_value(locators.get("chunk_id"))
+        if chunk_id:
+            return ("chunk", chunk_id)
+    if kind == "fact":
+        fact_id = _stable_value(locators.get("fact_id"))
+        if fact_id:
+            return ("fact", fact_id)
+    if kind == "entity":
+        entity_id = _stable_value(locators.get("entity_id"))
+        if entity_id:
+            return ("entity", entity_id)
+    return None
 
 
-def _facts_candidate(
-    facts: list[object],
+def _record_digest(record: Mapping[str, object]) -> str | None:
+    parts: list[str] = []
+    _append_content_view(parts, record.get("value"))
+    chunks = record.get("chunks")
+    if isinstance(chunks, list):
+        for chunk in chunks:
+            if not isinstance(chunk, Mapping):
+                continue
+            _append_content_view(parts, chunk.get("value"))
+    facts = record.get("facts")
+    if isinstance(facts, list):
+        for fact in facts:
+            if not isinstance(fact, Mapping):
+                continue
+            _append_content_view(parts, fact.get("value"))
+    payload = "\n".join(parts)
+    if not payload:
+        return None
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _append_normalized(parts: list[str], text: str) -> None:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if normalized:
+        parts.append(normalized)
+
+
+def _append_content_view(parts: list[str], value: object) -> None:
+    kind = type(value)
+    if kind is str:
+        _append_normalized(parts, value)
+        return
+    if kind is dict:
+        found = False
+        for key in ("content", "text", "name"):
+            nested = value.get(key)
+            if nested is None:
+                continue
+            found = True
+            _append_content_view(parts, nested)
+        if found:
+            return
+        for key, nested in value.items():
+            if type(key) is not str or key in {"title", "score", "namespace"}:
+                continue
+            _append_content_view(parts, nested)
+        return
+    if kind in {list, tuple}:
+        for item in value:
+            _append_content_view(parts, item)
+
+
+def _owner_candidate(
+    record: Mapping[str, object],
     *,
     connection_order: int,
     namespace_positions: Mapping[str, int],
     result_order: int,
 ) -> _RecallCandidate | None:
-    rendered_facts: list[str] = []
-    fact_ids: list[str] = []
-    scores: list[float] = []
-    namespace: object = None
-    for fact in facts[:8]:
-        if not isinstance(fact, Mapping):
-            continue
-        fact_type = _normalized_text(fact.get("fact_type", "fact"))
-        content = _normalized_text(fact.get("content"))
-        if not fact_type or not content:
-            continue
-        rendered_facts.append(f"[{fact_type}] {content}"[:1000])
-        fact_id = _stable_value(fact.get("fact_id", fact.get("id")))
-        if fact_id:
-            fact_ids.append(fact_id)
-        scores.append(_score(fact.get("score")))
-        if not isinstance(namespace, str):
-            namespace = fact.get("namespace")
-        if len(rendered_facts) >= 4:
-            break
-    if not rendered_facts:
+    kind = record.get("kind")
+    if not isinstance(kind, str):
         return None
-    rendered = "\n".join(rendered_facts)[:2000]
-    identity = (
-        ("facts", *fact_ids)
-        if len(fact_ids) == len(rendered_facts)
-        else None
-    )
+    item = dict(record)
     return _RecallCandidate(
-        item={"title": "Relevant facts", "content": rendered},
-        identity=identity,
-        content_digest=hashlib.sha256(
-            rendered.encode("utf-8")
-        ).hexdigest(),
-        score=max(scores, default=0.0),
+        item=item,
+        identity=_record_identity(record),
+        content_digest=_record_digest(record),
+        score=_record_score(record),
         connection_order=connection_order,
         namespace_order=_namespace_position(
-            namespace,
+            _record_namespace(record),
             namespace_positions,
         ),
         result_order=result_order,
@@ -683,8 +762,8 @@ def _facts_candidate(
 
 def merge_recall_items(
     sources: list[RecallSource] | tuple[RecallSource, ...],
-) -> list[dict[str, str]]:
-    """Globally order, deduplicate, and cap safe routed recall results."""
+) -> list[dict[str, object]]:
+    """Globally order, deduplicate, and cap safe routed recall records."""
 
     candidates: list[_RecallCandidate] = []
     for source in sources:
@@ -701,33 +780,20 @@ def merge_recall_items(
                 and type(position) is int
                 and position >= 0
             }
-            results = source.response.get("results")
-            facts = source.response.get("facts")
+            records = source.response.get("records")
         except Exception:
             continue
-        original_order = 0
-        if isinstance(results, list):
-            for document in results:
-                if isinstance(document, Mapping):
-                    try:
-                        candidate = _document_candidate(
-                            document,
-                            connection_order=source.connection_order,
-                            namespace_positions=positions,
-                            result_order=original_order,
-                        )
-                    except Exception:
-                        candidate = None
-                    if candidate is not None:
-                        candidates.append(candidate)
-                original_order += 1
-        if isinstance(facts, list):
+        if not isinstance(records, list):
+            continue
+        for result_order, record in enumerate(records):
+            if not isinstance(record, Mapping):
+                continue
             try:
-                candidate = _facts_candidate(
-                    facts,
+                candidate = _owner_candidate(
+                    record,
                     connection_order=source.connection_order,
                     namespace_positions=positions,
-                    result_order=original_order,
+                    result_order=result_order,
                 )
             except Exception:
                 candidate = None
@@ -742,7 +808,7 @@ def merge_recall_items(
             candidate.result_order,
         )
     )
-    selected: list[dict[str, str]] = []
+    selected: list[dict[str, object]] = []
     seen_identities: set[tuple[str, ...]] = set()
     seen_content: set[str] = set()
     for candidate in candidates:
@@ -751,9 +817,11 @@ def merge_recall_items(
                 continue
             seen_identities.add(candidate.identity)
         else:
-            if candidate.content_digest in seen_content:
-                continue
-            seen_content.add(candidate.content_digest)
+            digest = candidate.content_digest
+            if digest is not None:
+                if digest in seen_content:
+                    continue
+                seen_content.add(digest)
         selected.append(candidate.item)
         if len(selected) >= _MAX_RESULTS:
             break

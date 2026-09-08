@@ -34,6 +34,8 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
 import remem_api  # noqa: E402
 import remem_mcp_launcher  # noqa: E402
 import remem_routing  # noqa: E402
+import retrieval_adapter  # noqa: E402
+import retrieval_policy  # noqa: E402
 from memory_policy import RecallSource, merge_recall_items  # noqa: E402
 try:  # noqa: E402
     from scripts.remem_checkpoint import (
@@ -643,6 +645,13 @@ def _run_manual_routed_command(
         return 2
     if "--no-log" not in child_args:
         child_args.append("--no-log")
+    try:
+        extras = retrieval_adapter.sensitive_fields_from_environment(
+            child_environment,
+        )
+    except retrieval_adapter.RetrievalAdapterError:
+        print("error: invalid sensitive fields", file=sys.stderr)
+        return 2
     connection_order = {
         connection.id: position
         for position, connection in enumerate(config.connections)
@@ -653,9 +662,13 @@ def _run_manual_routed_command(
             (namespace_order, target)
         )
     sources: list[RecallSource] = []
-    payload: dict[str, Any] | None = None
     successful_children = 0
     failure_kinds: list[str] = []
+    prior_fields = 0
+    prior_values = 0
+    prior_records = 0
+    prior_omitted_items = 0
+    prior_omitted_characters = 0
     for connection_id, selected in sorted(
         grouped.items(),
         key=lambda item: connection_order.get(
@@ -732,28 +745,47 @@ def _run_manual_routed_command(
                     failure_kinds.append(matched.group(1))
             continue
         rendered = completed.stdout
-        if (
-            not isinstance(rendered, str)
-            or len(rendered.encode("utf-8"))
-            > _MAX_RECALL_CHILD_OUTPUT_BYTES
-        ):
-            continue
         try:
+            if not isinstance(rendered, str):
+                continue
+            encoded = rendered.encode("utf-8")
+            if len(encoded) > _MAX_RECALL_CHILD_OUTPUT_BYTES:
+                continue
             child_output = json.loads(rendered)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(child_output, dict) or not isinstance(
-            child_output.get("response"),
-            dict,
+            envelope = retrieval_adapter.parse_ordinary_envelope(child_output)
+            sanitized, local_counts = retrieval_policy.sanitize_retrieval_records(
+                envelope["records"],
+                sensitive_fields=list(extras),
+            )
+        except (
+            TypeError,
+            ValueError,
+            RecursionError,
+            UnicodeEncodeError,
+            retrieval_adapter.RetrievalAdapterError,
+            retrieval_policy.RetrievalEnvelopeError,
         ):
             continue
-        child_payload = child_output.get("payload")
-        if payload is None and isinstance(child_payload, dict):
-            payload = child_payload
+        redaction = envelope["redaction"]
+        truncation = envelope["truncation"]
+        prior_fields += redaction["fields"] + local_counts["fields"]
+        prior_values += redaction["values"] + local_counts["values"]
+        prior_records += redaction["records"] + local_counts["records"]
+        prior_omitted_items += truncation["omitted_items"]
+        prior_omitted_characters += truncation["omitted_characters"]
         successful_children += 1
         sources.append(
             RecallSource(
-                response=child_output["response"],
+                response={
+                    "policy_version": envelope["policy_version"],
+                    "access_mode": envelope["access_mode"],
+                    "trust": envelope["trust"],
+                    "origin": envelope["origin"],
+                    "records": sanitized,
+                    "redaction": local_counts,
+                    "truncation": truncation,
+                    "continuation": envelope["continuation"],
+                },
                 connection_order=connection_order.get(
                     connection_id,
                     len(connection_order),
@@ -776,15 +808,32 @@ def _run_manual_routed_command(
             file=sys.stderr,
         )
         return 1
-    output = {
-        "payload": payload or {},
-        "response": {"results": merge_recall_items(sources)},
-    }
-    rendered_output = json.dumps(
-        output,
-        indent=2,
-        ensure_ascii=True,
-    )
+    ranked = merge_recall_items(sources)
+    child_record_count = 0
+    for source in sources:
+        records = (
+            source.response.get("records")
+            if isinstance(source.response, dict)
+            else None
+        )
+        if isinstance(records, list):
+            child_record_count += len(records)
+    ranking_omitted = max(0, child_record_count - len(ranked))
+    try:
+        rendered_output = retrieval_adapter.serialize_cli_records(
+            ranked,
+            prior_redaction={
+                "fields": prior_fields,
+                "values": prior_values,
+                "records": prior_records,
+            },
+            prior_omitted_items=prior_omitted_items + ranking_omitted,
+            prior_omitted_characters=prior_omitted_characters,
+            sensitive_fields=list(extras),
+        )
+    except retrieval_adapter.RetrievalAdapterError:
+        print("error: invalid retrieval response", file=sys.stderr)
+        return 1
     if output_path:
         try:
             Path(output_path).write_text(

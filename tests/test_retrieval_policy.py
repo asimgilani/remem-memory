@@ -165,6 +165,12 @@ class RetrievalPolicyTests(unittest.TestCase):
             "source-locators-kept-with-no-locator-neighbor",
             "sensitive-source-locators-denied-keeps-neighbor",
             "off-record-after-long-synthesis-drops-record-and-source-locators",
+            "document-nested-chunks-preserve-duplicates-and-metadata",
+            "off-record-in-last-child-drops-document-keeps-neighbor",
+            "sensitive-original-id-and-chunks-container",
+            "entity-nested-facts-and-empty-header",
+            "sensitive-facts-container-keeps-entity-header",
+            "cross-parent-chunk-rejected",
         ):
             self.assertIn(required, categories)
         self.assertEqual(
@@ -194,6 +200,18 @@ class RetrievalPolicyTests(unittest.TestCase):
         )
         self.assertIn(
             "source-locator-association-under-truncation",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "nested-chunk-exact-budget-and-one-byte-short",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "nested-chunk-parent-omission-not-double-counted",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "nested-fact-child-omission-under-retained-entity",
             fixture["python_only"],
         )
 
@@ -393,6 +411,96 @@ class RetrievalPolicyTests(unittest.TestCase):
                 origin="python_cli",
             )
         self.assertEqual(str(ctx.exception), "retrieval input exceeds bounds")
+
+    def test_original_owner_group_depth_includes_nested_chunks(self) -> None:
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        chunk_id = "01234567-89ab-4def-8123-456789abcdef"
+        nested: object = "DEPTH-CANARY"
+        for _ in range(30):
+            nested = {"child": nested}
+        records = [
+            {
+                "kind": "document",
+                "value": {"title": "safe-title-neighbor"},
+                "locators": {"document_id": document_id},
+                "chunks": [
+                    {
+                        "locators": {
+                            "chunk_id": chunk_id,
+                            "document_id": document_id,
+                        },
+                        "value": nested,
+                    }
+                ],
+            }
+        ]
+        original = copy.deepcopy(records)
+        with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+            _RP.build_retrieval_envelope(records, origin="python_cli")
+        self.assertEqual(str(ctx.exception), "retrieval input exceeds bounds")
+        self.assertNotIn("DEPTH-CANARY", str(ctx.exception))
+        self.assertEqual(records, original)
+        shallow: object = "kept-neighbor"
+        for _ in range(8):
+            shallow = {"child": shallow}
+        kept = _RP.build_retrieval_envelope(
+            [
+                {
+                    "kind": "document",
+                    "value": {"title": "safe-title-neighbor"},
+                    "locators": {"document_id": document_id},
+                    "chunks": [
+                        {
+                            "locators": {
+                                "chunk_id": chunk_id,
+                                "document_id": document_id,
+                            },
+                            "value": shallow,
+                        }
+                    ],
+                }
+            ],
+            origin="python_cli",
+        )
+        self.assertEqual(kept["records"][0]["locators"]["document_id"], document_id)
+        self.assertIn("kept-neighbor", _dumps(kept))
+
+    def test_legacy_document_fact_locators_remain_compatible(self) -> None:
+        result = _RP.build_retrieval_envelope(
+            [
+                {
+                    "kind": "document",
+                    "value": {"title": "legacy-neighbor"},
+                    "locators": {
+                        "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                        "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210",
+                    },
+                }
+            ],
+            origin="python_mcp",
+        )
+        self.assertEqual(
+            result["records"][0]["locators"],
+            {
+                "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210",
+            },
+        )
+        with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+            _RP.build_retrieval_envelope(
+                [
+                    {
+                        "kind": "document",
+                        "value": {"title": "mixed"},
+                        "locators": {
+                            "document_id": "11111111-1111-1111-1111-111111111111",
+                            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                        },
+                    }
+                ],
+                origin="python_mcp",
+            )
+        self.assertEqual(str(ctx.exception), "invalid retrieval locators")
 
     def test_exact_budget_fits_and_one_byte_less_truncates(self) -> None:
         records = [
@@ -1299,6 +1407,435 @@ class RetrievalPolicyTests(unittest.TestCase):
         self.assertNotIn("denied-source-owner", serialized)
         self.assertNotIn(document_a, _diagnostics(denied))
         self.assertNotIn(document_b, _diagnostics(denied))
+
+    def test_load_sensitive_fields_absent_and_invalid(self) -> None:
+        self.assertEqual(_RP.load_sensitive_fields({}), ())
+        self.assertEqual(
+            _RP.load_sensitive_fields(
+                {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": '["SSN","internal-note"]'}
+            ),
+            ("internal_note", "ssn"),
+        )
+        self.assertEqual(
+            _RP.load_sensitive_fields(
+                {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "[]"}
+            ),
+            (),
+        )
+        for raw in (
+            "{",
+            '"ssn"',
+            "null",
+            json.dumps(["x" * 129]),
+            json.dumps(["a"] * 65),
+            "x" * 65537,
+        ):
+            with self.subTest(raw=raw[:40]):
+                with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+                    _RP.load_sensitive_fields(
+                        {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": raw}
+                    )
+                self.assertEqual(str(ctx.exception), "invalid sensitive fields")
+                self.assertNotIn("ssn", str(ctx.exception))
+                self.assertNotIn(raw[:20], str(ctx.exception))
+        with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+            _RP.load_sensitive_fields(
+                {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "\ud800"}
+            )
+        self.assertEqual(str(ctx.exception), "invalid sensitive fields")
+        self.assertEqual(
+            _RP._validated_sensitive_fields(None),
+            frozenset(),
+        )
+
+    def test_nested_chunk_exact_budget_and_one_byte_short(self) -> None:
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        chunk_id = "01234567-89ab-4def-8123-456789abcdef"
+        chunk = {
+            "locators": {
+                "chunk_id": chunk_id,
+                "document_id": document_id,
+            },
+            "value": {"content": "hidden-child"},
+        }
+        record = {
+            "kind": "document",
+            "value": {"title": "parent"},
+            "locators": {"document_id": document_id},
+            "chunks": [chunk],
+        }
+        full_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [record],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": False,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": None,
+        }
+        omitted_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {"title": "parent"},
+                    "locators": {"document_id": document_id},
+                    "chunks": [],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 1,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        child_min = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {"title": "parent"},
+                    "locators": {"document_id": document_id},
+                    "chunks": [
+                        {
+                            "locators": {
+                                "chunk_id": chunk_id,
+                                "document_id": document_id,
+                            },
+                            "value": {},
+                        }
+                    ],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        one_short_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {"title": "parent"},
+                    "locators": {"document_id": document_id},
+                    "chunks": [
+                        {
+                            "locators": {
+                                "chunk_id": chunk_id,
+                                "document_id": document_id,
+                            },
+                            "value": {},
+                        }
+                    ],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 1,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        full_size = _utf8_size(full_expected)
+        omitted_size = _utf8_size(omitted_expected)
+        one_short_size = _utf8_size(one_short_expected)
+        self.assertLessEqual(omitted_size, full_size - 1)
+        self.assertLessEqual(one_short_size, full_size - 1)
+        self.assertGreater(_utf8_size(child_min), omitted_size)
+        exact = _RP.build_retrieval_envelope(
+            [record],
+            origin="python_cli",
+            budget=full_size,
+        )
+        self.assertEqual(exact, full_expected)
+        one_short = _RP.build_retrieval_envelope(
+            [record],
+            origin="python_cli",
+            budget=full_size - 1,
+        )
+        self.assertEqual(one_short, one_short_expected)
+        self.assertLessEqual(_utf8_size(one_short), full_size - 1)
+        self.assertEqual(one_short["truncation"]["omitted_items"], 1)
+        self.assertEqual(one_short["truncation"]["omitted_characters"], 0)
+        self.assertIn(chunk_id, _dumps(one_short))
+        self.assertNotIn("hidden-child", _dumps(one_short))
+        tight = _RP.build_retrieval_envelope(
+            [record],
+            origin="python_cli",
+            budget=omitted_size,
+        )
+        self.assertEqual(tight, omitted_expected)
+        self.assertNotIn(chunk_id, _dumps(tight))
+        self.assertNotIn("hidden-child", _dumps(tight))
+        self.assertIn(document_id, _dumps(tight))
+        unicode_text = 'caf\u00e9 "quoted" \u6f22'
+        unicode_chunk = {
+            "locators": {
+                "chunk_id": chunk_id,
+                "document_id": document_id,
+            },
+            "value": {"content": unicode_text},
+        }
+        unicode_record = {
+            "kind": "document",
+            "value": {"title": "parent"},
+            "locators": {"document_id": document_id},
+            "chunks": [unicode_chunk],
+        }
+        unicode_full = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [unicode_record],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": False,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": None,
+        }
+        unicode_short_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {"title": "parent"},
+                    "locators": {"document_id": document_id},
+                    "chunks": [
+                        {
+                            "locators": {
+                                "chunk_id": chunk_id,
+                                "document_id": document_id,
+                            },
+                            "value": {"content": "caf"},
+                        }
+                    ],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": 12,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        unicode_next = copy.deepcopy(unicode_short_expected)
+        unicode_next["records"][0]["chunks"][0]["value"]["content"] = "caf\u00e9"
+        unicode_next["truncation"]["omitted_characters"] = 11
+        unicode_full_size = _utf8_size(unicode_full)
+        self.assertEqual(len(unicode_text), 15)
+        self.assertEqual(unicode_chunk["value"]["content"], unicode_text)
+        self.assertIn("caf\\u00e9", _dumps(unicode_full))
+        self.assertIn('\\"quoted\\"', _dumps(unicode_full))
+        self.assertIn("\\u6f22", _dumps(unicode_full))
+        self.assertLessEqual(
+            _utf8_size(unicode_short_expected),
+            unicode_full_size - 1,
+        )
+        self.assertGreater(_utf8_size(unicode_next), unicode_full_size - 1)
+        unicode_short = _RP.build_retrieval_envelope(
+            [unicode_record],
+            origin="python_cli",
+            budget=unicode_full_size - 1,
+        )
+        self.assertEqual(unicode_chunk["value"]["content"], unicode_text)
+        self.assertEqual(unicode_short, unicode_short_expected)
+        self.assertEqual(
+            unicode_short["records"][0]["chunks"][0]["value"]["content"],
+            "caf",
+        )
+        self.assertEqual(unicode_short["truncation"]["omitted_items"], 0)
+        self.assertEqual(unicode_short["truncation"]["omitted_characters"], 12)
+        self.assertIn(chunk_id, _dumps(unicode_short))
+        self.assertIn('"caf"', _dumps(unicode_short))
+        self.assertNotIn("caf\\u00e9", _dumps(unicode_short))
+        self.assertNotIn("quoted", _dumps(unicode_short))
+        self.assertNotIn("\\u6f22", _dumps(unicode_short))
+
+    def test_nested_chunk_parent_omission_not_double_counted(self) -> None:
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        chunk_id = "01234567-89ab-4def-8123-456789abcdef"
+        record = {
+            "kind": "document",
+            "value": {"title": "parent"},
+            "locators": {"document_id": document_id},
+            "chunks": [
+                {
+                    "locators": {
+                        "chunk_id": chunk_id,
+                        "document_id": document_id,
+                    },
+                    "value": {"content": "child"},
+                }
+            ],
+        }
+        skeleton = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_hook",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {},
+                    "locators": {"document_id": document_id},
+                    "chunks": [],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        omitted_parent = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_hook",
+            "records": [],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 1,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        skeleton_size = _utf8_size(skeleton)
+        omitted_size = _utf8_size(omitted_parent)
+        self.assertLessEqual(omitted_size, skeleton_size - 1)
+        result = _RP.build_retrieval_envelope(
+            [record],
+            origin="python_hook",
+            budget=omitted_size,
+        )
+        self.assertEqual(result, omitted_parent)
+        self.assertEqual(result["truncation"]["omitted_items"], 1)
+        self.assertNotIn(document_id, _dumps(result))
+        self.assertNotIn(chunk_id, _dumps(result))
+
+    def test_nested_fact_child_omission_under_retained_entity(self) -> None:
+        entity_id = "b3c4d5e6-f7a8-4901-b2c3-d4e5f6a7b8c9"
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        fact = {
+            "kind": "fact",
+            "value": {"content": "hidden-fact"},
+            "locators": {
+                "fact_id": fact_id,
+                "source_document_id": document_id,
+            },
+        }
+        record = {
+            "kind": "entity",
+            "value": {"name": "Alice"},
+            "locators": {"entity_id": entity_id},
+            "facts": [fact],
+        }
+        omitted_expected = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_mcp",
+            "records": [
+                {
+                    "kind": "entity",
+                    "value": {"name": "Alice"},
+                    "locators": {"entity_id": entity_id},
+                    "facts": [],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 1,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        fact_min = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_mcp",
+            "records": [
+                {
+                    "kind": "entity",
+                    "value": {"name": "Alice"},
+                    "locators": {"entity_id": entity_id},
+                    "facts": [
+                        {
+                            "kind": "fact",
+                            "value": {},
+                            "locators": {
+                                "fact_id": fact_id,
+                                "source_document_id": document_id,
+                            },
+                        }
+                    ],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+        omitted_size = _utf8_size(omitted_expected)
+        self.assertGreater(_utf8_size(fact_min), omitted_size)
+        result = _RP.build_retrieval_envelope(
+            [record],
+            origin="python_mcp",
+            budget=omitted_size,
+        )
+        self.assertEqual(result, omitted_expected)
+        self.assertIn(entity_id, _dumps(result))
+        self.assertNotIn(fact_id, _dumps(result))
+        self.assertNotIn("hidden-fact", _dumps(result))
+
+    def test_no_locator_documents_remain_compatible(self) -> None:
+        result = _RP.build_retrieval_envelope(
+            [{"kind": "document", "value": {"title": "plain"}}],
+            origin="python_hook",
+        )
+        self.assertEqual(
+            result["records"],
+            [{"kind": "document", "value": {"title": "plain"}}],
+        )
+        self.assertNotIn("locators", result["records"][0])
+        self.assertNotIn("chunks", result["records"][0])
 
     def _assert_atomic_locators(
         self,

@@ -2046,6 +2046,902 @@ class RoutingCliTests(unittest.TestCase):
             self.assertEqual(result, 2)
             self.assertTrue(stderr.startswith("error:"))
 
+    def test_routed_recall_parent_repacks_child_envelopes(self) -> None:
+        connection = remem_routing.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        config = remem_routing.RoutingConfig(
+            schema_version=1,
+            revision=1,
+            connections=(connection,),
+            global_routes=remem_routing.RouteLayer(
+                {
+                    "recall": (
+                        remem_routing.RouteTarget("primary", "@readable"),
+                    )
+                }
+            ),
+            client_routes={},
+            mcp_connections={},
+            legacy_namespace_migration_completed=True,
+            migration_write_blocked=False,
+            deprecations=(),
+        )
+        child_envelope = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "safe-title-neighbor",
+                        "content": "kept body",
+                        "score": 0.9,
+                    },
+                    "locators": {
+                        "document_id": "11111111-1111-1111-1111-111111111111"
+                    },
+                    "chunks": [],
+                }
+            ],
+            "redaction": {"fields": 1, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": False,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": None,
+        }
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps(
+                child_envelope,
+                ensure_ascii=True,
+                separators=(", ", ": "),
+            ),
+            stderr="",
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            remem_memory.remem_api,
+            "resolve_connection_api_key",
+            return_value="child-key",
+        ):
+            with mock.patch.object(
+                remem_memory,
+                "_normalize_origin_for_connection",
+                return_value="https://api.remem.io",
+            ):
+                with mock.patch.object(
+                    remem_memory,
+                    "_run_routed_child",
+                    return_value=completed,
+                ) as run_child:
+                    with contextlib.redirect_stdout(stdout):
+                        with contextlib.redirect_stderr(stderr):
+                            result = remem_memory._run_manual_routed_command(
+                                command="recall",
+                                script_path=_ROOT
+                                / "scripts"
+                                / "remem_recall.py",
+                                forwarded_args=["--query", "history"],
+                                child_environment={
+                                    "PATH": "/bin",
+                                    "HOME": "/tmp",
+                                },
+                                parent_environment={"HOME": "/tmp"},
+                                config=config,
+                            )
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        parsed = json.loads(stdout.getvalue())
+        self.assertEqual(parsed["origin"], "python_cli")
+        self.assertEqual(parsed["access_mode"], "ordinary")
+        self.assertEqual(parsed["trust"], "untrusted_source")
+        self.assertNotIn("payload", parsed)
+        self.assertNotIn("history", stdout.getvalue())
+        self.assertEqual(
+            parsed["records"][0]["value"]["title"],
+            "safe-title-neighbor",
+        )
+        self.assertEqual(parsed["redaction"]["fields"], 1)
+        run_child.assert_called_once()
+
+    _SECONDARY_TOKEN = "0123456789abcdef0123456789abcdef"
+    _SECONDARY_CONNECTION_ID = f"conn_{_SECONDARY_TOKEN}"
+
+    def _two_route_config(self):
+        primary = remem_routing.Connection(
+            "primary",
+            "Primary",
+            "default",
+            True,
+        )
+        secondary = remem_routing.Connection(
+            self._SECONDARY_CONNECTION_ID,
+            "Secondary",
+            f"connection:{self._SECONDARY_TOKEN}",
+            True,
+        )
+        config = remem_routing.RoutingConfig(
+            schema_version=1,
+            revision=1,
+            connections=(primary, secondary),
+            global_routes=remem_routing.RouteLayer(
+                {
+                    "recall": (
+                        remem_routing.RouteTarget("primary", "@readable"),
+                        remem_routing.RouteTarget(
+                            self._SECONDARY_CONNECTION_ID,
+                            "work",
+                        ),
+                    )
+                }
+            ),
+            client_routes={},
+            mcp_connections={},
+            legacy_namespace_migration_completed=True,
+            migration_write_blocked=False,
+            deprecations=(),
+        )
+        targets = remem_routing.resolve_routes(
+            config,
+            behavior="recall",
+            client="codex",
+        )
+        expected = (
+            remem_routing.RouteTarget("primary", "@readable"),
+            remem_routing.RouteTarget(self._SECONDARY_CONNECTION_ID, "work"),
+        )
+        if targets != expected:
+            raise AssertionError("synthetic two-route config must resolve")
+        return config
+
+    def _valid_child_envelope(self) -> dict[str, object]:
+        return {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "kept-neighbor",
+                        "content": "safe body",
+                        "score": 0.5,
+                    },
+                    "locators": {
+                        "document_id": "11111111-1111-1111-1111-111111111111"
+                    },
+                    "chunks": [],
+                }
+            ],
+            "redaction": {"fields": 2, "values": 1, "records": 1},
+            "truncation": {
+                "truncated": True,
+                "omitted_items": 1,
+                "omitted_characters": 0,
+            },
+            "continuation": {"kind": "narrow_query"},
+        }
+
+    def _child_stdout(self, payload: object) -> str:
+        if type(payload) is str:
+            return payload
+        return json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(", ", ": "),
+        )
+
+    def _closed_document_record(
+        self,
+        document_id: str,
+        title: str,
+        *,
+        score: float = 0.1,
+        extra: object | None = None,
+    ) -> dict[str, object]:
+        value: dict[str, object] = {
+            "title": title,
+            "content": "body",
+            "score": score,
+        }
+        if extra is not None:
+            value["extra"] = extra
+        return {
+            "kind": "document",
+            "value": value,
+            "locators": {"document_id": document_id},
+            "chunks": [],
+        }
+
+    def _closed_envelope(self, records: list) -> dict[str, object]:
+        return {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": records,
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": False,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": None,
+        }
+
+    def _run_parent(self, *, config, child_environment, parent_environment, run_child):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            remem_memory.remem_api,
+            "resolve_connection_api_key",
+            return_value="child-key",
+        ):
+            with mock.patch.object(
+                remem_memory,
+                "_normalize_origin_for_connection",
+                return_value="https://api.remem.io",
+            ):
+                with mock.patch.object(
+                    remem_memory,
+                    "_run_routed_child",
+                    side_effect=run_child,
+                ) as patched:
+                    with contextlib.redirect_stdout(stdout):
+                        with contextlib.redirect_stderr(stderr):
+                            result = remem_memory._run_manual_routed_command(
+                                command="recall",
+                                script_path=_ROOT
+                                / "scripts"
+                                / "remem_recall.py",
+                                forwarded_args=["--query", "history"],
+                                child_environment=child_environment,
+                                parent_environment=parent_environment,
+                                config=config,
+                            )
+        return result, stdout.getvalue(), stderr.getvalue(), patched
+
+    def test_routed_recall_parent_rejects_null_sensitive_fields(self) -> None:
+        def fail_child(**kwargs):
+            raise AssertionError("child must not start")
+
+        config = self._two_route_config()
+        result, stdout, stderr, patched = self._run_parent(
+            config=config,
+            child_environment={
+                "PATH": "/bin",
+                "HOME": "/tmp",
+                "REMEM_RETRIEVAL_SENSITIVE_FIELDS": "null",
+            },
+            parent_environment={"HOME": "/tmp"},
+            run_child=fail_child,
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "error: invalid sensitive fields\n")
+        self.assertNotIn("invalid manual route", stderr)
+        patched.assert_not_called()
+
+    def test_routed_recall_parent_rejects_malformed_child_envelopes(self) -> None:
+        valid = self._valid_child_envelope()
+        valid_stdout = self._child_stdout(valid)
+        nested_depth: object = "DEPTH-CANARY"
+        for _ in range(40):
+            nested_depth = {"child": nested_depth}
+        decoys = [
+            self._closed_document_record(
+                f"aaaaaaa{index}-aaaa-4aaa-8aaa-aaaaaaaaaaa{index}",
+                f"cap-decoy-{index}",
+                score=0.99,
+            )
+            for index in range(4)
+        ]
+        cases: tuple[tuple[str, object, tuple[str, ...]], ...] = (
+            (
+                "records-only-null-member",
+                {"records": [None]},
+                ("null",),
+            ),
+            (
+                "null-record-member",
+                self._closed_envelope([None]),
+                (),
+            ),
+            (
+                "raw-label",
+                {
+                    **self._closed_envelope([]),
+                    "access_mode": "raw",
+                },
+                (),
+            ),
+            (
+                "forged-trust-label",
+                {
+                    **self._closed_envelope([]),
+                    "trust": "trusted",
+                },
+                (),
+            ),
+            (
+                "unknown-wrapper-channel",
+                {
+                    **self._closed_envelope([]),
+                    "secret_channel": "FORGED",
+                },
+                ("FORGED", "secret_channel"),
+            ),
+            (
+                "missing-redaction-counter",
+                {
+                    **self._closed_envelope([]),
+                    "redaction": {"fields": 0, "values": 0},
+                },
+                (),
+            ),
+            (
+                "boolean-redaction-counter",
+                {
+                    **self._closed_envelope([]),
+                    "redaction": {
+                        "fields": True,
+                        "values": 0,
+                        "records": 0,
+                    },
+                },
+                (),
+            ),
+            (
+                "negative-omitted-items",
+                {
+                    **self._closed_envelope([]),
+                    "truncation": {
+                        "truncated": True,
+                        "omitted_items": -1,
+                        "omitted_characters": 0,
+                    },
+                    "continuation": {"kind": "narrow_query"},
+                },
+                (),
+            ),
+            (
+                "invalid-continuation",
+                {
+                    **self._closed_envelope([]),
+                    "truncation": {
+                        "truncated": True,
+                        "omitted_items": 1,
+                        "omitted_characters": 0,
+                    },
+                    "continuation": None,
+                },
+                (),
+            ),
+            (
+                "missing-fact-locators",
+                self._closed_envelope(
+                    [
+                        {
+                            "kind": "fact",
+                            "value": {
+                                "content": "UNATTRIBUTED-FACT-CANARY",
+                            },
+                        }
+                    ]
+                ),
+                ("UNATTRIBUTED-FACT-CANARY",),
+            ),
+            (
+                "partial-fact-locators",
+                self._closed_envelope(
+                    [
+                        {
+                            "kind": "fact",
+                            "value": {
+                                "content": "PARTIAL-FACT-CANARY",
+                            },
+                            "locators": {
+                                "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+                            },
+                        }
+                    ]
+                ),
+                ("PARTIAL-FACT-CANARY",),
+            ),
+            (
+                "wrong-fact-locators",
+                self._closed_envelope(
+                    [
+                        {
+                            "kind": "fact",
+                            "value": {"content": "WRONG-FACT-CANARY"},
+                            "locators": {
+                                "entity_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            },
+                        }
+                    ]
+                ),
+                ("WRONG-FACT-CANARY",),
+            ),
+            (
+                "unknown-record-channel",
+                self._closed_envelope(
+                    [
+                        {
+                            **self._closed_document_record(
+                                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                                "unknown-channel-decoy",
+                                score=0.8,
+                            ),
+                            "secret_channel": "RECORD-CHANNEL",
+                        }
+                    ]
+                ),
+                ("RECORD-CHANNEL", "unknown-channel-decoy"),
+            ),
+            (
+                "unknown-chunk-channel",
+                self._closed_envelope(
+                    [
+                        {
+                            "kind": "document",
+                            "value": {"title": "chunk-channel-decoy"},
+                            "locators": {
+                                "document_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+                            },
+                            "chunks": [
+                                {
+                                    "locators": {
+                                        "chunk_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                                        "document_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                                    },
+                                    "value": {"content": "CHUNK-CHANNEL-CANARY"},
+                                    "secret_channel": "CHUNK-CHANNEL",
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                ("CHUNK-CHANNEL", "CHUNK-CHANNEL-CANARY"),
+            ),
+            (
+                "beyond-cap-missing-locator",
+                self._closed_envelope(
+                    [
+                        *decoys,
+                        {
+                            "kind": "fact",
+                            "value": {"content": "BEYOND-CAP-CANARY"},
+                        },
+                    ]
+                ),
+                (
+                    "BEYOND-CAP-CANARY",
+                    "cap-decoy-0",
+                    "cap-decoy-1",
+                    "cap-decoy-2",
+                    "cap-decoy-3",
+                ),
+            ),
+            (
+                "original-group-depth",
+                self._closed_envelope(
+                    [
+                        self._closed_document_record(
+                            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                            "depth-decoy",
+                            extra=nested_depth,
+                        )
+                    ]
+                ),
+                ("DEPTH-CANARY", "depth-decoy"),
+            ),
+            (
+                "deep-json",
+                '{"k":' * 2000 + '"DEEP-JSON-CANARY"' + "}" * 2000,
+                ("DEEP-JSON-CANARY",),
+            ),
+            (
+                "malformed-unicode",
+                "\ud800MALFORMED-UNICODE-CANARY",
+                ("MALFORMED-UNICODE-CANARY",),
+            ),
+        )
+        config = self._two_route_config()
+        visited = []
+        for name, payload, canaries in cases:
+            invalid_stdout = self._child_stdout(payload)
+
+            def run_child(invalid_body=invalid_stdout, **kwargs):
+                connection_id = kwargs["route_descriptor"]["connection_id"]
+                run_child.seen.append(connection_id)
+                body = (
+                    invalid_body
+                    if connection_id == "primary"
+                    else valid_stdout
+                )
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=body,
+                    stderr="",
+                )
+
+            run_child.seen = []
+            with self.subTest(name=name):
+                result, stdout, stderr, patched = self._run_parent(
+                    config=config,
+                    child_environment={"PATH": "/bin", "HOME": "/tmp"},
+                    parent_environment={"HOME": "/tmp"},
+                    run_child=run_child,
+                )
+                visited.append(name)
+                self.assertEqual(result, 0)
+                self.assertEqual(stderr, "")
+                self.assertEqual(patched.call_count, 2)
+                self.assertEqual(
+                    run_child.seen,
+                    ["primary", self._SECONDARY_CONNECTION_ID],
+                )
+                self.assertEqual(
+                    [
+                        call.kwargs["route_descriptor"]["connection_id"]
+                        for call in patched.call_args_list
+                    ],
+                    ["primary", self._SECONDARY_CONNECTION_ID],
+                )
+                parsed = json.loads(stdout)
+                self.assertEqual(parsed["origin"], "python_cli")
+                self.assertEqual(parsed["access_mode"], "ordinary")
+                self.assertEqual(parsed["trust"], "untrusted_source")
+                self.assertEqual(
+                    parsed["records"][0]["value"]["title"],
+                    "kept-neighbor",
+                )
+                self.assertEqual(
+                    parsed["redaction"],
+                    {"fields": 2, "values": 1, "records": 1},
+                )
+                self.assertEqual(parsed["truncation"]["omitted_items"], 1)
+                for canary in canaries:
+                    self.assertNotIn(canary, stdout)
+                self.assertNotIn("FORGED", stdout)
+                self.assertNotIn("secret_channel", stdout)
+
+        self.assertEqual(
+            [name for name, _payload, _canaries in cases],
+            visited,
+        )
+
+        def fail_both(**kwargs):
+            fail_both.calls += 1
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=self._child_stdout({"records": [None]}),
+                stderr="",
+            )
+
+        fail_both.calls = 0
+        both_result, both_stdout, both_stderr, both_patched = self._run_parent(
+            config=config,
+            child_environment={"PATH": "/bin", "HOME": "/tmp"},
+            parent_environment={"HOME": "/tmp"},
+            run_child=fail_both,
+        )
+        self.assertEqual(both_result, 1)
+        self.assertEqual(both_stdout, "")
+        self.assertEqual(both_stderr, "error: query failed [request]\n")
+        self.assertEqual(both_patched.call_count, 2)
+        self.assertEqual(fail_both.calls, 2)
+
+    def test_routed_recall_helper_main_multi_route_and_config(self) -> None:
+        recall = load_script(
+            "remem_recall_routing_child",
+            _ROOT / "scripts" / "remem_recall.py",
+        )
+        shared = "11111111-1111-1111-1111-111111111111"
+        primary_response = {
+            "results": [
+                {
+                    "document_id": shared,
+                    "title": "secret-title",
+                    "content": "shared identity content",
+                    "score": 0.4,
+                    "chunks": [],
+                },
+                {
+                    "document_id": "22222222-2222-4222-8222-222222222222",
+                    "title": "safe-title-neighbor",
+                    "content": "primary unique body",
+                    "score": 0.8,
+                    "chunks": [],
+                },
+            ],
+            "synthesis": "primary synthesis",
+            "sources": [shared],
+        }
+        secondary_response = {
+            "results": [
+                {
+                    "document_id": shared,
+                    "title": "other-title",
+                    "content": "higher scored identity",
+                    "score": 0.9,
+                    "chunks": [],
+                },
+                {
+                    "document_id": "33333333-3333-4333-8333-333333333333",
+                    "title": "secondary-title",
+                    "content": "secondary unique body",
+                    "score": 0.7,
+                    "chunks": [],
+                },
+            ],
+            "synthesis": "secondary synthesis",
+            "sources": ["33333333-3333-4333-8333-333333333333"],
+        }
+        payloads = {
+            "primary": primary_response,
+            self._SECONDARY_CONNECTION_ID: secondary_response,
+        }
+        queries = []
+
+        def run_child(
+            *,
+            script_path,
+            forwarded_args,
+            child_environment,
+            route_descriptor,
+            credential,
+            capture_output,
+            allow_local_dev=False,
+        ):
+            del script_path, capture_output, allow_local_dev
+            connection_id = route_descriptor["connection_id"]
+            env = {
+                key: value
+                for key, value in child_environment.items()
+                if isinstance(value, str)
+            }
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch.object(
+                    recall.remem_api,
+                    "resolve_api_access",
+                    return_value=("https://api.remem.io", credential),
+                ) as resolve:
+                    with mock.patch.object(
+                        recall,
+                        "query_remem",
+                        return_value=payloads[connection_id],
+                    ) as query:
+                        with contextlib.redirect_stdout(stdout):
+                            with contextlib.redirect_stderr(stderr):
+                                code = recall.main(list(forwarded_args))
+            queries.append(
+                {
+                    "connection_id": connection_id,
+                    "credential": credential,
+                    "resolve": resolve,
+                    "query": query,
+                    "env": env,
+                }
+            )
+            return subprocess.CompletedProcess(
+                [],
+                int(code),
+                stdout=stdout.getvalue(),
+                stderr=stderr.getvalue(),
+            )
+
+        result, stdout, stderr, patched = self._run_parent(
+            config=self._two_route_config(),
+            child_environment={
+                "PATH": "/bin",
+                "HOME": "/tmp",
+                "REMEM_RETRIEVAL_SENSITIVE_FIELDS": '["title"]',
+            },
+            parent_environment={"HOME": "/tmp"},
+            run_child=run_child,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        parsed = json.loads(stdout)
+        self.assertEqual(parsed["origin"], "python_cli")
+        self.assertEqual(parsed["access_mode"], "ordinary")
+        self.assertEqual(parsed["trust"], "untrusted_source")
+        self.assertNotIn("payload", parsed)
+        self.assertNotIn("history", stdout)
+        self.assertNotIn("secret-title", stdout)
+        self.assertNotIn("other-title", stdout)
+        self.assertNotIn("safe-title-neighbor", stdout)
+        kinds = [record["kind"] for record in parsed["records"]]
+        self.assertEqual(
+            kinds,
+            ["document", "document", "document", "synthesis"],
+        )
+        identities = [
+            record.get("locators", {}).get("document_id")
+            for record in parsed["records"]
+            if record["kind"] == "document"
+        ]
+        self.assertEqual(
+            identities,
+            [
+                shared,
+                "22222222-2222-4222-8222-222222222222",
+                "33333333-3333-4333-8333-333333333333",
+            ],
+        )
+        synthesis = [
+            record["value"]
+            for record in parsed["records"]
+            if record["kind"] == "synthesis"
+        ]
+        self.assertEqual(synthesis, ["primary synthesis"])
+        self.assertEqual(
+            parsed["records"][-1]["source_locators"],
+            [{"source_document_id": shared}],
+        )
+        self.assertNotIn("secondary synthesis", stdout)
+        self.assertEqual(patched.call_count, 2)
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(
+            [item["connection_id"] for item in queries],
+            ["primary", self._SECONDARY_CONNECTION_ID],
+        )
+        self.assertEqual(
+            patched.call_args_list[0].kwargs["route_descriptor"][
+                "read_namespaces"
+            ],
+            None,
+        )
+        self.assertEqual(
+            patched.call_args_list[1].kwargs["route_descriptor"][
+                "read_namespaces"
+            ],
+            ["work"],
+        )
+        self.assertEqual(
+            patched.call_args_list[1].kwargs["route_descriptor"][
+                "connection_id"
+            ],
+            self._SECONDARY_CONNECTION_ID,
+        )
+        for item in queries:
+            item["resolve"].assert_called_once()
+            item["query"].assert_called_once()
+            self.assertEqual(item["credential"], "child-key")
+            self.assertEqual(
+                item["env"]["REMEM_RETRIEVAL_SENSITIVE_FIELDS"],
+                '["title"]',
+            )
+            self.assertNotIn("REMEM_API_KEY", item["env"])
+
+    def test_routed_recall_parent_partial_failure_and_cumulative_counts(self) -> None:
+        safe_envelope = self._valid_child_envelope()
+        seen = []
+
+        def run_child(**kwargs):
+            connection_id = kwargs["route_descriptor"]["connection_id"]
+            seen.append(connection_id)
+            if connection_id == "primary":
+                return subprocess.CompletedProcess(
+                    [],
+                    1,
+                    stdout="",
+                    stderr="error: query failed [auth]\n",
+                )
+            self.assertEqual(connection_id, self._SECONDARY_CONNECTION_ID)
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=self._child_stdout(safe_envelope),
+                stderr="",
+            )
+
+        result, stdout, stderr, patched = self._run_parent(
+            config=self._two_route_config(),
+            child_environment={"PATH": "/bin", "HOME": "/tmp"},
+            parent_environment={"HOME": "/tmp"},
+            run_child=run_child,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        parsed = json.loads(stdout)
+        self.assertEqual(parsed["origin"], "python_cli")
+        self.assertEqual(len(parsed["records"]), 1)
+        self.assertEqual(
+            parsed["records"][0]["value"]["title"],
+            "kept-neighbor",
+        )
+        self.assertEqual(
+            parsed["redaction"],
+            {"fields": 2, "values": 1, "records": 1},
+        )
+        self.assertEqual(parsed["truncation"]["omitted_items"], 1)
+        self.assertEqual(patched.call_count, 2)
+        self.assertEqual(seen, ["primary", self._SECONDARY_CONNECTION_ID])
+
+    def test_routed_recall_parent_uses_child_environment_not_process_env(
+        self,
+    ) -> None:
+        envelope = {
+            "policy_version": "retrieval-envelope-v1",
+            "access_mode": "ordinary",
+            "trust": "untrusted_source",
+            "origin": "python_cli",
+            "records": [
+                {
+                    "kind": "document",
+                    "value": {
+                        "title": "drop-this-title",
+                        "content": "kept body",
+                        "score": 0.9,
+                    },
+                    "locators": {
+                        "document_id": "11111111-1111-1111-1111-111111111111"
+                    },
+                    "chunks": [],
+                }
+            ],
+            "redaction": {"fields": 0, "values": 0, "records": 0},
+            "truncation": {
+                "truncated": False,
+                "omitted_items": 0,
+                "omitted_characters": 0,
+            },
+            "continuation": None,
+        }
+
+        seen = []
+
+        def run_child(**kwargs):
+            seen.append(kwargs["route_descriptor"]["connection_id"])
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=self._child_stdout(envelope),
+                stderr="",
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {"REMEM_RETRIEVAL_SENSITIVE_FIELDS": "[]"},
+            clear=False,
+        ):
+            result, stdout, stderr, patched = self._run_parent(
+                config=self._two_route_config(),
+                child_environment={
+                    "PATH": "/bin",
+                    "HOME": "/tmp",
+                    "REMEM_RETRIEVAL_SENSITIVE_FIELDS": '["title"]',
+                },
+                parent_environment={"HOME": "/tmp"},
+                run_child=run_child,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(stderr, "")
+        parsed = json.loads(stdout)
+        self.assertNotIn("drop-this-title", stdout)
+        self.assertIn("kept body", stdout)
+        self.assertGreaterEqual(parsed["redaction"]["fields"], 1)
+        self.assertEqual(patched.call_count, 2)
+        self.assertEqual(seen, ["primary", self._SECONDARY_CONNECTION_ID])
+
 
 class MCPLauncherTests(unittest.TestCase):
     def setUp(self):
@@ -2407,6 +3303,52 @@ class MCPLauncherTests(unittest.TestCase):
             "https://api.remem.io",
         )
         self.assertNotIn("REMEM_DEFAULT_NAMESPACE", child)
+
+    def test_launcher_forwards_retrieval_sensitive_fields(self):
+        class ExecIntercept(Exception):
+            pass
+
+        child = {}
+        dummy = Path(self._cache_environment) / "bin" / "python"
+        real_access = os.access
+        runner = mock.Mock()
+
+        def access(path, mode, *args, **kwargs):
+            try:
+                if Path(path) == dummy:
+                    return True
+            except (TypeError, ValueError, OSError):
+                pass
+            return real_access(path, mode, *args, **kwargs)
+
+        def execvpe(executable, arguments, environment):
+            del executable, arguments
+            child.update(environment)
+            raise ExecIntercept()
+
+        with mock.patch.object(os, "access", access):
+            with self.assertRaises(ExecIntercept):
+                launcher.main(
+                    ["--client", "codex"],
+                    environment={
+                        "PATH": "/test/bin",
+                        "REMEM_RETRIEVAL_SENSITIVE_FIELDS": '["ssn"]',
+                        "REMEM_API_KEY": "must-not-forward",
+                    },
+                    resolver=lambda **kwargs: "configured",
+                    which=lambda command: "/test/bin/uv",
+                    execvpe=execvpe,
+                    runner=runner,
+                )
+        runner.assert_not_called()
+
+        self.assertEqual(
+            child["REMEM_RETRIEVAL_SENSITIVE_FIELDS"],
+            '["ssn"]',
+        )
+        self.assertNotIn("REMEM_API_KEY", child)
+        self._probe.assert_called_once()
+        self.assertEqual(child.get("UV_PROJECT_ENVIRONMENT", None), None)
 
     def test_launcher_missing_key_error_is_fixed_and_non_secret(self):
         canary = "vlt_launcher-secret-canary"

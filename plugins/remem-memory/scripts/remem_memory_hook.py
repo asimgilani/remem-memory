@@ -25,6 +25,8 @@ from typing import Any, Callable, Literal, Mapping
 from uuid import uuid4
 
 import remem_api
+import retrieval_adapter
+import retrieval_policy
 from memory_policy import (
     RecallSource,
     contains_secret,
@@ -1204,6 +1206,11 @@ def _handle_user_prompt(
         return {}
 
     try:
+        extras = retrieval_adapter.sensitive_fields_from_environment()
+    except retrieval_adapter.RetrievalAdapterError:
+        return {}
+
+    try:
         config, targets = _resolved_route(
             dependencies,
             behavior="recall",
@@ -1225,6 +1232,9 @@ def _handle_user_prompt(
         )
 
     sources: list[RecallSource] = []
+    prior_fields = 0
+    prior_values = 0
+    prior_records = 0
     for connection_id, selected in sorted(
         grouped.items(),
         key=lambda item: connection_order.get(item[0], len(connection_order)),
@@ -1280,9 +1290,36 @@ def _handle_user_prompt(
             behavior="recall",
             targets=selected_targets,
         )
+        try:
+            records = retrieval_adapter.map_query_response(response)
+            sanitized, counts = retrieval_policy.sanitize_retrieval_records(
+                records,
+                sensitive_fields=list(extras),
+            )
+        except (
+            retrieval_adapter.RetrievalAdapterError,
+            retrieval_policy.RetrievalEnvelopeError,
+        ):
+            continue
+        prior_fields += counts["fields"]
+        prior_values += counts["values"]
+        prior_records += counts["records"]
         sources.append(
             RecallSource(
-                response=response,
+                response={
+                    "policy_version": retrieval_policy.RETRIEVAL_ENVELOPE_VERSION,
+                    "access_mode": "ordinary",
+                    "trust": "untrusted_source",
+                    "origin": "python_hook",
+                    "records": sanitized,
+                    "redaction": counts,
+                    "truncation": {
+                        "truncated": False,
+                        "omitted_items": 0,
+                        "omitted_characters": 0,
+                    },
+                    "continuation": None,
+                },
                 connection_order=connection_order.get(
                     connection_id,
                     len(connection_order),
@@ -1294,7 +1331,27 @@ def _handle_user_prompt(
             )
         )
 
-    context = render_untrusted_context(merge_recall_items(sources))
+    ranked = merge_recall_items(sources)
+    child_record_count = 0
+    for source in sources:
+        records = (
+            source.response.get("records")
+            if isinstance(source.response, dict)
+            else None
+        )
+        if isinstance(records, list):
+            child_record_count += len(records)
+    ranking_omitted = max(0, child_record_count - len(ranked))
+    context = render_untrusted_context(
+        ranked,
+        prior_redaction={
+            "fields": prior_fields,
+            "values": prior_values,
+            "records": prior_records,
+        },
+        prior_omitted_items=ranking_omitted,
+        sensitive_fields=list(extras),
+    )
     if settings.mode == "auto":
         with store.locked(session_id):
             latest = store.load(session_id)

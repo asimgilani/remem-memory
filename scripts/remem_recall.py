@@ -22,6 +22,7 @@ if str(_PLUGIN_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_SCRIPTS))
 
 import remem_api  # noqa: E402
+import retrieval_adapter  # noqa: E402
 
 try:
     from scripts.remem_checkpoint import (
@@ -192,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(output, indent=2, ensure_ascii=True))
         return 0
 
+    try:
+        extras = retrieval_adapter.sensitive_fields_from_environment()
+    except retrieval_adapter.RetrievalAdapterError:
+        print("error: invalid sensitive fields", file=sys.stderr)
+        return 2
+
     if "REMEM_MEMORY_ROUTE_FD" in os.environ:
         try:
             route = _consume_route_descriptor(
@@ -245,10 +252,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_log:
         append_recall_log(args.log_file, record)
 
-    output = {"payload": payload, "response": response}
+    try:
+        rendered = retrieval_adapter.serialize_cli_query_response(
+            response,
+            sensitive_fields=list(extras),
+        )
+    except retrieval_adapter.RetrievalAdapterError:
+        print("error: invalid retrieval response", file=sys.stderr)
+        return 1
     if args.output:
-        Path(args.output).write_text(json.dumps(output, indent=2, ensure_ascii=True), encoding="utf-8")
-    print(json.dumps(output, indent=2, ensure_ascii=True))
+        Path(args.output).write_text(rendered, encoding="utf-8")
+    print(rendered)
 
     return 0
 

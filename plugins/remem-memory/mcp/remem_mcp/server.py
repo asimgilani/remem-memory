@@ -350,7 +350,9 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remem_get_document",
-            description="Fetch a document by ID (raw JSON from GET /v1/documents/{document_id}).",
+            description=(
+                "Fetch a document by ID as one ordinary untrusted retrieval envelope."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -362,7 +364,53 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remem_get_document_chunks",
-            description="Fetch decrypted chunks for a document (GET /v1/documents/{document_id}/chunks).",
+            description=(
+                "Fetch document chunks as one ordinary untrusted retrieval envelope."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Document UUID"},
+                    "include_content": {
+                        "type": "boolean",
+                        "description": "Include decrypted chunk content",
+                        "default": True,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max chunks to return (default 200, max 1000)",
+                        "default": 200,
+                    },
+                    "namespaces": _NAMESPACES_SCHEMA,
+                },
+                "required": ["document_id"],
+            },
+        ),
+        Tool(
+            name="remem_get_raw_document",
+            description=(
+                "Explicit raw document access. Uses the same permission-checked "
+                "GET /v1/documents/{document_id} request as remem_get_document. "
+                "Can reveal sensitive source content within existing permissions "
+                "and remains untrusted."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Document UUID"},
+                    "namespaces": _NAMESPACES_SCHEMA,
+                },
+                "required": ["document_id"],
+            },
+        ),
+        Tool(
+            name="remem_get_raw_document_chunks",
+            description=(
+                "Explicit raw document-chunk access. Uses the same "
+                "permission-checked GET /v1/documents/{document_id}/chunks "
+                "request as remem_get_document_chunks. Can reveal sensitive "
+                "source content within existing permissions and remains untrusted."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -405,7 +453,9 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remem_list_entities",
-            description="List memory entities (people, orgs, projects, etc.) in your knowledge base.",
+            description=(
+                "List memory entities as one ordinary untrusted retrieval envelope."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -429,7 +479,9 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remem_get_entity_facts",
-            description="Get facts associated with a specific entity.",
+            description=(
+                "Get entity facts as one ordinary untrusted retrieval envelope."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -450,7 +502,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remem_extract_facts",
-            description="Trigger fact extraction for a document (async, returns immediately).",
+            description=(
+                "Trigger fact extraction for a document and return its status "
+                "as one ordinary untrusted retrieval envelope."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -533,10 +588,23 @@ def _inject_namespaces_get(params: dict[str, Any], namespaces: list[str] | None)
         params["namespaces"] = ",".join(namespaces)
 
 
+def _require_ordinary_config() -> tuple[str, ...]:
+    return _RETRIEVAL_ADAPTER.sensitive_fields_from_environment()
+
+
+def _envelope_text(serialize, *args, **kwargs) -> list[TextContent]:
+    try:
+        text = serialize(*args, **kwargs)
+    except _ADAPTER_ERROR as exc:
+        return [TextContent(type="text", text=str(exc))]
+    return [TextContent(type="text", text=text)]
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         if name == "remem_query":
+            extras = _require_ordinary_config()
             mode = str(arguments.get("mode") or _get_default_mode()).strip().lower()
             if mode not in {"fast", "rich"}:
                 mode = _get_default_mode()
@@ -570,13 +638,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "/v1/query",
                 json_body=payload,
             )
-            try:
-                text = _RETRIEVAL_ADAPTER.serialize_query_response(data)
-            except _ADAPTER_ERROR as exc:
-                return [TextContent(type="text", text=str(exc))]
-            return [TextContent(type="text", text=text)]
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_query_response,
+                data,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_search":
+            extras = _require_ordinary_config()
             limit = arguments.get("limit", _get_default_max_results())
             try:
                 limit = int(limit)
@@ -595,13 +664,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "/v1/query",
                 json_body=payload,
             )
-            try:
-                text = _RETRIEVAL_ADAPTER.serialize_search_response(data)
-            except _ADAPTER_ERROR as exc:
-                return [TextContent(type="text", text=str(exc))]
-            return [TextContent(type="text", text=text)]
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_search_response,
+                data,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_summarize":
+            extras = _require_ordinary_config()
             payload = {
                 "query": arguments["question"],
                 "mode": "rich",
@@ -615,13 +685,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "/v1/query",
                 json_body=payload,
             )
-            try:
-                text = _RETRIEVAL_ADAPTER.serialize_summarize_response(data)
-            except _ADAPTER_ERROR as exc:
-                return [TextContent(type="text", text=str(exc))]
-            return [TextContent(type="text", text=text)]
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_summarize_response,
+                data,
+                sensitive_fields=extras,
+            )
 
-        if name == "remem_get_document":
+        if name in {
+            "remem_get_document",
+            "remem_get_raw_document",
+        }:
+            extras = None
+            if name == "remem_get_document":
+                extras = _require_ordinary_config()
             document_id = _canonical_resource_id(
                 arguments.get("document_id"),
                 "document_id",
@@ -633,9 +709,31 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 f"/v1/documents/{document_id}",
                 params=params or None,
             )
-            return [TextContent(type="text", text=_truncate_response(json.dumps(doc, indent=2)))]
+            serializer = (
+                _RETRIEVAL_ADAPTER.serialize_raw_document_response
+                if name == "remem_get_raw_document"
+                else _RETRIEVAL_ADAPTER.serialize_document_response
+            )
+            if extras is None:
+                return _envelope_text(
+                    serializer,
+                    doc,
+                    requested_id=document_id,
+                )
+            return _envelope_text(
+                serializer,
+                doc,
+                requested_id=document_id,
+                sensitive_fields=extras,
+            )
 
-        if name == "remem_get_document_chunks":
+        if name in {
+            "remem_get_document_chunks",
+            "remem_get_raw_document_chunks",
+        }:
+            extras = None
+            if name == "remem_get_document_chunks":
+                extras = _require_ordinary_config()
             document_id = _canonical_resource_id(
                 arguments.get("document_id"),
                 "document_id",
@@ -650,9 +748,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 f"/v1/documents/{document_id}/chunks",
                 params=params,
             )
-            return [TextContent(type="text", text=_truncate_response(json.dumps(chunks, indent=2)))]
+            serializer = (
+                _RETRIEVAL_ADAPTER.serialize_raw_document_chunks_response
+                if name == "remem_get_raw_document_chunks"
+                else _RETRIEVAL_ADAPTER.serialize_document_chunks_response
+            )
+            if extras is None:
+                return _envelope_text(
+                    serializer,
+                    chunks,
+                    requested_id=document_id,
+                )
+            return _envelope_text(
+                serializer,
+                chunks,
+                requested_id=document_id,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_memory_query":
+            extras = _require_ordinary_config()
             payload: dict[str, Any] = {
                 "query": arguments["query"],
                 "mode": "fast",
@@ -666,13 +781,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             _inject_namespaces_post(payload, _resolve_read_namespaces(arguments))
 
             data = await _request("POST", "/v1/query", json_body=payload)
-            try:
-                text = _RETRIEVAL_ADAPTER.serialize_memory_query_response(data)
-            except _ADAPTER_ERROR as exc:
-                return [TextContent(type="text", text=str(exc))]
-            return [TextContent(type="text", text=text)]
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_memory_query_response,
+                data,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_list_entities":
+            extras = _require_ordinary_config()
             params: dict[str, Any] = {
                 "limit": int(arguments.get("limit", 50)),
                 "offset": int(arguments.get("offset", 0)),
@@ -683,20 +799,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             _inject_namespaces_get(params, _resolve_read_namespaces(arguments))
 
             data = await _request("GET", "/v1/entities", params=params)
-            entities = data.get("entities", [])
-            if not entities:
-                return [TextContent(type="text", text="No entities found.")]
-
-            lines = [f"**Entities** ({data.get('total', len(entities))} total)\n"]
-            for e in entities:
-                lines.append(
-                    f"- **{e.get('name', '?')}** ({e.get('entity_type', '?')}) "
-                    f"— {e.get('fact_count', 0)} facts, {e.get('mention_count', 0)} mentions "
-                    f"[id: {e.get('id', '?')}]"
-                )
-            return [TextContent(type="text", text=_truncate_response("\n".join(lines)))]
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_entities_response,
+                data,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_get_entity_facts":
+            extras = _require_ordinary_config()
             params: dict[str, Any] = {
                 "latest_only": bool(arguments.get("latest_only", True)),
             }
@@ -709,26 +819,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 arguments.get("entity_id"),
                 "entity_id",
             )
-            data = await _request("GET", f"/v1/entities/{entity_id}/facts", params=params)
-
-            entity = data.get("entity", {})
-            facts = data.get("facts", [])
-            lines = [f"**{entity.get('name', '?')}** ({entity.get('entity_type', '?')})\n"]
-
-            if not facts:
-                lines.append("No facts found.")
-            else:
-                for f in facts:
-                    line = f"- [{f.get('fact_type', 'fact')}] {f.get('content', '')}"
-                    if f.get("confidence"):
-                        line += f" (confidence: {f['confidence']:.1f})"
-                    lines.append(line)
-                    for rel in f.get("relationships", []):
-                        lines.append(f"  -> {rel.get('rel_type', '?')}: {rel.get('related_fact_content', '')}")
-
-            return [TextContent(type="text", text=_truncate_response("\n".join(lines)))]
+            data = await _request(
+                "GET",
+                f"/v1/entities/{entity_id}/facts",
+                params=params,
+            )
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_entity_facts_response,
+                data,
+                requested_id=entity_id,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_extract_facts":
+            extras = _require_ordinary_config()
             doc_id = _canonical_resource_id(
                 arguments.get("document_id"),
                 "document_id",
@@ -742,7 +846,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 f"/v1/documents/{doc_id}/extract-facts",
                 params=params or None,
             )
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+            return _envelope_text(
+                _RETRIEVAL_ADAPTER.serialize_extract_facts_response,
+                data,
+                requested_id=doc_id,
+                sensitive_fields=extras,
+            )
 
         if name == "remem_ingest":
             # Preserve empty-string source; only default when the caller
