@@ -617,34 +617,102 @@ class MCPRetrievalEnvelopeTests(unittest.TestCase):
     def test_unicode_and_tight_budgets_use_canonical_serialization(self) -> None:
         case = _fixture_case("clip-escaped-unicode-exact")
         value = case["records"][0]["value"]
+        self.assertEqual(
+            value["note"],
+            "caf\u00e9 \u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22",
+        )
         response = {"results": [value]}
         records = [{"kind": "document", "value": value}]
         full = _expected_text(records)
-        exact = _ADAPTER.serialize_query_response(response, budget=_utf8_size(full))
+        exact = _ADAPTER.serialize_query_response(response, budget=409)
         self.assertEqual(exact, full)
         json.loads(exact)
-        self.assertEqual(_utf8_size(exact), _utf8_size(full))
+        self.assertEqual(exact, _dumps(json.loads(exact)))
+        self.assertEqual(_utf8_size(exact), 409)
+        self.assertEqual(_utf8_size(full), 409)
+        full_parsed = json.loads(full)
+        self.assertEqual(full_parsed["origin"], "python_mcp")
+        self.assertEqual(full_parsed["records"][0]["kind"], "document")
+        self.assertFalse(full_parsed["truncation"]["truncated"])
+        self.assertEqual(
+            full_parsed["records"][0]["value"]["note"],
+            "caf\u00e9 \u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22",
+        )
+        self.assertIn(
+            "caf\\u00e9 \\u6f22\\u6f22\\u6f22\\u6f22\\u6f22\\u6f22\\u6f22\\u6f22",
+            full,
+        )
 
-        tight_budget = _utf8_size(full) - 1
+        tight_budget = 408
         tight = _ADAPTER.serialize_query_response(response, budget=tight_budget)
         expected_tight = _expected_text(records, budget=tight_budget)
         self.assertEqual(tight, expected_tight)
         parsed = json.loads(tight)
         self.assertEqual(tight, _dumps(parsed))
+        self.assertEqual(_utf8_size(tight), 404)
         self.assertLessEqual(_utf8_size(tight), tight_budget)
+        self.assertEqual(parsed["origin"], "python_mcp")
+        self.assertEqual(parsed["records"][0]["kind"], "document")
         self.assertTrue(parsed["truncation"]["truncated"])
+        self.assertEqual(parsed["truncation"]["omitted_items"], 0)
+        self.assertEqual(parsed["truncation"]["omitted_characters"], 4)
         self.assertEqual(parsed["continuation"], {"kind": "narrow_query"})
+        four_han_note = "caf\u00e9 \u6f22\u6f22\u6f22\u6f22"
+        four_han_wire = "caf\\u00e9 \\u6f22\\u6f22\\u6f22\\u6f22"
+        five_han_wire = four_han_wire + "\\u6f22"
+        self.assertEqual(parsed["records"][0]["value"]["note"], four_han_note)
+        self.assertIn('"note": "caf\\u00e9 \\u6f22\\u6f22\\u6f22\\u6f22"', tight)
+        self.assertNotIn(five_han_wire, tight)
+        self.assertEqual(
+            _utf8_size(tight.replace(four_han_wire, five_han_wire, 1)),
+            410,
+        )
+        self.assertGreater(410, tight_budget)
         self.assertNotIn(_QUERY_CANARY, tight)
         self.assertNotIn("cursor", tight)
+
         minus_value = _fixture_case("clip-escaped-unicode-minus-one")["records"][0]["value"]
+        self.assertEqual(minus_value, value)
         minus_records = [{"kind": "document", "value": minus_value}]
-        minus_budget = _utf8_size(_expected_text(minus_records)) - 1
-        minus_text = _ADAPTER.serialize_query_response(
-            {"results": [minus_value]},
-            budget=minus_budget,
+        minus_response = {"results": [minus_value]}
+
+        cafe_budget = 379
+        cafe_text = _ADAPTER.serialize_query_response(
+            minus_response,
+            budget=cafe_budget,
         )
-        self.assertEqual(minus_text, _expected_text(minus_records, budget=minus_budget))
-        self.assertNotIn("\\u6f22", minus_text)
+        self.assertEqual(cafe_text, _expected_text(minus_records, budget=cafe_budget))
+        cafe_parsed = json.loads(cafe_text)
+        self.assertEqual(cafe_text, _dumps(cafe_parsed))
+        self.assertEqual(_utf8_size(cafe_text), 379)
+        self.assertEqual(cafe_parsed["origin"], "python_mcp")
+        self.assertEqual(cafe_parsed["records"][0]["kind"], "document")
+        self.assertEqual(cafe_parsed["records"][0]["value"]["note"], "caf\u00e9")
+        self.assertEqual(cafe_parsed["truncation"]["omitted_items"], 0)
+        self.assertEqual(cafe_parsed["truncation"]["omitted_characters"], 9)
+        self.assertEqual(cafe_parsed["continuation"], {"kind": "narrow_query"})
+        self.assertIn('"note": "caf\\u00e9"', cafe_text)
+        self.assertNotIn("\\u6f22", cafe_text)
+
+        caf_budget = 378
+        caf_text = _ADAPTER.serialize_query_response(
+            minus_response,
+            budget=caf_budget,
+        )
+        self.assertEqual(caf_text, _expected_text(minus_records, budget=caf_budget))
+        caf_parsed = json.loads(caf_text)
+        self.assertEqual(caf_text, _dumps(caf_parsed))
+        self.assertEqual(_utf8_size(caf_text), 374)
+        self.assertLessEqual(_utf8_size(caf_text), caf_budget)
+        self.assertEqual(caf_parsed["origin"], "python_mcp")
+        self.assertEqual(caf_parsed["records"][0]["kind"], "document")
+        self.assertEqual(caf_parsed["records"][0]["value"]["note"], "caf")
+        self.assertEqual(caf_parsed["truncation"]["omitted_items"], 0)
+        self.assertEqual(caf_parsed["truncation"]["omitted_characters"], 10)
+        self.assertEqual(caf_parsed["continuation"], {"kind": "narrow_query"})
+        self.assertIn('"note": "caf"', caf_text)
+        self.assertNotIn("\\u00e9", caf_text)
+        self.assertNotIn("\\u6f22", caf_text)
 
     def test_call_tool_budgets_actual_serialized_text(self) -> None:
         document = {"title": "safe-title-neighbor", "body": "x" * 60000}
