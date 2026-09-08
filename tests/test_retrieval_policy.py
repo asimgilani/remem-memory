@@ -152,6 +152,19 @@ class RetrievalPolicyTests(unittest.TestCase):
             "sensitive-related-fact-id-locator-denied-keeps-parent-locators",
             "off-record-after-long-prefix-drops-record-and-locators",
             "nested-relationship-locators-stay-with-relationship",
+            "declared-source-locators-kept-in-order-with-duplicates-identical-prose-redacted",
+            "malformed-source-locator-rejected",
+            "null-source-locator-member-rejected",
+            "incomplete-source-locator-rejected",
+            "unknown-source-locator-role-rejected",
+            "null-source-locator-id-rejected",
+            "source-locator-string-rejected",
+            "source-locators-on-fact-rejected",
+            "null-source-locators-object-absent",
+            "empty-source-locators-absent",
+            "source-locators-kept-with-no-locator-neighbor",
+            "sensitive-source-locators-denied-keeps-neighbor",
+            "off-record-after-long-synthesis-drops-record-and-source-locators",
         ):
             self.assertIn(required, categories)
         self.assertEqual(
@@ -169,6 +182,18 @@ class RetrievalPolicyTests(unittest.TestCase):
         self.assertIn("locator-all-or-nothing-ids", fixture["python_only"])
         self.assertIn(
             "relationship-locator-association-under-truncation",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "source-locator-exact-budget-and-one-byte-short",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "source-locator-all-or-nothing-ids",
+            fixture["python_only"],
+        )
+        self.assertIn(
+            "source-locator-association-under-truncation",
             fixture["python_only"],
         )
 
@@ -937,6 +962,344 @@ class RetrievalPolicyTests(unittest.TestCase):
         self.assertNotIn(related_id, _diagnostics(denied_rel))
         self.assertNotIn(value_related_id, _diagnostics(denied_rel))
 
+    def test_source_locator_exact_budget_and_one_byte_short(self) -> None:
+        document_a = "fedcba98-7654-3210-fedc-ba9876543210"
+        document_b = "01234567-89ab-4def-8123-456789abcdef"
+        document_c = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        required = [
+            {"source_document_id": document_a},
+            {"source_document_id": document_b},
+            {"source_document_id": document_c},
+            {"source_document_id": document_a},
+        ]
+        records = [
+            {
+                "kind": "synthesis",
+                "value": {"title": "alpha-neighbor", "body": "bravo"},
+                "source_locators": required,
+            }
+        ]
+        full = _RP.build_retrieval_envelope(records, origin="python_cli")
+        size = _utf8_size(full)
+        exact = _RP.build_retrieval_envelope(
+            records,
+            origin="python_cli",
+            budget=size,
+        )
+        self.assertEqual(exact, full)
+        self.assertFalse(exact["truncation"]["truncated"])
+        self.assertEqual(exact["records"][0]["source_locators"], required)
+        tight = _RP.build_retrieval_envelope(
+            records,
+            origin="python_cli",
+            budget=size - 1,
+        )
+        self.assertTrue(tight["truncation"]["truncated"])
+        self.assertEqual(tight["continuation"], {"kind": "narrow_query"})
+        self.assertLessEqual(_utf8_size(tight), size - 1)
+        json.loads(_dumps(tight))
+        self._assert_atomic_source_locators(tight, required)
+        self.assertNotIn("alpha-neighbor", _diagnostics(tight))
+
+    def test_source_locator_all_or_nothing_ids(self) -> None:
+        document_a = "fedcba98-7654-3210-fedc-ba9876543210"
+        document_b = "01234567-89ab-4def-8123-456789abcdef"
+        required = [
+            {"source_document_id": document_a},
+            {"source_document_id": document_b},
+            {"source_document_id": document_a},
+        ]
+        records = [
+            {
+                "kind": "synthesis",
+                "value": {"body": "n" * 180},
+                "source_locators": required,
+            }
+        ]
+        full = _RP.build_retrieval_envelope(records, origin="python_hook")
+        full_size = _utf8_size(full)
+        for budget in range(1, full_size + 1):
+            try:
+                result = _RP.build_retrieval_envelope(
+                    records,
+                    origin="python_hook",
+                    budget=budget,
+                )
+            except _RP.RetrievalEnvelopeError as exc:
+                self.assertEqual(
+                    str(exc),
+                    "retrieval budget below minimum envelope",
+                )
+                continue
+            self.assertLessEqual(_utf8_size(result), budget)
+            self._assert_atomic_source_locators(result, required)
+
+    def test_source_locator_association_under_truncation(self) -> None:
+        document_a = "fedcba98-7654-3210-fedc-ba9876543210"
+        document_b = "01234567-89ab-4def-8123-456789abcdef"
+        document_c = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        document_d = "0fedcba9-8765-4321-0fed-cba987654321"
+        sources_a = [
+            {"source_document_id": document_a},
+            {"source_document_id": document_b},
+            {"source_document_id": document_a},
+        ]
+        sources_b = [{"source_document_id": document_c}]
+        first_content = "first-synthesis-" + ("c" * 360)
+        records = [
+            {
+                "kind": "synthesis",
+                "value": {"content": first_content, "title": "owner-a"},
+                "source_locators": sources_a,
+            },
+            {
+                "kind": "synthesis",
+                "value": {"content": "second synthesis", "title": "owner-b"},
+                "source_locators": sources_b,
+            },
+            {
+                "kind": "fact",
+                "value": {"title": "no-locator neighbor"},
+            },
+        ]
+        full = _RP.build_retrieval_envelope(records, origin="python_hook")
+        full_size = _utf8_size(full)
+        ids_a = {document_a, document_b}
+        ids_b = {document_c}
+        for budget in range(1, full_size + 1):
+            try:
+                result = _RP.build_retrieval_envelope(
+                    records,
+                    origin="python_hook",
+                    budget=budget,
+                )
+            except _RP.RetrievalEnvelopeError as exc:
+                self.assertEqual(
+                    str(exc),
+                    "retrieval budget below minimum envelope",
+                )
+                continue
+            self.assertLessEqual(_utf8_size(result), budget)
+            serialized = _dumps(result)
+            owners = []
+            for record in result["records"]:
+                source_locators = record.get("source_locators")
+                if source_locators is None:
+                    self.assertNotEqual(record["kind"], "synthesis")
+                    continue
+                self.assertEqual(record["kind"], "synthesis")
+                self.assertIsInstance(source_locators, list)
+                self.assertTrue(source_locators)
+                for item in source_locators:
+                    self.assertEqual(set(item), {"source_document_id"})
+                    source_id = item["source_document_id"]
+                    self.assertRegex(
+                        source_id,
+                        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    )
+                    self.assertNotEqual(source_id, "")
+                    self.assertNotEqual(source_id, document_d)
+                value = record.get("value")
+                content = ""
+                if type(value) is dict:
+                    raw_content = value.get("content")
+                    if type(raw_content) is str:
+                        content = raw_content
+                    raw_title = value.get("title")
+                    title = raw_title if type(raw_title) is str else ""
+                elif type(value) is str:
+                    content = value
+                    title = ""
+                else:
+                    title = ""
+                owned_ids = [item["source_document_id"] for item in source_locators]
+                if source_locators == sources_a:
+                    self.assertNotEqual(content, "second synthesis")
+                    self.assertNotEqual(title, "owner-b")
+                    self.assertNotIn(document_c, owned_ids)
+                elif source_locators == sources_b:
+                    self.assertNotIn("first-synthesis-", content)
+                    self.assertNotEqual(title, "owner-a")
+                    self.assertNotIn(document_a, owned_ids)
+                    self.assertNotIn(document_b, owned_ids)
+                else:
+                    self.fail("detached or partial source locators")
+                owners.append(source_locators)
+            if sources_a in owners and sources_b in owners:
+                self.assertEqual(owners, [sources_a, sources_b])
+            if sources_a not in owners:
+                for source_id in ids_a:
+                    self.assertNotIn(source_id, serialized)
+            if sources_b not in owners:
+                for source_id in ids_b:
+                    self.assertNotIn(source_id, serialized)
+            self.assertNotIn(document_d, serialized)
+
+    def test_null_and_empty_source_locators_are_absent(self) -> None:
+        variants: list[object] = ["missing", None, []]
+        for source_key in variants:
+            with self.subTest(source_locators=source_key):
+                record: dict[str, object] = {
+                    "kind": "synthesis",
+                    "value": {"title": "plain"},
+                }
+                if source_key != "missing":
+                    record["source_locators"] = source_key
+                records = [record]
+                original = copy.deepcopy(records)
+                result = _RP.build_retrieval_envelope(
+                    records,
+                    origin="python_hook",
+                )
+                self.assertEqual(records, original)
+                self.assertEqual(
+                    result["records"][0],
+                    {"kind": "synthesis", "value": {"title": "plain"}},
+                )
+                self.assertNotIn("source_locators", _dumps(result["records"][0]))
+
+    def test_empty_source_locators_on_fact_remain_absent(self) -> None:
+        records = [
+            {
+                "kind": "fact",
+                "value": {"title": "plain", "valid_until": None},
+                "source_locators": [],
+            }
+        ]
+        original = copy.deepcopy(records)
+        result = _RP.build_retrieval_envelope(records, origin="python_cli")
+        self.assertEqual(records, original)
+        self.assertEqual(
+            result["records"][0],
+            {
+                "kind": "fact",
+                "value": {"title": "plain", "valid_until": None},
+            },
+        )
+        self.assertNotIn("source_locators", _dumps(result["records"][0]))
+        self.assertNotIn("locators", _dumps(result["records"][0]))
+
+    def test_source_locators_do_not_relax_fact_locator_requirements(self) -> None:
+        fact_id = "01234567-89ab-4def-8123-456789abcdef"
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        records = [
+            {
+                "kind": "synthesis",
+                "value": {"content": "SYN-CANARY"},
+                "source_locators": [{"source_document_id": document_id}],
+            },
+            {
+                "kind": "fact",
+                "value": {"content": "INCOMPLETE-FACT-CANARY"},
+                "locators": {"fact_id": fact_id},
+            },
+        ]
+        original = copy.deepcopy(records)
+        with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+            _RP.build_retrieval_envelope(records, origin="python_hook")
+        message = str(ctx.exception)
+        self.assertEqual(message, "invalid retrieval locators")
+        self.assertNotIn(fact_id, message)
+        self.assertNotIn(document_id, message)
+        self.assertNotIn("SYN-CANARY", message)
+        self.assertNotIn("INCOMPLETE-FACT-CANARY", message)
+        self.assertEqual(records, original)
+
+    def test_null_source_locator_members_are_rejected(self) -> None:
+        document_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        cases = [
+            (
+                "NULL-MEMBER-CANARY",
+                [
+                    {"source_document_id": document_id},
+                    None,
+                ],
+            ),
+            (
+                "NULL-ID-CANARY",
+                [{"source_document_id": None}],
+            ),
+            (
+                "STRING-MEMBER-CANARY",
+                [document_id],
+            ),
+        ]
+        for canary, source_locators in cases:
+            with self.subTest(canary=canary):
+                records = [
+                    {
+                        "kind": "synthesis",
+                        "value": {"content": canary},
+                        "source_locators": source_locators,
+                    }
+                ]
+                original = copy.deepcopy(records)
+                with self.assertRaises(_RP.RetrievalEnvelopeError) as ctx:
+                    _RP.build_retrieval_envelope(
+                        records,
+                        origin="python_mcp",
+                    )
+                message = str(ctx.exception)
+                self.assertEqual(message, "invalid retrieval locators")
+                self.assertNotIn(document_id, message)
+                self.assertNotIn(canary, message)
+                self.assertEqual(records, original)
+
+    def test_sensitive_source_locators_count_denied_roles_once(self) -> None:
+        document_a = "fedcba98-7654-3210-fedc-ba9876543210"
+        document_b = "01234567-89ab-4def-8123-456789abcdef"
+        value_document_id = "11111111-2222-3333-4444-555555555555"
+        denied = _RP.build_retrieval_envelope(
+            [
+                {
+                    "kind": "synthesis",
+                    "value": {
+                        "title": "denied-source-owner",
+                        "content": "DENIED-SOURCE-CANARY",
+                    },
+                    "source_locators": [
+                        {"source_document_id": document_a},
+                        {"source_document_id": document_b},
+                    ],
+                },
+                {
+                    "kind": "fact",
+                    "value": {
+                        "title": "safe neighbor",
+                        "source_document_id": value_document_id,
+                        "notes": "kept notes",
+                    },
+                },
+            ],
+            origin="python_hook",
+            sensitive_fields=["source-document-id"],
+        )
+        serialized = _dumps(denied)
+        self.assertEqual(denied["trust"], "untrusted_source")
+        self.assertEqual(denied["access_mode"], "ordinary")
+        self.assertEqual(
+            denied["records"],
+            [
+                {
+                    "kind": "fact",
+                    "value": {"title": "safe neighbor", "notes": "kept notes"},
+                }
+            ],
+        )
+        self.assertEqual(
+            denied["redaction"],
+            {"fields": 3, "values": 0, "records": 0},
+        )
+        self.assertFalse(denied["truncation"]["truncated"])
+        self.assertIsNone(denied["continuation"])
+        self.assertNotIn(document_a, serialized)
+        self.assertNotIn(document_b, serialized)
+        self.assertNotIn(value_document_id, serialized)
+        self.assertNotIn("DENIED-SOURCE-CANARY", serialized)
+        self.assertNotIn("denied-source-owner", serialized)
+        self.assertNotIn(document_a, _diagnostics(denied))
+        self.assertNotIn(document_b, _diagnostics(denied))
+
     def _assert_atomic_locators(
         self,
         result: dict,
@@ -954,6 +1317,31 @@ class RetrievalPolicyTests(unittest.TestCase):
                 self.assertNotEqual(value, "")
         if not result["records"]:
             for value in required.values():
+                self.assertNotIn(value, serialized)
+
+    def _assert_atomic_source_locators(
+        self,
+        result: dict,
+        required: list[dict[str, str]],
+    ) -> None:
+        serialized = _dumps(result)
+        ids = [item["source_document_id"] for item in required]
+        if result["records"]:
+            self.assertEqual(len(result["records"]), 1)
+            record = result["records"][0]
+            self.assertEqual(record["kind"], "synthesis")
+            source_locators = record.get("source_locators")
+            self.assertEqual(source_locators, required)
+            for item in source_locators:
+                self.assertEqual(set(item), {"source_document_id"})
+                value = item["source_document_id"]
+                self.assertRegex(
+                    value,
+                    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                )
+                self.assertNotEqual(value, "")
+        else:
+            for value in ids:
                 self.assertNotIn(value, serialized)
 
 

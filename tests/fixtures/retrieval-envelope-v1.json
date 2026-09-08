@@ -1,6 +1,6 @@
 {
   "version": "retrieval-envelope-v1",
-  "change_note": "Ordinary recall inspects each record fully, then redacts credential and sensitive mapping entries and secret-bearing keys, replaces secret-bearing strings with a fixed marker, and only then truncates structured leaves to the UTF-8 serialization budget. Declared locator slots retain exact canonical UUIDs atomically with their record or relationship; identical strings in ordinary prose still redact or clip. Explicit sensitive-field names apply to declared locator roles; a denied required role suppresses its owning record or relationship instead of emitting a partial set. Supplied required locator IDs reject null. Off-record raw or serialized hits drop the whole record and its locators. No automatic-capture path or generated-ID entropy exemptions apply. Continuation never echoes queries, filters, keys, snippets, or fingerprints.",
+  "change_note": "Ordinary recall inspects each record fully, then redacts credential and sensitive mapping entries and secret-bearing keys, replaces secret-bearing strings with a fixed marker, and only then truncates structured leaves to the UTF-8 serialization budget. Declared locator slots retain exact canonical UUIDs atomically with their record or relationship; identical strings in ordinary prose still redact or clip. A synthesis-owned source_locators list retains exact canonical source_document_id maps in supplied order, including repeats, atomically with that synthesis record. Explicit sensitive-field names apply to declared locator roles; a denied required role suppresses its owning record or relationship instead of emitting a partial set. A denied declared source_document_id role suppresses the complete synthesis owner. Supplied required locator IDs reject null. Off-record raw or serialized hits drop the whole record and its locators, including source_locators. No automatic-capture path or generated-ID entropy exemptions apply. Continuation never echoes queries, filters, keys, snippets, or fingerprints.",
   "scope": {
     "applies_to": [
       "ordinary structured recall envelopes"
@@ -46,10 +46,10 @@
     "exceeds_bounds": "retrieval input exceeds bounds"
   },
   "count_semantics": {
-    "redaction.fields": "Mapping entries removed because of credential-like names, additive sensitive names, or secret-bearing keys. Nested content inside a removed entry is not counted separately. Declared locator roles denied by additive sensitive names count here and suppress their owning record or relationship.",
+    "redaction.fields": "Mapping entries removed because of credential-like names, additive sensitive names, or secret-bearing keys. Nested content inside a removed entry is not counted separately. Declared locator roles denied by additive sensitive names count here and suppress their owning record or relationship. Each denied declared source_document_id role on a synthesis source_locators member counts here once and suppresses that complete synthesis owner.",
     "redaction.values": "String leaves replaced by the fixed redaction marker. The whole string is replaced; secrets are not cut into a prefix.",
     "redaction.records": "Whole records omitted because an off-record indication appeared in the raw or serialized policy view.",
-    "truncation.omitted_items": "Records, object members, or array members dropped to satisfy the byte budget. Off-record redaction is counted under redaction.records instead. A retained record or relationship keeps its declared locator set whole, or that record or relationship is omitted.",
+    "truncation.omitted_items": "Records, object members, or array members dropped to satisfy the byte budget. Off-record redaction is counted under redaction.records instead. A retained record or relationship keeps its declared locator set whole, or that record or relationship is omitted. A retained synthesis keeps its declared source_locators list whole, or that synthesis is omitted.",
     "truncation.omitted_characters": "Unicode code points removed from kept string leaves. Omitted items do not add their lengths here. Locator UUID strings are never clipped."
   },
   "python_only": [
@@ -57,7 +57,10 @@
     "cyclic-values-rejected-without-content",
     "locator-exact-budget-and-one-byte-short",
     "locator-all-or-nothing-ids",
-    "relationship-locator-association-under-truncation"
+    "relationship-locator-association-under-truncation",
+    "source-locator-exact-budget-and-one-byte-short",
+    "source-locator-all-or-nothing-ids",
+    "source-locator-association-under-truncation"
   ],
   "cases": [
     {
@@ -1913,6 +1916,470 @@
           }
         ],
         "redaction": {"fields": 1, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "declared-source-locators-kept-in-order-with-duplicates-identical-prose-redacted",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {
+            "content": "01234567-89ab-4def-8123-456789abcdef",
+            "title": "safe-title-neighbor"
+          },
+          "source_locators": [
+            {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"},
+            {"source_document_id": "01234567-89ab-4def-8123-456789abcdef"},
+            {"source_document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"},
+            {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"}
+          ]
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["01234567-89ab-4def-8123-456789abcdef"],
+      "absent": [],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "synthesis",
+            "value": {
+              "content": "[redacted]",
+              "title": "safe-title-neighbor"
+            },
+            "source_locators": [
+              {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"},
+              {"source_document_id": "01234567-89ab-4def-8123-456789abcdef"},
+              {"source_document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"},
+              {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"}
+            ]
+          }
+        ],
+        "redaction": {"fields": 0, "values": 1, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "malformed-source-locator-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {"content": "SOURCE-SHAPE-CANARY"},
+          "source_locators": [
+            {
+              "source_document_id": "not-a-uuid"
+            }
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "not-a-uuid",
+        "SOURCE-SHAPE-CANARY"
+      ]
+    },
+    {
+      "id": "null-source-locator-member-rejected",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {"content": "NULL-SOURCE-MEMBER-CANARY"},
+          "source_locators": [
+            {
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            },
+            null
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "NULL-SOURCE-MEMBER-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "incomplete-source-locator-rejected",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {"content": "INCOMPLETE-SOURCE-CANARY"},
+          "source_locators": [
+            {
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            },
+            {}
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "INCOMPLETE-SOURCE-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "unknown-source-locator-role-rejected",
+      "origin": "openclaw_tool",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {"content": "SOURCE-ROLE-CANARY"},
+          "source_locators": [
+            {
+              "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            }
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "fact_id",
+        "SOURCE-ROLE-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "null-source-locator-id-rejected",
+      "origin": "openclaw_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {"content": "NULL-SOURCE-ID-CANARY"},
+          "source_locators": [
+            {
+              "source_document_id": null
+            }
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "NULL-SOURCE-ID-CANARY",
+        "source_document_id"
+      ]
+    },
+    {
+      "id": "source-locator-string-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {"content": "SOURCE-STRING-CANARY"},
+          "source_locators": "fedcba98-7654-3210-fedc-ba9876543210"
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "SOURCE-STRING-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "source-locators-on-fact-rejected",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "FACT-SOURCE-CANARY"},
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "source_locators": [
+            {
+              "source_document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "FACT-SOURCE-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      ]
+    },
+    {
+      "id": "null-source-locators-object-absent",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {
+            "content": "no source locator list"
+          },
+          "source_locators": null
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["source_locators"],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "synthesis",
+            "value": {
+              "content": "no source locator list"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "empty-source-locators-absent",
+      "origin": "openclaw_tool",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {
+            "content": "empty source locator list"
+          },
+          "source_locators": []
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "no-locator neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["source_locators"],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "openclaw_tool",
+        "records": [
+          {
+            "kind": "synthesis",
+            "value": {
+              "content": "empty source locator list"
+            }
+          },
+          {
+            "kind": "fact",
+            "value": {
+              "title": "no-locator neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "source-locators-kept-with-no-locator-neighbor",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {
+            "content": "kept synthesis"
+          },
+          "source_locators": [
+            {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"},
+            {"source_document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+          ]
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "no-locator neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_cli",
+        "records": [
+          {
+            "kind": "synthesis",
+            "value": {
+              "content": "kept synthesis"
+            },
+            "source_locators": [
+              {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"},
+              {"source_document_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+            ]
+          },
+          {
+            "kind": "fact",
+            "value": {
+              "title": "no-locator neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "sensitive-source-locators-denied-keeps-neighbor",
+      "origin": "python_hook",
+      "sensitive_fields": ["source-document-id"],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": {
+            "title": "denied-source-owner",
+            "content": "DENIED-SOURCE-CANARY"
+          },
+          "source_locators": [
+            {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"},
+            {"source_document_id": "01234567-89ab-4def-8123-456789abcdef"}
+          ]
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "safe neighbor",
+            "source_document_id": "11111111-2222-3333-4444-555555555555",
+            "notes": "kept notes"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "DENIED-SOURCE-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "11111111-2222-3333-4444-555555555555"
+      ],
+      "absent": [
+        "DENIED-SOURCE-CANARY",
+        "denied-source-owner",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "11111111-2222-3333-4444-555555555555"
+      ],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "title": "safe neighbor",
+              "notes": "kept notes"
+            }
+          }
+        ],
+        "redaction": {"fields": 3, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "off-record-after-long-synthesis-drops-record-and-source-locators",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 400,
+      "records": [
+        {
+          "kind": "synthesis",
+          "value": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB off the record",
+          "source_locators": [
+            {"source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"},
+            {"source_document_id": "01234567-89ab-4def-8123-456789abcdef"}
+          ]
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "kept-neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "off the record",
+        "BBBBBBBBBB",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "01234567-89ab-4def-8123-456789abcdef"
+      ],
+      "absent": [
+        "off the record",
+        "BBBBBBBBBB",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "01234567-89ab-4def-8123-456789abcdef"
+      ],
+      "serialized_utf8_bytes": 349,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "title": "kept-neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 1},
         "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
         "continuation": null
       }
