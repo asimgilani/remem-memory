@@ -48,6 +48,7 @@ _ERROR_INVALID_RECORDS = "invalid retrieval records"
 _ERROR_INVALID_SENSITIVE_FIELDS = "invalid sensitive fields"
 _ERROR_UNSUPPORTED_VALUE = "unsupported retrieval value"
 _ERROR_EXCEEDS_BOUNDS = "retrieval input exceeds bounds"
+_JSON_SEPARATORS = (", ", ": ")
 
 
 class RetrievalEnvelopeError(ValueError):
@@ -76,31 +77,19 @@ def build_retrieval_envelope(
     apply to retrieved prose. Serialized JSON is never sliced.
     """
 
-    if origin not in RETRIEVAL_ORIGINS:
+    if type(origin) is not str or origin not in RETRIEVAL_ORIGINS:
         raise RetrievalEnvelopeError(_ERROR_INVALID_ORIGIN)
     if type(budget) is not int or budget < 1:
         raise RetrievalEnvelopeError(_ERROR_INVALID_BUDGET)
     extras = _validated_sensitive_fields(sensitive_fields)
     items = _validated_records(records)
     redacted, counts = _redact_records(items, extras)
-    envelope_origin = str(origin)
     redaction = {
         "fields": counts.fields,
         "values": counts.values,
         "records": counts.records,
     }
-    minimum = _utf8_size(
-        _envelope(
-            envelope_origin,
-            [],
-            redaction,
-            _truncation(True, 0, 0),
-            dict(_CONTINUATION),
-        )
-    )
-    if budget < minimum:
-        raise RetrievalEnvelopeError(_ERROR_BUDGET_TOO_SMALL)
-    return _pack(envelope_origin, redacted, redaction, budget)
+    return _pack(origin, redacted, redaction, budget)
 
 
 def _validated_sensitive_fields(value: object) -> frozenset[str]:
@@ -129,7 +118,7 @@ def _validated_records(value: object) -> list[dict[str, object]]:
         if type(item) is not dict:
             raise RetrievalEnvelopeError(_ERROR_INVALID_RECORDS)
         kind = item.get("kind")
-        if kind not in RETRIEVAL_KINDS or "value" not in item:
+        if type(kind) is not str or kind not in RETRIEVAL_KINDS or "value" not in item:
             raise RetrievalEnvelopeError(_ERROR_INVALID_RECORDS)
         nodes = _scan(item["value"], 1, set(), nodes)
         records.append({"kind": kind, "value": item["value"]})
@@ -536,7 +525,12 @@ def _truncation(
 
 
 def _dumps(value: object) -> str:
-    return json.dumps(value, ensure_ascii=True, allow_nan=False)
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=_JSON_SEPARATORS,
+    )
 
 
 def _utf8_size(value: object) -> int:

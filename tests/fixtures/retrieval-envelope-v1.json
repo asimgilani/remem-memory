@@ -29,6 +29,12 @@
   ],
   "redaction_marker": "[redacted]",
   "default_budget": 50000,
+  "serialization": {
+    "ensure_ascii": true,
+    "allow_nan": false,
+    "separators": [", ", ": "],
+    "encoding": "utf-8"
+  },
   "errors": {
     "invalid_origin": "invalid retrieval origin",
     "invalid_budget": "invalid retrieval budget",
@@ -733,6 +739,475 @@
       "expect": "error",
       "error": "invalid retrieval records",
       "needles": ["KIND-CANARY", "raw_document"]
+    },
+    {
+      "id": "origin-list-rejected",
+      "origin": ["python_hook", "VALIDATION-CANARY"],
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": "VALIDATION-CANARY"
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval origin",
+      "needles": ["VALIDATION-CANARY", "python_hook"]
+    },
+    {
+      "id": "origin-object-rejected",
+      "origin": {"label": "VALIDATION-CANARY"},
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": "VALIDATION-CANARY"
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval origin",
+      "needles": ["VALIDATION-CANARY", "label"]
+    },
+    {
+      "id": "origin-boolean-rejected",
+      "origin": true,
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "document",
+          "value": "VALIDATION-CANARY"
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval origin",
+      "needles": ["VALIDATION-CANARY"]
+    },
+    {
+      "id": "kind-list-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": [],
+          "value": "VALIDATION-CANARY"
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval records",
+      "needles": ["VALIDATION-CANARY"]
+    },
+    {
+      "id": "kind-object-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": {"label": "VALIDATION-CANARY"},
+          "value": "KIND-DICT-CANARY"
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval records",
+      "needles": ["VALIDATION-CANARY", "KIND-DICT-CANARY"]
+    },
+    {
+      "id": "empty-exact-budget",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 297,
+      "records": [],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "serialized_utf8_bytes": 297,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "empty-one-byte-less",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 296,
+      "records": [],
+      "expect": "error",
+      "error": "retrieval budget below minimum envelope",
+      "needles": []
+    },
+    {
+      "id": "clip-escaped-quote",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 352,
+      "records": [
+        {
+          "kind": "chunk",
+          "value": "aaaa\"bbbbcccccccccccccccccccccccccccccc"
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["bbbb"],
+      "serialized_utf8_bytes": 351,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {
+            "kind": "chunk",
+            "value": "aaaa"
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 0, "omitted_characters": 35},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "clip-escaped-unicode-exact",
+      "origin": "openclaw_cli",
+      "sensitive_fields": [],
+      "budget": 377,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "ok": true,
+            "note": "caf\u00e9 \u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["\\u6f22"],
+      "serialized_utf8_bytes": 377,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "openclaw_cli",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "ok": true,
+              "note": "caf\u00e9"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 0, "omitted_characters": 9},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "clip-escaped-unicode-minus-one",
+      "origin": "openclaw_cli",
+      "sensitive_fields": [],
+      "budget": 376,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "ok": true,
+            "note": "caf\u00e9 \u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22\u6f22"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["\\u00e9", "\\u6f22"],
+      "serialized_utf8_bytes": 372,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "openclaw_cli",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "ok": true,
+              "note": "caf"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 0, "omitted_characters": 10},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "omit-oversized-key-keeps-neighbor",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 362,
+      "records": [
+        {
+          "kind": "document",
+          "value": {
+            "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk": "x",
+            "title": "ok"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["kkkkkkkkkk"],
+      "serialized_utf8_bytes": 362,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {
+            "kind": "document",
+            "value": {
+              "title": "ok"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 1, "omitted_characters": 0},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "omit-list-members",
+      "origin": "openclaw_tool",
+      "sensitive_fields": [],
+      "budget": 360,
+      "records": [
+        {
+          "kind": "chunk",
+          "value": ["one", "two", "three", "four", "five"]
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["three", "four", "five"],
+      "serialized_utf8_bytes": 360,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "openclaw_tool",
+        "records": [
+          {
+            "kind": "chunk",
+            "value": ["one", "two"]
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 3, "omitted_characters": 0},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "omit-records-omitted-items-digit-boundary",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 375,
+      "records": [
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1}
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "serialized_utf8_bytes": 375,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {"kind": "fact", "value": 1},
+          {"kind": "fact", "value": 1}
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 10, "omitted_characters": 0},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "omit-records-omitted-items-digit-boundary-minus-one",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 374,
+      "records": [
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1},
+        {"kind": "fact", "value": 1}
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "serialized_utf8_bytes": 345,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {"kind": "fact", "value": 1}
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 11, "omitted_characters": 0},
+        "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "scan-before-clip-secret-prefix",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 400,
+      "records": [
+        {
+          "kind": "chunk",
+          "value": {
+            "content": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA sk-abcdefghijklmnopqrstuvwxyz1234567890",
+            "title": "safe-title-neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+        "AAAAAAAAAAAAAAAAAA"
+      ],
+      "absent": [
+        "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+        "AAAAAAAAAAAAAAAAAA"
+      ],
+      "serialized_utf8_bytes": 382,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {
+            "kind": "chunk",
+            "value": {
+              "content": "[redacted]",
+              "title": "safe-title-neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 1, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "scan-before-clip-off-record-prefix",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 400,
+      "records": [
+        {
+          "kind": "document",
+          "value": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB off the record"
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "kept-neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["off the record", "BBBBBBBBBB"],
+      "absent": ["off the record", "BBBBBBBBBB"],
+      "serialized_utf8_bytes": 349,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "title": "kept-neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 1},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "mixed-redaction-and-string-clip",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 388,
+      "records": [
+        {
+          "kind": "document",
+          "value": {
+            "password": "hunter2-not-a-real-password",
+            "body": "cccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["hunter2-not-a-real-password"],
+      "absent": ["hunter2-not-a-real-password"],
+      "serialized_utf8_bytes": 388,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_cli",
+        "records": [
+          {
+            "kind": "document",
+            "value": {
+              "body": "ccccccccccccccccccccccccccccc"
+            }
+          }
+        ],
+        "redaction": {"fields": 1, "values": 0, "records": 0},
+        "truncation": {"truncated": true, "omitted_items": 0, "omitted_characters": 21},
+        "continuation": {"kind": "narrow_query"}
+      }
     }
   ]
 }

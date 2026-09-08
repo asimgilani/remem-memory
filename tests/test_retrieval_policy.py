@@ -40,7 +40,12 @@ def _load_fixture() -> dict:
 
 
 def _dumps(value: object) -> str:
-    return json.dumps(value, ensure_ascii=True, allow_nan=False)
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(", ", ": "),
+    )
 
 
 def _utf8_size(value: object) -> int:
@@ -93,6 +98,11 @@ class RetrievalPolicyTests(unittest.TestCase):
         self.assertEqual(_RP.REDACTION_MARKER, fixture["redaction_marker"])
         self.assertEqual(set(fixture["origins"]), set(_RP.RETRIEVAL_ORIGINS))
         self.assertEqual(set(fixture["kinds"]), set(_RP.RETRIEVAL_KINDS))
+        serialization = fixture["serialization"]
+        self.assertEqual(serialization["ensure_ascii"], True)
+        self.assertEqual(serialization["allow_nan"], False)
+        self.assertEqual(serialization["separators"], [", ", ": "])
+        self.assertEqual(serialization["encoding"], "utf-8")
         note = fixture["change_note"].lower()
         self.assertIn("redact", note)
         self.assertIn("truncat", note)
@@ -106,6 +116,23 @@ class RetrievalPolicyTests(unittest.TestCase):
             "prompt-injection-remains-untrusted-source",
             "unicode-escaping-preserved",
             "tiny-budget-rejected",
+            "origin-list-rejected",
+            "origin-object-rejected",
+            "origin-boolean-rejected",
+            "kind-list-rejected",
+            "kind-object-rejected",
+            "empty-exact-budget",
+            "empty-one-byte-less",
+            "clip-escaped-quote",
+            "clip-escaped-unicode-exact",
+            "clip-escaped-unicode-minus-one",
+            "omit-oversized-key-keeps-neighbor",
+            "omit-list-members",
+            "omit-records-omitted-items-digit-boundary",
+            "omit-records-omitted-items-digit-boundary-minus-one",
+            "scan-before-clip-secret-prefix",
+            "scan-before-clip-off-record-prefix",
+            "mixed-redaction-and-string-clip",
         ):
             self.assertIn(required, categories)
         self.assertIn(
@@ -145,6 +172,7 @@ class RetrievalPolicyTests(unittest.TestCase):
                 result = _call(case)
                 self.assertEqual(records, original)
                 self.assertEqual(result, case["expected"])
+                self.assertEqual(result, _call(case))
                 self.assertEqual(
                     list(result.keys()),
                     [
@@ -161,10 +189,10 @@ class RetrievalPolicyTests(unittest.TestCase):
                 serialized = _dumps(result)
                 parsed = json.loads(serialized)
                 self.assertEqual(parsed, result)
-                self.assertLessEqual(
-                    len(serialized.encode("utf-8")),
-                    case["budget"],
-                )
+                encoded = serialized.encode("utf-8")
+                self.assertLessEqual(len(encoded), case["budget"])
+                if "serialized_utf8_bytes" in case:
+                    self.assertEqual(len(encoded), case["serialized_utf8_bytes"])
                 diagnostics = _diagnostics(result)
                 for needle in _needles(case):
                     self.assertNotIn(needle, diagnostics)
