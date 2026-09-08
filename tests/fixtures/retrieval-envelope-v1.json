@@ -1,6 +1,6 @@
 {
   "version": "retrieval-envelope-v1",
-  "change_note": "Ordinary recall inspects each record fully, then redacts credential and sensitive mapping entries and secret-bearing keys, replaces secret-bearing strings with a fixed marker, and only then truncates structured leaves to the UTF-8 serialization budget. Off-record raw or serialized hits drop the whole record. No automatic-capture path or generated-ID entropy exemptions apply. Continuation never echoes queries, filters, keys, snippets, or fingerprints.",
+  "change_note": "Ordinary recall inspects each record fully, then redacts credential and sensitive mapping entries and secret-bearing keys, replaces secret-bearing strings with a fixed marker, and only then truncates structured leaves to the UTF-8 serialization budget. Declared locator slots retain exact canonical UUIDs atomically with their record or relationship; identical strings in ordinary prose still redact or clip. Explicit sensitive-field names apply to declared locator roles; a denied required role suppresses its owning record or relationship instead of emitting a partial set. Supplied required locator IDs reject null. Off-record raw or serialized hits drop the whole record and its locators. No automatic-capture path or generated-ID entropy exemptions apply. Continuation never echoes queries, filters, keys, snippets, or fingerprints.",
   "scope": {
     "applies_to": [
       "ordinary structured recall envelopes"
@@ -40,20 +40,24 @@
     "invalid_budget": "invalid retrieval budget",
     "budget_too_small": "retrieval budget below minimum envelope",
     "invalid_records": "invalid retrieval records",
+    "invalid_locators": "invalid retrieval locators",
     "invalid_sensitive_fields": "invalid sensitive fields",
     "unsupported_value": "unsupported retrieval value",
     "exceeds_bounds": "retrieval input exceeds bounds"
   },
   "count_semantics": {
-    "redaction.fields": "Mapping entries removed because of credential-like names, additive sensitive names, or secret-bearing keys. Nested content inside a removed entry is not counted separately.",
+    "redaction.fields": "Mapping entries removed because of credential-like names, additive sensitive names, or secret-bearing keys. Nested content inside a removed entry is not counted separately. Declared locator roles denied by additive sensitive names count here and suppress their owning record or relationship.",
     "redaction.values": "String leaves replaced by the fixed redaction marker. The whole string is replaced; secrets are not cut into a prefix.",
     "redaction.records": "Whole records omitted because an off-record indication appeared in the raw or serialized policy view.",
-    "truncation.omitted_items": "Records, object members, or array members dropped to satisfy the byte budget. Off-record redaction is counted under redaction.records instead.",
-    "truncation.omitted_characters": "Unicode code points removed from kept string leaves. Omitted items do not add their lengths here."
+    "truncation.omitted_items": "Records, object members, or array members dropped to satisfy the byte budget. Off-record redaction is counted under redaction.records instead. A retained record or relationship keeps its declared locator set whole, or that record or relationship is omitted.",
+    "truncation.omitted_characters": "Unicode code points removed from kept string leaves. Omitted items do not add their lengths here. Locator UUID strings are never clipped."
   },
   "python_only": [
     "shared-references-checked-in-each-field-context",
-    "cyclic-values-rejected-without-content"
+    "cyclic-values-rejected-without-content",
+    "locator-exact-budget-and-one-byte-short",
+    "locator-all-or-nothing-ids",
+    "relationship-locator-association-under-truncation"
   ],
   "cases": [
     {
@@ -1207,6 +1211,710 @@
         "redaction": {"fields": 1, "values": 0, "records": 0},
         "truncation": {"truncated": true, "omitted_items": 0, "omitted_characters": 21},
         "continuation": {"kind": "narrow_query"}
+      }
+    },
+    {
+      "id": "declared-high-entropy-uuid-locator-kept-identical-prose-redacted",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "01234567-89ab-4def-8123-456789abcdef",
+            "title": "safe-title-neighbor"
+          },
+          "locators": {
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210",
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": ["01234567-89ab-4def-8123-456789abcdef"],
+      "absent": [],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "content": "[redacted]",
+              "title": "safe-title-neighbor"
+            },
+            "locators": {
+              "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 1, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "malformed-locator-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "LOCATOR-SHAPE-CANARY"},
+          "locators": {
+            "fact_id": "not-a-uuid",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "not-a-uuid",
+        "LOCATOR-SHAPE-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "uppercase-locator-rejected",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "UPPER-LOCATOR-CANARY"},
+          "locators": {
+            "fact_id": "A8098C1A-F86E-11DA-BD1A-00112444BE1E",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "A8098C1A-F86E-11DA-BD1A-00112444BE1E",
+        "UPPER-LOCATOR-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "empty-locator-string-rejected",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "EMPTY-LOCATOR-CANARY"},
+          "locators": {
+            "fact_id": "",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "EMPTY-LOCATOR-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "truncated-locator-rejected",
+      "origin": "openclaw_tool",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "TRUNCATED-LOCATOR-CANARY"},
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcde",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "01234567-89ab-4def-8123-456789abcde",
+        "TRUNCATED-LOCATOR-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "secret-bearing-locator-rejected",
+      "origin": "openclaw_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "SECRET-LOCATOR-CANARY"},
+          "locators": {
+            "fact_id": "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+        "SECRET-LOCATOR-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "extra-id-key-locator-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "EXTRA-ID-CANARY"},
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "entity_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "entity_id",
+        "EXTRA-ID-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef"
+      ]
+    },
+    {
+      "id": "related-fact-id-at-record-locator-rejected",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "ROLE-CANARY"},
+          "locators": {
+            "related_fact_id": "01234567-89ab-4def-8123-456789abcdef"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": ["related_fact_id", "ROLE-CANARY", "01234567-89ab-4def-8123-456789abcdef"]
+    },
+    {
+      "id": "generated-turn-id-not-a-locator",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {"content": "TURN-LOCATOR-CANARY"},
+          "locators": {
+            "fact_id": "turn-0123456789abcdef0123456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "turn-0123456789abcdef0123456789abcdef",
+        "TURN-LOCATOR-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "null-locator-object-absent",
+      "origin": "openclaw_tool",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "no locator map",
+            "valid_until": null
+          },
+          "locators": null
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": ["locators"],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "openclaw_tool",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "content": "no locator map",
+              "valid_until": null
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "null-fact-id-locator-rejected",
+      "origin": "python_hook",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "NULL-FACT-CANARY",
+            "valid_until": null
+          },
+          "locators": {
+            "fact_id": null,
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "NULL-FACT-CANARY",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "null-source-document-id-locator-rejected",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "NULL-DOC-CANARY",
+            "valid_until": null
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": null
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "NULL-DOC-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef"
+      ]
+    },
+    {
+      "id": "null-related-fact-id-locator-rejected",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "NULL-REL-CANARY",
+            "valid_until": null
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "relationships": [
+            {
+              "value": {
+                "rel_type": "updates"
+              },
+              "locators": {
+                "related_fact_id": null
+              }
+            }
+          ]
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "NULL-REL-CANARY",
+        "related_fact_id",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ]
+    },
+    {
+      "id": "incomplete-record-locator-rejected",
+      "origin": "openclaw_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "INCOMPLETE-LOCATOR-CANARY"
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef"
+          }
+        }
+      ],
+      "expect": "error",
+      "error": "invalid retrieval locators",
+      "needles": [
+        "INCOMPLETE-LOCATOR-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef"
+      ]
+    },
+    {
+      "id": "required-locator-set-kept-with-null-value-and-no-locator-neighbor",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "kept fact",
+            "valid_until": null
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "no-locator neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [],
+      "absent": [],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_cli",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "content": "kept fact",
+              "valid_until": null
+            },
+            "locators": {
+              "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            }
+          },
+          {
+            "kind": "fact",
+            "value": {
+              "title": "no-locator neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "sensitive-source-document-id-locator-denied-keeps-neighbor",
+      "origin": "python_hook",
+      "sensitive_fields": ["source-document-id"],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "title": "denied-locator-owner",
+            "content": "DENIED-TOP-CANARY"
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "safe neighbor",
+            "source_document_id": "11111111-2222-3333-4444-555555555555",
+            "notes": "kept notes"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "DENIED-TOP-CANARY",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "11111111-2222-3333-4444-555555555555"
+      ],
+      "absent": [
+        "DENIED-TOP-CANARY",
+        "denied-locator-owner",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210",
+        "11111111-2222-3333-4444-555555555555"
+      ],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_hook",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "title": "safe neighbor",
+              "notes": "kept notes"
+            }
+          }
+        ],
+        "redaction": {"fields": 2, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "sensitive-related-fact-id-locator-denied-keeps-parent-locators",
+      "origin": "python_cli",
+      "sensitive_fields": ["related_fact_id"],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "parent fact",
+            "related_fact_id": "99999999-8888-7777-6666-555555555555",
+            "title": "kept parent"
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "relationships": [
+            {
+              "value": {
+                "rel_type": "updates",
+                "related_fact_content": "DENIED-REL-CANARY"
+              },
+              "locators": {
+                "related_fact_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              }
+            },
+            {
+              "value": {
+                "rel_type": "extends",
+                "related_fact_content": "kept related"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "DENIED-REL-CANARY",
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "99999999-8888-7777-6666-555555555555"
+      ],
+      "absent": [
+        "DENIED-REL-CANARY",
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "99999999-8888-7777-6666-555555555555"
+      ],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_cli",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "content": "parent fact",
+              "title": "kept parent"
+            },
+            "locators": {
+              "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            },
+            "relationships": [
+              {
+                "value": {
+                  "rel_type": "extends",
+                  "related_fact_content": "kept related"
+                }
+              }
+            ]
+          }
+        ],
+        "redaction": {"fields": 2, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "off-record-after-long-prefix-drops-record-and-locators",
+      "origin": "python_mcp",
+      "sensitive_fields": [],
+      "budget": 400,
+      "records": [
+        {
+          "kind": "document",
+          "value": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB off the record",
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          }
+        },
+        {
+          "kind": "fact",
+          "value": {
+            "title": "kept-neighbor"
+          }
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "off the record",
+        "BBBBBBBBBB",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ],
+      "absent": [
+        "off the record",
+        "BBBBBBBBBB",
+        "01234567-89ab-4def-8123-456789abcdef",
+        "fedcba98-7654-3210-fedc-ba9876543210"
+      ],
+      "serialized_utf8_bytes": 349,
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_mcp",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "title": "kept-neighbor"
+            }
+          }
+        ],
+        "redaction": {"fields": 0, "values": 0, "records": 1},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
+      }
+    },
+    {
+      "id": "nested-relationship-locators-stay-with-relationship",
+      "origin": "python_cli",
+      "sensitive_fields": [],
+      "budget": 50000,
+      "records": [
+        {
+          "kind": "fact",
+          "value": {
+            "content": "parent fact",
+            "title": "kept"
+          },
+          "locators": {
+            "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+            "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+          },
+          "relationships": [
+            {
+              "value": {
+                "rel_type": "updates",
+                "related_fact_content": "first related",
+                "password": "hunter2-not-a-real-password"
+              },
+              "locators": {
+                "related_fact_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              }
+            },
+            {
+              "value": {
+                "rel_type": "extends",
+                "related_fact_content": "second related"
+              },
+              "locators": {
+                "related_fact_id": "0fedcba9-8765-4321-0fed-cba987654321"
+              }
+            }
+          ]
+        }
+      ],
+      "expect": "envelope",
+      "needles": [
+        "hunter2-not-a-real-password",
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "0fedcba9-8765-4321-0fed-cba987654321"
+      ],
+      "absent": ["hunter2-not-a-real-password"],
+      "expected": {
+        "policy_version": "retrieval-envelope-v1",
+        "access_mode": "ordinary",
+        "trust": "untrusted_source",
+        "origin": "python_cli",
+        "records": [
+          {
+            "kind": "fact",
+            "value": {
+              "content": "parent fact",
+              "title": "kept"
+            },
+            "locators": {
+              "fact_id": "01234567-89ab-4def-8123-456789abcdef",
+              "source_document_id": "fedcba98-7654-3210-fedc-ba9876543210"
+            },
+            "relationships": [
+              {
+                "value": {
+                  "rel_type": "updates",
+                  "related_fact_content": "first related"
+                },
+                "locators": {
+                  "related_fact_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                }
+              },
+              {
+                "value": {
+                  "rel_type": "extends",
+                  "related_fact_content": "second related"
+                },
+                "locators": {
+                  "related_fact_id": "0fedcba9-8765-4321-0fed-cba987654321"
+                }
+              }
+            ]
+          }
+        ],
+        "redaction": {"fields": 1, "values": 0, "records": 0},
+        "truncation": {"truncated": false, "omitted_items": 0, "omitted_characters": 0},
+        "continuation": null
       }
     }
   ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from typing import Callable
 
@@ -45,10 +46,16 @@ _ERROR_INVALID_ORIGIN = "invalid retrieval origin"
 _ERROR_INVALID_BUDGET = "invalid retrieval budget"
 _ERROR_BUDGET_TOO_SMALL = "retrieval budget below minimum envelope"
 _ERROR_INVALID_RECORDS = "invalid retrieval records"
+_ERROR_INVALID_LOCATORS = "invalid retrieval locators"
 _ERROR_INVALID_SENSITIVE_FIELDS = "invalid sensitive fields"
 _ERROR_UNSUPPORTED_VALUE = "unsupported retrieval value"
 _ERROR_EXCEEDS_BOUNDS = "retrieval input exceeds bounds"
 _JSON_SEPARATORS = (", ", ": ")
+_CANONICAL_UUID = re.compile(
+    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+_RECORD_LOCATOR_ROLES = ("fact_id", "source_document_id")
+_RELATIONSHIP_LOCATOR_ROLES = ("related_fact_id",)
 
 
 class RetrievalEnvelopeError(ValueError):
@@ -74,7 +81,9 @@ def build_retrieval_envelope(
     """Return a closed ordinary-recall envelope for locally selected records.
 
     Path and generated-ID entropy exemptions from automatic capture do not
-    apply to retrieved prose. Serialized JSON is never sliced.
+    apply to retrieved prose. Declared locator slots are exact canonical UUID
+    claims bound to a retained record or relationship; they are not a generic
+    ID exemption and confer no permission. Serialized JSON is never sliced.
     """
 
     if type(origin) is not str or origin not in RETRIEVAL_ORIGINS:
@@ -120,9 +129,104 @@ def _validated_records(value: object) -> list[dict[str, object]]:
         kind = item.get("kind")
         if type(kind) is not str or kind not in RETRIEVAL_KINDS or "value" not in item:
             raise RetrievalEnvelopeError(_ERROR_INVALID_RECORDS)
+        locators = None
+        if "locators" in item:
+            locators = _validated_locators(
+                item["locators"],
+                _RECORD_LOCATOR_ROLES,
+            )
+        relationships = None
+        if "relationships" in item:
+            relationships = _validated_relationships(item["relationships"])
         nodes = _scan(item["value"], 1, set(), nodes)
-        records.append({"kind": kind, "value": item["value"]})
+        if locators is not None:
+            nodes = _scan(locators, 1, set(), nodes)
+        if relationships is not None:
+            for relationship in relationships:
+                nodes = _scan(relationship["value"], 1, set(), nodes)
+                nested = relationship.get("locators")
+                if nested is not None:
+                    nodes = _scan(nested, 1, set(), nodes)
+        records.append(
+            _record_payload(kind, item["value"], locators, relationships)
+        )
     return records
+
+
+def _validated_locators(
+    value: object,
+    roles: tuple[str, ...],
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if type(value) is not dict:
+        raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+    allowed = frozenset(roles)
+    for key in value:
+        if type(key) is not str or key not in allowed:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+    if not value:
+        return None
+    out: dict[str, str] = {}
+    for role in roles:
+        if role not in value:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+        item = value[role]
+        if item is None:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+        if type(item) is not str or _CANONICAL_UUID.fullmatch(item) is None:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+        if contains_explicit_secret(item) or contains_explicit_secret(
+            _dumps(item)
+        ):
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+        out[role] = item
+    return out
+
+
+def _validated_relationships(value: object) -> list[dict[str, object]] | None:
+    if value is None:
+        return None
+    if type(value) not in {list, tuple}:
+        raise RetrievalEnvelopeError(_ERROR_INVALID_RECORDS)
+    relationships: list[dict[str, object]] = []
+    for item in value:
+        if type(item) is not dict or "value" not in item:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_RECORDS)
+        locators = None
+        if "locators" in item:
+            locators = _validated_locators(
+                item["locators"],
+                _RELATIONSHIP_LOCATOR_ROLES,
+            )
+        relationships.append(_relationship_payload(item["value"], locators))
+    if not relationships:
+        return None
+    return relationships
+
+
+def _record_payload(
+    kind: str,
+    value: object,
+    locators: dict[str, str] | None,
+    relationships: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    record: dict[str, object] = {"kind": kind, "value": value}
+    if locators:
+        record["locators"] = locators
+    if relationships:
+        record["relationships"] = relationships
+    return record
+
+
+def _relationship_payload(
+    value: object,
+    locators: dict[str, str] | None,
+) -> dict[str, object]:
+    relationship: dict[str, object] = {"value": value}
+    if locators:
+        relationship["locators"] = locators
+    return relationship
 
 
 def _scan(
@@ -174,17 +278,52 @@ def _redact_records(
     counts = _Counts()
     kept: list[dict[str, object]] = []
     for record in records:
-        value = record["value"]
-        if _contains_off_record(value):
+        if _contains_off_record(_selected_source(record)):
             counts.records += 1
             continue
+        locators = record.get("locators")
+        if type(locators) is not dict:
+            locators = None
+        if _suppress_denied_locators(locators, extras, counts):
+            continue
+        raw_relationships = record.get("relationships")
+        relationships = None
+        if type(raw_relationships) is list:
+            relationships = []
+            for item in raw_relationships:
+                nested = (
+                    item.get("locators")
+                    if type(item.get("locators")) is dict
+                    else None
+                )
+                if _suppress_denied_locators(nested, extras, counts):
+                    continue
+                relationships.append(
+                    _relationship_payload(
+                        _redact(item["value"], extras, counts),
+                        nested,
+                    )
+                )
         kept.append(
-            {
-                "kind": record["kind"],
-                "value": _redact(value, extras, counts),
-            }
+            _record_payload(
+                record["kind"],
+                _redact(record["value"], extras, counts),
+                locators,
+                relationships,
+            )
         )
     return kept, counts
+
+
+def _selected_source(record: Mapping[str, object]) -> dict[str, object]:
+    source: dict[str, object] = {"value": record["value"]}
+    locators = record.get("locators")
+    if locators is not None:
+        source["locators"] = locators
+    relationships = record.get("relationships")
+    if relationships is not None:
+        source["relationships"] = relationships
+    return source
 
 
 def _contains_off_record(value: object) -> bool:
@@ -235,6 +374,23 @@ def _redact(
     return value
 
 
+def _suppress_denied_locators(
+    locators: dict[str, str] | None,
+    extras: frozenset[str],
+    counts: _Counts,
+) -> bool:
+    if locators is None:
+        return False
+    denied = 0
+    for role in locators:
+        if _drop_key(role, extras):
+            denied += 1
+    if not denied:
+        return False
+    counts.fields += denied
+    return True
+
+
 def _drop_key(key: str, extras: frozenset[str]) -> bool:
     if is_credential_field_name(key):
         return True
@@ -267,18 +423,15 @@ def _pack(
     omitted_items = 0
     omitted_characters = 0
     for record in records:
-        kind = record["kind"]
-        value = record["value"]
-        trial = {"kind": kind, "value": value}
         if _fits(
             origin,
-            kept + [trial],
+            kept + [record],
             redaction,
             omitted_items,
             omitted_characters,
             budget,
         ):
-            kept.append(trial)
+            kept.append(record)
             inner_counts.append((0, 0))
             continue
 
@@ -286,24 +439,23 @@ def _pack(
             candidate: object,
             extra_oi: int,
             extra_oc: int,
-            current_kind: str = kind,
             snapshot: list[dict[str, object]] = list(kept),
             base_oi: int = omitted_items,
             base_oc: int = omitted_characters,
         ) -> dict[str, object]:
             return _truncating_envelope(
                 origin,
-                snapshot + [{"kind": current_kind, "value": candidate}],
+                snapshot + [candidate],
                 redaction,
                 base_oi + extra_oi,
                 base_oc + extra_oc,
             )
 
-        fitted, extra_oi, extra_oc = _fit_value(value, make_env, budget)
+        fitted, extra_oi, extra_oc = _fit_record(record, make_env, budget)
         if fitted is None:
             omitted_items += 1
             continue
-        kept.append({"kind": kind, "value": fitted})
+        kept.append(fitted)
         inner_counts.append((extra_oi, extra_oc))
         omitted_items += extra_oi
         omitted_characters += extra_oc
@@ -329,6 +481,131 @@ def _pack(
     if _utf8_size(packed) > budget:
         raise RetrievalEnvelopeError(_ERROR_BUDGET_TOO_SMALL)
     return packed
+
+
+def _fit_record(
+    record: dict[str, object],
+    make_env: Callable[[object, int, int], dict[str, object]],
+    budget: int,
+) -> tuple[dict[str, object] | None, int, int]:
+    kind = record["kind"]
+    locators = record.get("locators")
+    if type(locators) is not dict:
+        locators = None
+    relationships = record.get("relationships")
+    if type(relationships) is not list:
+        relationships = None
+
+    def value_env(
+        candidate: object,
+        extra_oi: int,
+        extra_oc: int,
+    ) -> dict[str, object]:
+        return make_env(
+            _record_payload(kind, candidate, locators, None),
+            extra_oi,
+            extra_oc,
+        )
+
+    fitted_value, omitted_items, omitted_characters = _fit_value(
+        record["value"],
+        value_env,
+        budget,
+    )
+    if fitted_value is None:
+        return None, 0, 0
+    fitted_relationships: list[dict[str, object]] | None = None
+    extra_oi = 0
+    extra_oc = 0
+    if relationships:
+
+        def relationships_env(
+            candidate: object,
+            extra_oi: int,
+            extra_oc: int,
+            current_value: object = fitted_value,
+            value_oi: int = omitted_items,
+            value_oc: int = omitted_characters,
+        ) -> dict[str, object]:
+            rels = candidate if candidate else None
+            return make_env(
+                _record_payload(kind, current_value, locators, rels),
+                value_oi + extra_oi,
+                value_oc + extra_oc,
+            )
+
+        fitted_relationships, extra_oi, extra_oc = _fit_relationships(
+            relationships,
+            relationships_env,
+            budget,
+        )
+        if fitted_relationships is None:
+            return None, 0, 0
+    payload = _record_payload(
+        kind,
+        fitted_value,
+        locators,
+        fitted_relationships,
+    )
+    if _utf8_size(
+        make_env(
+            payload,
+            omitted_items + extra_oi,
+            omitted_characters + extra_oc,
+        )
+    ) > budget:
+        return None, 0, 0
+    return (
+        payload,
+        omitted_items + extra_oi,
+        omitted_characters + extra_oc,
+    )
+
+
+def _fit_relationships(
+    relationships: list[dict[str, object]],
+    make_env: Callable[[object, int, int], dict[str, object]],
+    budget: int,
+) -> tuple[list[dict[str, object]] | None, int, int]:
+    if _utf8_size(make_env([], 0, 0)) > budget:
+        return None, 0, 0
+    out: list[dict[str, object]] = []
+    omitted_items = 0
+    omitted_characters = 0
+    for item in relationships:
+        locators = item.get("locators")
+        if type(locators) is not dict:
+            locators = None
+        value = item["value"]
+        snapshot = list(out)
+        trial = snapshot + [_relationship_payload(value, locators)]
+        if _utf8_size(make_env(trial, omitted_items, omitted_characters)) <= budget:
+            out.append(_relationship_payload(value, locators))
+            continue
+
+        def child_env(
+            candidate: object,
+            extra_oi: int,
+            extra_oc: int,
+            current_locators: dict[str, str] | None = locators,
+            prefix: list[dict[str, object]] = snapshot,
+            base_oi: int = omitted_items,
+            base_oc: int = omitted_characters,
+        ) -> dict[str, object]:
+            return make_env(
+                prefix + [_relationship_payload(candidate, current_locators)],
+                base_oi + extra_oi,
+                base_oc + extra_oc,
+            )
+
+        fitted, extra_oi, extra_oc = _fit_value(value, child_env, budget)
+        if fitted is None:
+            omitted_items += 1
+            continue
+        out.append(_relationship_payload(fitted, locators))
+        omitted_items += extra_oi
+        omitted_characters += extra_oc
+    return out, omitted_items, omitted_characters
 
 
 def _fit_value(
