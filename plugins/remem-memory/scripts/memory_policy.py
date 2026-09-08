@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import Counter
@@ -15,6 +16,33 @@ from typing import Any
 _MAX_QUERY = 2000
 _MAX_CONTEXT = 6000
 _MAX_RESULTS = 4
+AUTOMATIC_CAPTURE_POLICY_VERSION = "automatic-capture-policy-v1"
+_ALLOWED_REASON = "allowed"
+_SECRET_REASON = "secret"
+_OFF_RECORD_REASON = "off-record"
+_CREDENTIAL_FIELD_NAMES = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "client_secret",
+        "id_token",
+        "auth_token",
+    }
+)
+_CREDENTIAL_FIELD_SUFFIXES = (
+    "_password",
+    "_passwd",
+    "_secret",
+    "_token",
+    "_api_key",
+)
 
 _SECRET_PATTERNS = (
     re.compile(
@@ -39,6 +67,17 @@ _SECRET_PATTERNS = (
 )
 _HIGH_ENTROPY_CANDIDATE = re.compile(
     r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9])"
+)
+_GENERATED_TURN_ID = re.compile(r"\Aturn-[0-9a-f]{32}\Z")
+_IDENTIFIER_FIELDS = frozenset({"turn_id", "completed_turn_ids"})
+_LEGACY_GENERATED_REPO_PREFIX = "- Repo: "
+_TRUSTED_PATH_FIELDS = frozenset(
+    {
+        "source_path",
+        "cwd",
+        "repo_root",
+        "transcript_path",
+    }
 )
 _OFF_RECORD = re.compile(
     r"(?:\boff\s+the\s+record\b|(?:^|\s)/remem\s+off-record\b)",
@@ -90,6 +129,15 @@ _TRIVIAL_PROMPT = re.compile(
 
 
 @dataclass(frozen=True)
+class AutomaticCaptureDecision:
+    """A secret/off-record decision safe to retain as aggregate telemetry."""
+
+    allowed: bool
+    reason: str
+    matched_count: int
+
+
+@dataclass(frozen=True)
 class RecallDecision:
     """A deterministic recall decision safe to retain as aggregate telemetry."""
 
@@ -138,18 +186,177 @@ def contains_explicit_secret(value: str) -> bool:
 def contains_secret(value: str) -> bool:
     """Return whether text contains explicit or high-entropy credentials."""
 
-    if contains_explicit_secret(value):
-        return True
-    return any(
-        _entropy(match.group(0)) >= 4.0
-        for match in _HIGH_ENTROPY_CANDIDATE.finditer(value)
-    )
+    return contains_explicit_secret(value) or _contains_high_entropy(value)
 
 
 def is_off_record(text: str) -> bool:
     """Return whether a prompt explicitly disables memory for this turn."""
 
     return bool(_OFF_RECORD.search(text))
+
+
+def _credential_field_name(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    if normalized in _CREDENTIAL_FIELD_NAMES:
+        return True
+    return any(
+        normalized.endswith(suffix) for suffix in _CREDENTIAL_FIELD_SUFFIXES
+    )
+
+
+def _contains_high_entropy(value: str) -> bool:
+    return any(
+        _entropy(match.group(0)) >= 4.0
+        for match in _HIGH_ENTROPY_CANDIDATE.finditer(value)
+    )
+
+
+def _agreed_legacy_repo_roots(
+    value: object,
+    trusted_values: frozenset[str],
+) -> frozenset[str]:
+    source_paths: set[str] = set()
+    repo_roots: set[str] = set()
+
+    def collect(item: object, field_name: str | None = None) -> None:
+        if isinstance(item, str):
+            if item in trusted_values:
+                if field_name == "source_path":
+                    source_paths.add(item)
+                elif field_name == "repo_root":
+                    repo_roots.add(item)
+            return
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                collect(child, key if isinstance(key, str) else None)
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                collect(child, field_name)
+
+    collect(value)
+    return frozenset(source_paths & repo_roots)
+
+
+def _content_without_legacy_repo_lines(
+    text: str,
+    agreed_roots: frozenset[str],
+) -> str:
+    if not agreed_roots:
+        return text
+    kept: list[str] = []
+    prefix = _LEGACY_GENERATED_REPO_PREFIX
+    for line in text.splitlines():
+        if line.startswith(prefix) and line[len(prefix):] in agreed_roots:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def evaluate_automatic_capture(
+    payload: object,
+    *,
+    trusted_fragments: tuple[str, ...] = (),
+) -> AutomaticCaptureDecision:
+    """Return whether automatic capture may persist or ingest this payload.
+
+    Off-record directives and explicit secrets are matched on raw text before
+    any path handling. ``trusted_fragments`` may skip high-entropy false
+    positives only when a structural path field's exact value equals a
+    fragment. They never hide secrets, off-record spans, or arbitrary body
+    text, and payload-derived paths are not a trust root.
+
+    Identifier entropy may skip only the generated ``turn-`` plus 32
+    lowercase hex shape on ``turn_id`` and ``completed_turn_ids``. Other
+    identifier values use the same secret, off-record, and entropy checks.
+
+    A previously generated content line that is exactly ``- Repo:`` plus a
+    trusted fragment may skip entropy when that fragment is both
+    ``source_path`` and ``repo_root``. Stored content is not rewritten.
+    """
+
+    secret_count = 0
+    off_record_count = 0
+    trusted_values = frozenset(
+        fragment for fragment in trusted_fragments if fragment
+    )
+    agreed_repo_roots = _agreed_legacy_repo_roots(payload, trusted_values)
+
+    def consider_text(
+        text: str,
+        *,
+        field_name: str | None = None,
+        serialized: bool = False,
+    ) -> None:
+        nonlocal secret_count, off_record_count
+        if is_off_record(text):
+            off_record_count += 1
+        if contains_explicit_secret(text):
+            secret_count += 1
+            return
+        if serialized:
+            return
+        if field_name in _TRUSTED_PATH_FIELDS and text in trusted_values:
+            return
+        if (
+            field_name in _IDENTIFIER_FIELDS
+            and _GENERATED_TURN_ID.fullmatch(text)
+        ):
+            return
+        entropy_text = text
+        if field_name == "content":
+            entropy_text = _content_without_legacy_repo_lines(
+                text,
+                agreed_repo_roots,
+            )
+        if _contains_high_entropy(entropy_text):
+            secret_count += 1
+
+    def walk(value: object, *, field_name: str | None = None) -> None:
+        nonlocal secret_count
+        if isinstance(value, str):
+            if field_name and _credential_field_name(field_name) and value.strip():
+                secret_count += 1
+            consider_text(value, field_name=field_name)
+            return
+        if type(value) in {int, float} and not isinstance(value, bool):
+            if field_name and _credential_field_name(field_name):
+                secret_count += 1
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                key_text = key if isinstance(key, str) else None
+                if key_text:
+                    consider_text(key_text)
+                walk(item, field_name=key_text)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, field_name=field_name)
+            return
+        if value is None or type(value) is bool:
+            return
+        try:
+            consider_text(json.dumps(value, ensure_ascii=True), serialized=True)
+        except (TypeError, ValueError):
+            secret_count += 1
+
+    try:
+        serialized = json.dumps(payload, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return AutomaticCaptureDecision(False, _SECRET_REASON, 1)
+    consider_text(serialized, serialized=True)
+    walk(payload)
+    matched_count = off_record_count + secret_count
+    if off_record_count:
+        return AutomaticCaptureDecision(
+            False,
+            _OFF_RECORD_REASON,
+            matched_count,
+        )
+    if secret_count:
+        return AutomaticCaptureDecision(False, _SECRET_REASON, matched_count)
+    return AutomaticCaptureDecision(True, _ALLOWED_REASON, 0)
 
 
 def sanitize_query(text: str) -> str | None:
@@ -560,10 +767,13 @@ def normalize_recall_items(response: object) -> list[dict[str, str]]:
 
 
 __all__ = [
+    "AUTOMATIC_CAPTURE_POLICY_VERSION",
+    "AutomaticCaptureDecision",
     "RecallDecision",
     "RecallSource",
     "contains_explicit_secret",
     "contains_secret",
+    "evaluate_automatic_capture",
     "is_off_record",
     "merge_recall_items",
     "normalize_recall_items",

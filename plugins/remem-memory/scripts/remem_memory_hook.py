@@ -28,6 +28,7 @@ import remem_api
 from memory_policy import (
     RecallSource,
     contains_secret,
+    evaluate_automatic_capture,
     is_off_record,
     merge_recall_items,
     render_untrusted_context,
@@ -265,21 +266,28 @@ def _counter(value: object) -> int:
     return value if type(value) is int and 0 <= value <= 1_000_000_000 else 0
 
 
+def _retained_identifier(value: object, *, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()[:limit]
+    if not cleaned:
+        return ""
+    if not evaluate_automatic_capture({"turn_id": cleaned}).allowed:
+        return ""
+    return cleaned
+
+
 def _normalize_state(value: object) -> dict[str, Any]:
     default = _default_state()
     if not isinstance(value, dict):
         return default
     prompt = value.get("current_prompt")
-    turn_id = value.get("turn_id")
+    safe_prompt = sanitize_query(prompt) if isinstance(prompt, str) else None
     completed = value.get("completed_turn_ids")
     metrics = value.get("metrics")
     return {
-        "current_prompt": (
-            prompt[:4000] if isinstance(prompt, str) else default["current_prompt"]
-        ),
-        "turn_id": (
-            turn_id[:200] if isinstance(turn_id, str) else default["turn_id"]
-        ),
+        "current_prompt": (safe_prompt or "")[:4000],
+        "turn_id": _retained_identifier(value.get("turn_id"), limit=200),
         "off_record": (
             value.get("off_record")
             if type(value.get("off_record")) is bool
@@ -292,9 +300,11 @@ def _normalize_state(value: object) -> dict[str, Any]:
         ),
         "completed_turn_ids": (
             [
-                item[:200]
-                for item in completed
-                if isinstance(item, str) and item
+                item
+                for item in (
+                    _retained_identifier(entry, limit=200) for entry in completed
+                )
+                if item
             ][-_MAX_COMPLETED_TURNS:]
             if isinstance(completed, list)
             else default["completed_turn_ids"]
@@ -753,9 +763,10 @@ def _session_id(payload: dict[str, Any]) -> str:
 def _turn_id(payload: dict[str, Any], current: str = "") -> str:
     value = payload.get("turn_id")
     if isinstance(value, str) and value.strip():
-        return value.strip()[:200]
-    if current:
-        return current
+        return _retained_identifier(value, limit=200)
+    retained_current = _retained_identifier(current, limit=200)
+    if retained_current:
+        return retained_current
     return f"turn-{uuid4().hex}"
 
 
@@ -1442,6 +1453,13 @@ def _handle_stop(
                 str(payload.get("cwd") or ""),
                 harness,
             )
+            if not evaluate_automatic_capture(
+                memory,
+                trusted_fragments=(str(payload.get("cwd") or ""),),
+            ).allowed:
+                if propagate_capture_failure:
+                    raise CapturePolicyRejected()
+                return output
             if write_gate is not None:
                 try:
                     allowed = write_gate(state)
@@ -1576,7 +1594,7 @@ def _background_payload(
     elif mode == "stop":
         turn_id = _bounded_field(payload, "turn_id", 200)
         if turn_id:
-            if contains_secret(turn_id):
+            if not evaluate_automatic_capture({"turn_id": turn_id}).allowed:
                 return None
             minimized["turn_id"] = turn_id
         assistant = _bounded_field(payload, "last_assistant_message", 2000)
@@ -1588,6 +1606,8 @@ def _background_payload(
             if safe_turn_state["off_record"]:
                 return None
             minimized["_turn_state"] = safe_turn_state
+    if not evaluate_automatic_capture(minimized).allowed:
+        return None
     return minimized
 
 
@@ -1597,7 +1617,10 @@ def _normalize_turn_state(value: object) -> dict[str, Any]:
     prompt = sanitize_query(raw_prompt) if raw_prompt else ""
     unsafe_prompt = bool(raw_prompt and prompt is None)
     turn_id = normalized["turn_id"]
-    unsafe_turn_id = bool(turn_id and contains_secret(turn_id))
+    unsafe_turn_id = bool(
+        turn_id
+        and not evaluate_automatic_capture({"turn_id": turn_id}).allowed
+    )
     return {
         "current_prompt": prompt or "",
         "turn_id": "" if unsafe_turn_id else turn_id,
@@ -2419,6 +2442,8 @@ def _process_background_event(
     )
     if live_state is None or live_state["off_record"]:
         return CaptureOutcome("discard", "policy")
+    if not evaluate_automatic_capture(payload).allowed:
+        return CaptureOutcome("discard", "policy")
     try:
         config, targets = _resolved_route(
             dependencies,
@@ -2585,6 +2610,7 @@ def _drain_background_queue(
                     None,
                 )
                 if event is None:
+                    queue.save(session_id, events)
                     return {}
                 if event.get("delivery_status") == "exhausted":
                     pending.discard(event["id"])

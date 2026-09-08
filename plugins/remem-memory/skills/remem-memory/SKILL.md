@@ -56,6 +56,9 @@ permission boundary.
 - In `off`, do not recall or write memory.
 - When the user says “off the record” or `/remem off-record`, do not recall,
   capture, checkpoint, or roll up that turn.
+- Automatic capture mechanically drops known secrets and off-record spans
+  before queue or ingest. This is not complete protection. Explicit raw or
+  manual saves stay a separate user-requested path.
 - Never send credential-like content to Remem or duplicate a successful
   automatic read or write.
 

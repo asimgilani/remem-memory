@@ -1,0 +1,483 @@
+{
+  "version": "automatic-capture-policy-v1",
+  "scope": {
+    "applies_to": [
+      "automatic durable conversation capture",
+      "automatic session checkpoints and rollups",
+      "automatic background queue persistence",
+      "automatic prepared capture records",
+      "automatic ingest and retry of those records"
+    ],
+    "does_not_apply_to": [
+      "explicit user-requested raw storage",
+      "manual checkpoint, rollup, or recall CLI helpers",
+      "explicit MCP writes such as remem_ingest"
+    ],
+    "guarantee": "Best-effort pattern, credential-field, entropy, and off-record detection. This is not complete protection and must not be marketed as a guarantee."
+  },
+  "reasons": ["secret", "off-record", "allowed"],
+  "detectors": {
+    "explicit_key_patterns": [
+      "vlt_ plus 16 or more URL-safe characters",
+      "sk- or sk-proj- plus 20 or more URL-safe characters",
+      "GitHub ghp_/gho_/ghu_/ghs_/ghr_ tokens",
+      "github_pat_ tokens",
+      "AWS AKIA/ASIA access key IDs",
+      "Bearer tokens of 20 or more URL-safe characters"
+    ],
+    "private_keys": "PEM BEGIN PRIVATE KEY markers, including algorithm-specific BEGIN <ALG> PRIVATE KEY blocks",
+    "credential_fields": "Object keys named password, passwd, secret, token, api_key, or a suffix of those names, with a non-empty value",
+    "high_entropy": "32 or more base64url-like characters whose Shannon entropy is at least 4.0 bits per character, unless that exact string is a trusted structural path field such as source_path, cwd, repo_root, or transcript_path. Identifier fields turn_id and completed_turn_ids may skip entropy only for the generated turn- plus 32 lowercase hex shape. A previously generated content line that is exactly '- Repo: ' plus a trusted fragment may skip entropy when that fragment is both source_path and repo_root. Trusted fragments must not be substituted through body text, summary fields, or payload-derived paths before off-record or explicit-secret detection.",
+    "off_record_directives": [
+      "the phrase off the record",
+      "the slash command /remem off-record"
+    ],
+    "off_record_spans": "Any automatic payload that contains an off-record directive is rejected as a whole. Transcript summarization also drops the rest of that user turn until the next safe user message."
+  },
+  "rejection": {
+    "new_capture": "Do not write the payload to a queue, prepared log, receipt body, state file, or transport body. Automatic hooks stay fail-open for the user session.",
+    "legacy_or_retry": "Do not ingest. Discard the live queue event with the fixed reason policy. Do not retry. Do not copy rejected text into receipts, diagnostics, or logs. An append-only prepared row that already exists is not rewritten; it is never re-ingested.",
+    "safe_reasons": ["policy", "secret", "off-record"],
+    "matched_count": "Implementations may expose a count of matched fields or spans. They must not echo rejected text."
+  },
+  "cases": [
+    {
+      "id": "openai-api-key",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["sk-abcdefghijklmnopqrstuvwxyz1234567890"],
+      "payload": {
+        "content": "Use sk-abcdefghijklmnopqrstuvwxyz1234567890 for the client."
+      }
+    },
+    {
+      "id": "github-pat",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["ghp_abcdefghijklmnopqrstuvwxyz1234"],
+      "payload": {
+        "content": "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234"
+      }
+    },
+    {
+      "id": "aws-access-key-id",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["AKIAIOSFODNN7EXAMPLE"],
+      "payload": {
+        "content": "aws_access_key_id=AKIAIOSFODNN7EXAMPLE"
+      }
+    },
+    {
+      "id": "bearer-token",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcd"],
+      "payload": {
+        "content": "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcd"
+      }
+    },
+    {
+      "id": "vault-style-key",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["vlt_abcdefghijklmnopqrstuvwxyz"],
+      "payload": {
+        "content": "api_key=vlt_abcdefghijklmnopqrstuvwxyz"
+      }
+    },
+    {
+      "id": "pem-private-key",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "private-key",
+      "needles": ["BEGIN RSA PRIVATE KEY", "MIIEowIBAAKCAQEAprivateKeyMaterialNotForUse"],
+      "payload": {
+        "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAprivateKeyMaterialNotForUse\n-----END RSA PRIVATE KEY-----"
+      }
+    },
+    {
+      "id": "password-assignment",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "needles": ["password=super-secret-value"],
+      "payload": {
+        "content": "db password=super-secret-value"
+      }
+    },
+    {
+      "id": "nested-password-field",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "credential-field",
+      "needles": ["hunter2-not-a-real-password"],
+      "payload": {
+        "title": "Checkpoint",
+        "content": "safe body",
+        "metadata": {
+          "password": "hunter2-not-a-real-password"
+        }
+      }
+    },
+    {
+      "id": "nested-summary-secret",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "nested-metadata",
+      "needles": ["vlt_nestedSummaryCanary0001"],
+      "payload": {
+        "title": "Checkpoint",
+        "content": "Automatic interval checkpoint.",
+        "metadata": {
+          "summary": "Model returned api_key=vlt_nestedSummaryCanary0001",
+          "decisions": ["ship v1"],
+          "open_questions": []
+        }
+      }
+    },
+    {
+      "id": "nested-decisions-secret",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "nested-metadata",
+      "needles": ["vlt_nestedDecisionCanary01"],
+      "payload": {
+        "metadata": {
+          "summary": "Safe summary.",
+          "decisions": [
+            "Keep the blue theme",
+            "token=vlt_nestedDecisionCanary01"
+          ]
+        }
+      }
+    },
+    {
+      "id": "high-entropy-token",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "needles": ["n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG"],
+      "payload": {
+        "content": "store n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG in the worker"
+      }
+    },
+    {
+      "id": "off-record-directive",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "needles": ["STARLING-PRIVATE-CONTEXT"],
+      "payload": {
+        "content": "Off the record: evaluate STARLING-PRIVATE-CONTEXT."
+      }
+    },
+    {
+      "id": "off-record-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "content": "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+      }
+    },
+    {
+      "id": "off-record-span",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-span",
+      "needles": ["STARLING-PRIVATE-CONTEXT", "Off the record"],
+      "payload": {
+        "content": "Public intro. Off the record: STARLING-PRIVATE-CONTEXT. Later text is still in the same span."
+      }
+    },
+    {
+      "id": "nested-off-record-summary",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-span",
+      "needles": ["STARLING-PRIVATE-CONTEXT"],
+      "payload": {
+        "metadata": {
+          "summary": "Off the record: STARLING-PRIVATE-CONTEXT",
+          "decisions": ["do not store this"]
+        }
+      }
+    },
+    {
+      "id": "safe-preference",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "safe",
+      "payload": {
+        "title": "Durable conversation context",
+        "content": "User: Remember that I prefer concise answers.\n\nAssistant: I will keep future answers concise.",
+        "metadata": {
+          "memory_kind": "conversation_turn",
+          "summary": "Prefer concise answers."
+        }
+      }
+    },
+    {
+      "id": "safe-checkpoint",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "safe",
+      "payload": {
+        "title": "project | session | interval checkpoint (auto)",
+        "content": "Automatic interval checkpoint after 4 tool events.",
+        "metadata": {
+          "summary": "Write src/main.py",
+          "decisions": ["ship v1"],
+          "open_questions": ["who reviews the diff?"],
+          "files_touched": ["src/main.py"]
+        }
+      }
+    },
+    {
+      "id": "token-count-false-positive",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "A numeric token_count field is not a credential. The detector matches credential field names, not every word that contains token.",
+      "payload": {
+        "metadata": {
+          "summary": "Counted output tokens for the draft.",
+          "token_count": 3
+        }
+      }
+    },
+    {
+      "id": "password-policy-prose-false-positive",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Prose about a password policy has no assignment and is not a credential field.",
+      "payload": {
+        "content": "The password policy requires twelve characters."
+      }
+    },
+    {
+      "id": "sklearn-false-positive",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "The sk- detector requires 20 or more characters after the prefix, so sk-learn is not a match.",
+      "payload": {
+        "content": "Use sk-learn for the baseline model."
+      }
+    },
+    {
+      "id": "macos-temp-path-trusted",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Opaque macOS temp path entropy is a documented false positive. Callers may pass the exact local cwd as a trusted fragment so the matching structural path field can keep that exact value. The exception does not rewrite body text or nested summaries.",
+      "trusted_fragments": [
+        "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      ],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+        "metadata": {
+          "repo_root": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+        }
+      }
+    },
+    {
+      "id": "macos-temp-path-untrusted",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "notes": "The same opaque path is rejected when it is not a trusted local fragment. This is a documented false positive, not proof of a credential.",
+      "needles": ["1h0qwbnj29b45h4bcrq5g4jm0000gn"],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      }
+    },
+    {
+      "id": "trusted-cwd-overlaps-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A trusted local cwd of /remem must not hide a slash-command directive in body or summary text.",
+      "trusted_fragments": ["/remem"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/remem",
+        "content": "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+      }
+    },
+    {
+      "id": "trusted-root-overlaps-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A trusted cwd of / must not remove the leading slash from /remem off-record.",
+      "trusted_fragments": ["/"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/",
+        "content": "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+      }
+    },
+    {
+      "id": "trusted-path-in-off-record-summary",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-span",
+      "notes": "Trusted path fragments overlapping a nested summary still reject the off-record span.",
+      "trusted_fragments": ["/remem"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/remem",
+        "metadata": {
+          "repo_root": "/remem",
+          "summary": "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+        }
+      }
+    },
+    {
+      "id": "payload-derived-source-path-does-not-mask",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-span",
+      "notes": "A payload source_path is not a trust root. Authentic trusted fragments from elsewhere must not hide an off-record summary.",
+      "trusted_fragments": ["/tmp/project"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/remem",
+        "metadata": {
+          "summary": "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+        }
+      }
+    },
+    {
+      "id": "identifier-secret",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "needles": ["vlt_abcdefghijklmnopqrstuvwxyz"],
+      "payload": {
+        "turn_id": "vlt_abcdefghijklmnopqrstuvwxyz",
+        "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
+      "id": "identifier-high-entropy",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "needles": ["n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG"],
+      "payload": {
+        "turn_id": "n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG",
+        "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
+      "id": "identifier-allowed",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "safe",
+      "payload": {
+        "turn_id": "t-safe-1",
+        "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
+      "id": "identifier-generated-turn",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "Entropy may skip only the generated turn- plus 32 lowercase hex identifier shape. Explicit secrets and off-record still reject.",
+      "payload": {
+        "turn_id": "turn-0123456789abcdef0123456789abcdef",
+        "content": "Remember that I prefer concise answers."
+      }
+    },
+    {
+      "id": "macos-temp-path-legacy-generated-repo-line",
+      "expect": "allow",
+      "reason": "allowed",
+      "category": "false-positive",
+      "notes": "A previously generated checkpoint body may contain one exact '- Repo: {cwd}' line. Entropy may skip that line only when it equals the trusted fragment and both source_path and repo_root agree. Body text is not rewritten.",
+      "trusted_fragments": [
+        "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      ],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+        "content": "# Coding Session Checkpoint (Auto)\n- Repo: /var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project\n## Summary\nSafe interval checkpoint.",
+        "metadata": {
+          "repo_root": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+          "summary": "Safe interval checkpoint."
+        }
+      }
+    },
+    {
+      "id": "legacy-repo-line-without-structural-agreement",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "high-entropy",
+      "needles": ["1h0qwbnj29b45h4bcrq5g4jm0000gn"],
+      "payload": {
+        "content": "- Repo: /var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      }
+    },
+    {
+      "id": "legacy-repo-line-does-not-mask-canary-summary",
+      "expect": "reject",
+      "reason": "secret",
+      "category": "explicit-key",
+      "notes": "The generated Repo line exception does not hide an explicit secret in summary or remaining body text.",
+      "trusted_fragments": [
+        "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+      ],
+      "needles": ["vlt_abcdefghijklmnopqrstuvwxyz"],
+      "payload": {
+        "source_path": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+        "content": "- Repo: /var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project\n## Summary\napi_key=vlt_abcdefghijklmnopqrstuvwxyz",
+        "metadata": {
+          "repo_root": "/var/folders/d7/1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project",
+          "summary": "api_key=vlt_abcdefghijklmnopqrstuvwxyz"
+        }
+      }
+    },
+    {
+      "id": "legacy-repo-line-does-not-mask-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A trusted cwd of /remem plus a generated Repo line must not hide a slash-command directive.",
+      "trusted_fragments": ["/remem"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/remem",
+        "content": "- Repo: /remem\n/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT.",
+        "metadata": {
+          "repo_root": "/remem"
+        }
+      }
+    },
+    {
+      "id": "legacy-repo-line-does-not-mask-root-slash-command",
+      "expect": "reject",
+      "reason": "off-record",
+      "category": "off-record-directive",
+      "notes": "A trusted cwd of / plus a generated Repo line must not hide a slash-command directive.",
+      "trusted_fragments": ["/"],
+      "needles": ["ORBITAL-PRIVATE-CONTEXT"],
+      "payload": {
+        "source_path": "/",
+        "content": "- Repo: /\n/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT.",
+        "metadata": {
+          "repo_root": "/"
+        }
+      }
+    }
+  ]
+}

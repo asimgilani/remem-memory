@@ -1889,7 +1889,217 @@ class AutoMemoryHookTests(unittest.TestCase):
             serialized = config.log_path.read_text(encoding="utf-8")
 
         api.ingest.assert_called_once()
+        ingested = api.ingest.call_args.args[0]
+        self.assertNotIn("- Repo:", ingested["content"])
+        self.assertEqual(
+            ingested["source_path"],
+            str(macos_temp_project.resolve()),
+        )
+        self.assertEqual(
+            ingested["metadata"]["repo_root"],
+            str(macos_temp_project.resolve()),
+        )
         self.assertIn(str(macos_temp_project), serialized)
+
+    def test_legacy_prepared_opaque_cwd_repo_line_retries_immutably(
+        self,
+    ) -> None:
+        opaque = (
+            "/var/folders/d7/"
+            "1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+        )
+        operation_id = "c" * 32
+        payload = {
+            "title": "remem | sess-a | interval checkpoint (auto)",
+            "content": (
+                "# Coding Session Checkpoint (Auto)\n"
+                f"- Repo: {opaque}\n"
+                "## Summary\n"
+                "Safe interval checkpoint."
+            ),
+            "metadata": {
+                "project": "remem",
+                "session_id": "sess-a",
+                "repo_root": opaque,
+                "summary": "Safe interval checkpoint.",
+            },
+            "source_id": f"auto-checkpoint:{operation_id}:interval",
+            "source_path": opaque,
+        }
+        digest = _MODULE._stable_digest(payload)
+        coverage = {
+            "through_seq": 4,
+            "events_since": 4,
+            "window": 1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_path = root / "memory.ndjson"
+            state_path = root / "state.json"
+            config = _MODULE.Config(
+                **{
+                    **_build_cfg().__dict__,
+                    "cwd": Path(opaque),
+                    "api_key": "trusted-ingest-key",
+                    "state_path": state_path,
+                    "log_path": log_path,
+                    "request_identity": operation_id,
+                }
+            )
+            state = {
+                **_MODULE._default_state("sess-a"),
+                "project": "remem",
+                "events_since_checkpoint": 4,
+                "pending_seq": 4,
+                "checkpoint_acked_through": 0,
+                "receipts": {
+                    operation_id: {
+                        "done": [],
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "complete": False,
+                        "protocol": 2,
+                        "checkpoint_input": {
+                            "digest": digest,
+                            **coverage,
+                        },
+                    }
+                },
+            }
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "event": "auto_checkpoint_prepared",
+                        "operation_id": operation_id,
+                        "payload": payload,
+                        "payload_digest": digest,
+                        "coverage": coverage,
+                    },
+                    ensure_ascii=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            api = mock.Mock()
+            api.ingest.return_value = {"ok": True}
+            with mock.patch.object(
+                _MODULE,
+                "RememAPI",
+                return_value=api,
+            ):
+                result = _MODULE._persist_checkpoint(
+                    config=config,
+                    kind="interval",
+                    hook_event="PostToolUse",
+                    state=state,
+                )
+
+            serialized = log_path.read_text(encoding="utf-8")
+
+        self.assertTrue(result)
+        api.ingest.assert_called_once()
+        ingested = api.ingest.call_args.args[0]
+        self.assertEqual(ingested, payload)
+        self.assertEqual(_MODULE._stable_digest(ingested), digest)
+        self.assertIn(f"- Repo: {opaque}", ingested["content"])
+        self.assertIn(opaque, serialized)
+        self.assertIn("auto_checkpoint_delivered", serialized)
+        self.assertIn(digest, serialized)
+
+    def test_legacy_prepared_repo_line_does_not_retry_canary_summary(
+        self,
+    ) -> None:
+        opaque = (
+            "/var/folders/d7/"
+            "1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+        )
+        canary = "vlt_abcdefghijklmnopqrstuvwxyz"
+        operation_id = "d" * 32
+        payload = {
+            "title": "remem | sess-a | interval checkpoint (auto)",
+            "content": (
+                "# Coding Session Checkpoint (Auto)\n"
+                f"- Repo: {opaque}\n"
+                "## Summary\n"
+                f"api_key={canary}"
+            ),
+            "metadata": {
+                "project": "remem",
+                "session_id": "sess-a",
+                "repo_root": opaque,
+                "summary": f"api_key={canary}",
+            },
+            "source_id": f"auto-checkpoint:{operation_id}:interval",
+            "source_path": opaque,
+        }
+        digest = _MODULE._stable_digest(payload)
+        coverage = {
+            "through_seq": 4,
+            "events_since": 4,
+            "window": 1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_path = root / "memory.ndjson"
+            prepared_row = json.dumps(
+                {
+                    "event": "auto_checkpoint_prepared",
+                    "operation_id": operation_id,
+                    "payload": payload,
+                    "payload_digest": digest,
+                    "coverage": coverage,
+                },
+                ensure_ascii=True,
+            )
+            log_path.write_text(prepared_row + "\n", encoding="utf-8")
+            config = _MODULE.Config(
+                **{
+                    **_build_cfg().__dict__,
+                    "cwd": Path(opaque),
+                    "api_key": "trusted-ingest-key",
+                    "state_path": root / "state.json",
+                    "log_path": log_path,
+                    "request_identity": operation_id,
+                }
+            )
+            state = {
+                **_MODULE._default_state("sess-a"),
+                "project": "remem",
+                "events_since_checkpoint": 4,
+                "pending_seq": 4,
+                "checkpoint_acked_through": 0,
+                "receipts": {
+                    operation_id: {
+                        "done": [],
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "complete": False,
+                        "protocol": 2,
+                        "checkpoint_input": {
+                            "digest": digest,
+                            **coverage,
+                        },
+                    }
+                },
+            }
+            api = mock.Mock()
+            api.ingest.return_value = {"ok": True}
+            with mock.patch.object(
+                _MODULE,
+                "RememAPI",
+                return_value=api,
+            ):
+                result = _MODULE._persist_checkpoint(
+                    config=config,
+                    kind="interval",
+                    hook_event="PostToolUse",
+                    state=state,
+                )
+            serialized = log_path.read_text(encoding="utf-8")
+
+        self.assertFalse(result)
+        api.ingest.assert_not_called()
+        self.assertEqual(serialized, prepared_row + "\n")
+        self.assertIn(canary, serialized)
+        self.assertNotIn("auto_checkpoint_delivered", serialized)
 
     def test_trusted_cwd_does_not_mask_secret_model_summary(self) -> None:
         macos_temp_project = Path(

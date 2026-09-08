@@ -42,17 +42,31 @@ correct. Confirm consequential or conflicting memories with the user.
 
 ## Secret filtering
 
-Automatic paths perform secret filtering before queries, local state, local
-logs, optional summaries, or remote ingestion. They reject recognized API
-keys, tokens, passwords, private-key markers, bearer credentials, and
-high-entropy credential-like strings. Secret-bearing tool events, paths,
-transcript turns, results, and final payloads are dropped instead of redacted
-and forwarded.
+Automatic paths run one executable secret and off-record policy before local
+queue, prepared-log, receipt, or state persistence, before summary-provider
+prompts, and again before ingestion of a prepared or legacy retry. They reject
+recognized API keys, tokens, password and credential fields, private-key
+markers, bearer credentials, high-entropy credential-like strings, and
+off-record directives or spans. Secret-bearing or off-record tool events,
+paths, transcript turns, nested metadata or summary fields, prompt-state
+identifiers, results, and final payloads are dropped instead of redacted and
+forwarded. Opaque local cwd values may skip entropy only on matching
+structural path fields. They do not rewrite body text or become a trust root
+when they appear as payload `source_path` or `repo_root`. A previously
+generated `- Repo: {cwd}` content line may skip entropy only when that
+exact trusted cwd is both `source_path` and `repo_root`. Prompt-state
+identifiers skip entropy only for the generated `turn-` plus 32 lowercase
+hex shape; other turn IDs are dropped to empty when they fail the same
+secret, off-record, and entropy policy.
 
 Filtering is defense in depth, not a guarantee that every form of private data
-will be recognized. Do not paste credentials into conversations. An explicit
-MCP or manual command can bypass automatic policy if an agent supplies unsafe
-arguments, so the canonical skill prohibits secret-bearing explicit calls.
+will be recognized. Documented false positives include opaque local temp-path
+entropy, `sk-learn`, numeric `token_count` fields, and prose about a password
+policy. Do not paste credentials into conversations. An explicit MCP or manual
+command can bypass automatic policy if an agent supplies unsafe arguments, so
+the canonical skill prohibits secret-bearing explicit calls. User-requested
+raw storage and manual checkpoint, rollup, or recall helpers are a separate
+explicit policy. Automatic capture never silently reclassifies those writes.
 
 ## Local state and logs
 
@@ -75,11 +89,18 @@ marker. They do not store checkpoint or rollup bodies. A queued checkpoint
 or rollup is prepared once in the existing append-only session log as an
 immutable pending record, then marked delivered in that same log. Retry
 reuses that prepared body; it does not rebuild from later pending activity
-or a later summary-provider result. Failed or interrupted queued captures
-therefore leave prepared content in that log until a future retention pass
-(issue 54). The queue's diagnostic reserve is not used for this content.
+or a later summary-provider result. The same automatic-capture policy runs
+before that prepared row is written and again before a retry ingests it.
+A new rejected capture is never written. A pending legacy row that fails
+the policy is not ingested, not retried, and not copied into the live queue,
+receipts, or transport; the queue event is discarded with the fixed reason
+`policy`. The append-only prepared row is not rewritten, so historical
+rejected text may remain in that log until an operator deletes the file.
+The queue's diagnostic reserve is not used for this content.
 This does not promise indefinite retention or exactly-once ingestion across
-a crash between network delivery and local receipt persistence.
+a crash between network delivery and local receipt persistence. Allowed
+captures keep the existing at-least-once retry and exhausted-event retention
+behavior.
 
 Session automation keeps project-local files under `.remem/`, normally:
 
@@ -116,9 +137,11 @@ Disable this path with:
 export REMEM_MEMORY_SUMMARY_ENABLED="0"
 ```
 
-The secret filter runs before the summary request, but disable external
-summaries when project policy does not allow another model provider to receive
-the material.
+The same policy runs on checkpoint and rollup source notes and on the assembled
+provider prompt before dispatch. A rejected historical row is omitted from the
+prompt and from fallback summary fields. It is not rewritten in the append-only
+log. Disable external summaries when project policy does not allow another
+model provider to receive the material.
 
 ## Credential handling and precedence
 
@@ -269,7 +292,8 @@ The persistent automatic modes are:
 
 Sensitivity controls only automatic durable capture. Explicit
 checkpoint, rollup, and recall helpers plus explicit MCP calls are separate
-operations and do not mechanically inherit all automatic controls. The skill
+operations and do not mechanically inherit all automatic controls. Raw or
+manual storage is never silently treated as automatic capture. The skill
 therefore requires a `remem-memory status` preflight before explicit/manual
 memory: `auto` permits eligible reads and writes, `recall-only` permits
 read-only MCP tools or manual recall with `--no-log` but no write MCP tools,

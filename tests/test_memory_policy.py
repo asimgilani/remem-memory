@@ -57,6 +57,112 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertIsNone(_MODULE.sanitize_query(prompt))
         self.assertFalse(_MODULE.should_capture(prompt, "Done", "aggressive"))
 
+    def test_trusted_path_fragments_do_not_mask_off_record_or_body_text(
+        self,
+    ) -> None:
+        evaluate = _MODULE.evaluate_automatic_capture
+        slash = "/remem off-record evaluate ORBITAL-PRIVATE-CONTEXT."
+        opaque = (
+            "/var/folders/d7/"
+            "1h0qwbnj29b45h4bcrq5g4jm0000gn/T/project"
+        )
+
+        hidden_by_cwd = evaluate(
+            {"source_path": "/remem", "content": slash},
+            trusted_fragments=("/remem",),
+        )
+        hidden_by_root = evaluate(
+            {"source_path": "/", "content": slash},
+            trusted_fragments=("/",),
+        )
+        summary = evaluate(
+            {
+                "source_path": "/remem",
+                "metadata": {"summary": slash},
+            },
+            trusted_fragments=("/remem",),
+        )
+        payload_path = evaluate(
+            {
+                "source_path": "/remem",
+                "metadata": {"summary": slash},
+            },
+            trusted_fragments=("/tmp/project",),
+        )
+        exact_path = evaluate(
+            {
+                "source_path": opaque,
+                "metadata": {"repo_root": opaque},
+            },
+            trusted_fragments=(opaque,),
+        )
+        generated_id = evaluate(
+            {"turn_id": "turn-0123456789abcdef0123456789abcdef"}
+        )
+        high_entropy_id = evaluate(
+            {"turn_id": "n8xQ2vL9mR4tYw7pK3bF6cH1jZ5aD0sG"}
+        )
+        legacy_repo = evaluate(
+            {
+                "source_path": opaque,
+                "content": f"- Repo: {opaque}\nSafe interval checkpoint.",
+                "metadata": {"repo_root": opaque},
+            },
+            trusted_fragments=(opaque,),
+        )
+        repo_without_agreement = evaluate(
+            {"content": f"- Repo: {opaque}"},
+            trusted_fragments=(opaque,),
+        )
+        repo_masks_slash = evaluate(
+            {
+                "source_path": "/remem",
+                "content": f"- Repo: /remem\n{slash}",
+                "metadata": {"repo_root": "/remem"},
+            },
+            trusted_fragments=("/remem",),
+        )
+        repo_masks_root = evaluate(
+            {
+                "source_path": "/",
+                "content": f"- Repo: /\n{slash}",
+                "metadata": {"repo_root": "/"},
+            },
+            trusted_fragments=("/",),
+        )
+        repo_masks_canary = evaluate(
+            {
+                "source_path": opaque,
+                "content": (
+                    f"- Repo: {opaque}\n"
+                    "api_key=vlt_abcdefghijklmnopqrstuvwxyz"
+                ),
+                "metadata": {
+                    "repo_root": opaque,
+                    "summary": "api_key=vlt_abcdefghijklmnopqrstuvwxyz",
+                },
+            },
+            trusted_fragments=(opaque,),
+        )
+
+        self.assertFalse(hidden_by_cwd.allowed)
+        self.assertEqual(hidden_by_cwd.reason, "off-record")
+        self.assertFalse(hidden_by_root.allowed)
+        self.assertEqual(hidden_by_root.reason, "off-record")
+        self.assertFalse(summary.allowed)
+        self.assertFalse(payload_path.allowed)
+        self.assertTrue(exact_path.allowed)
+        self.assertTrue(generated_id.allowed)
+        self.assertFalse(high_entropy_id.allowed)
+        self.assertTrue(legacy_repo.allowed)
+        self.assertFalse(repo_without_agreement.allowed)
+        self.assertFalse(repo_masks_slash.allowed)
+        self.assertEqual(repo_masks_slash.reason, "off-record")
+        self.assertFalse(repo_masks_root.allowed)
+        self.assertEqual(repo_masks_root.reason, "off-record")
+        self.assertFalse(repo_masks_canary.allowed)
+        self.assertEqual(repo_masks_canary.reason, "secret")
+
     def test_off_record_suppresses_recall_and_capture(self) -> None:
         for prompt in (
             "Off the record: remember that I prefer blue.",

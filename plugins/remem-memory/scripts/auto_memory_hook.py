@@ -25,6 +25,7 @@ from urllib import request as urllib_request
 from memory_policy import (
     contains_explicit_secret,
     contains_secret,
+    evaluate_automatic_capture,
     is_off_record,
 )
 from remem_api import (
@@ -216,37 +217,48 @@ def _payload_contains_secret(
     *,
     trusted_fragments: tuple[str, ...] = (),
 ) -> bool:
-    try:
-        serialized = json.dumps(payload, ensure_ascii=True)
-    except (TypeError, ValueError):
-        return True
-    for fragment in sorted(
-        (item for item in trusted_fragments if item),
-        key=len,
-        reverse=True,
-    ):
-        encoded_fragment = json.dumps(
-            fragment,
-            ensure_ascii=True,
-        )[1:-1]
-        serialized = serialized.replace(
-            encoded_fragment,
-            "[trusted-local-path]",
-        )
-    return contains_secret(serialized)
+    return not evaluate_automatic_capture(
+        payload,
+        trusted_fragments=trusted_fragments,
+    ).allowed
 
 
-def _safe_path(value: object, *, limit: int = 2000) -> str:
+def _trusted_path_fragments(config: Config) -> tuple[str, ...]:
+    cwd = str(config.cwd).strip() if config.cwd else ""
+    return (cwd,) if cwd else ()
+
+
+def _retained_text(value: object, *, limit: int) -> str:
     if not isinstance(value, str):
         return ""
     cleaned = value.strip()[:limit]
-    if not cleaned or contains_secret(cleaned):
+    if not cleaned or not evaluate_automatic_capture(cleaned).allowed:
         return ""
     return cleaned
 
 
+def _reject_automatic_capture(config: Config) -> bool:
+    if _should_propagate(config):
+        raise EngineeringWriteRejected()
+    return False
+
+
+def _prepared_record_blocked(row: object, config: Config) -> bool:
+    if not isinstance(row, dict):
+        return False
+    payload = row.get("payload")
+    return _payload_contains_secret(
+        payload,
+        trusted_fragments=_trusted_path_fragments(config),
+    )
+
+
+def _safe_path(value: object, *, limit: int = 2000) -> str:
+    return _retained_text(value, limit=limit)
+
+
 def _safe_cwd_path(value: object, *, limit: int = 2000) -> str:
-    """Accept local path entropy but reject explicit credential-bearing paths."""
+    """Accept local path entropy but reject explicit secrets and off-record paths."""
 
     if not isinstance(value, str):
         return ""
@@ -255,6 +267,7 @@ def _safe_cwd_path(value: object, *, limit: int = 2000) -> str:
         not cleaned
         or any(ord(character) < 32 for character in cleaned)
         or contains_explicit_secret(cleaned)
+        or is_off_record(cleaned)
     ):
         return ""
     return cleaned
@@ -867,20 +880,12 @@ def _sanitize_state(
     fallback_session_id: str,
 ) -> dict[str, Any]:
     state = _default_state(fallback_session_id)
-    session_id = value.get("session_id")
-    if (
-        isinstance(session_id, str)
-        and session_id.strip()
-        and not contains_secret(session_id)
-    ):
-        state["session_id"] = session_id.strip()[:200]
-    project = value.get("project")
-    if (
-        isinstance(project, str)
-        and project.strip()
-        and not contains_secret(project)
-    ):
-        state["project"] = project.strip()[:200]
+    session_id = _retained_text(value.get("session_id"), limit=200)
+    if session_id:
+        state["session_id"] = session_id
+    project = _retained_text(value.get("project"), limit=200)
+    if project:
+        state["project"] = project
     for name in (
         "last_checkpoint_epoch",
         "events_since_checkpoint",
@@ -979,13 +984,8 @@ def _open_regular_file(
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
-    session_id = state.get("session_id")
     fallback_session_id = (
-        session_id.strip()[:200]
-        if isinstance(session_id, str)
-        and session_id.strip()
-        and not contains_secret(session_id)
-        else "session-unknown"
+        _retained_text(state.get("session_id"), limit=200) or "session-unknown"
     )
     safe_state = _sanitize_state(state, fallback_session_id)
     _prepare_storage_parent(path)
@@ -1149,7 +1149,11 @@ def _checkpoint_payload_in_session(
     return payload
 
 
-def _validate_prepared_checkpoint(row: object) -> dict[str, Any] | None:
+def _validate_prepared_checkpoint(
+    row: object,
+    *,
+    trusted_fragments: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
     if not isinstance(row, dict):
         return None
     if row.get("event") != "auto_checkpoint_prepared":
@@ -1162,6 +1166,11 @@ def _validate_prepared_checkpoint(row: object) -> dict[str, Any] | None:
         return None
     payload = row.get("payload")
     if not isinstance(payload, dict):
+        return None
+    if _payload_contains_secret(
+        payload,
+        trusted_fragments=trusted_fragments,
+    ):
         return None
     digest = _parse_digest(row.get("payload_digest"))
     if digest is None or digest != _stable_digest(payload):
@@ -1177,7 +1186,11 @@ def _validate_prepared_checkpoint(row: object) -> dict[str, Any] | None:
     }
 
 
-def _validate_prepared_rollup(row: object) -> dict[str, Any] | None:
+def _validate_prepared_rollup(
+    row: object,
+    *,
+    trusted_fragments: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
     if not isinstance(row, dict):
         return None
     if row.get("event") != "auto_rollup_prepared":
@@ -1190,6 +1203,11 @@ def _validate_prepared_rollup(row: object) -> dict[str, Any] | None:
         return None
     payload = row.get("payload")
     if not isinstance(payload, dict):
+        return None
+    if _payload_contains_secret(
+        payload,
+        trusted_fragments=trusted_fragments,
+    ):
         return None
     digest = _parse_digest(row.get("payload_digest"))
     if digest is None or digest != _stable_digest(payload):
@@ -1243,7 +1261,7 @@ def _require_log_append(
     if not _append_ndjson(
         config.log_path,
         record,
-        trusted_fragments=(str(config.cwd),),
+        trusted_fragments=_trusted_path_fragments(config),
     ):
         raise RememAPIError("Remem request failed", kind="request")
 
@@ -2012,6 +2030,8 @@ def _call_codex_cli(prompt: str, *, model: str, timeout: int) -> str | None:
 
 
 def _prompt_llm(prompt: str) -> tuple[str | None, str | None, str | None]:
+    if not evaluate_automatic_capture(prompt).allowed:
+        return None, None, None
     provider = _select_llm_provider()
     if not provider:
         return None, None, None
@@ -2228,7 +2248,6 @@ def _build_checkpoint_payload(
         f"- Kind: {kind}",
         f"- Timestamp: {timestamp}",
         f"- Branch: {_git_branch(config.cwd) or 'unknown'}",
-        f"- Repo: {config.cwd}",
         f"- Trigger: {hook_event}",
         "",
         "## Summary",
@@ -2298,11 +2317,15 @@ def _load_checkpoint_rows(
     project: str,
     session_id: str,
     end: int | None = None,
+    trusted_fragments: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     rows = _read_ndjson(log_path)
     prepared_by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
-        validated = _validate_prepared_checkpoint(row)
+        validated = _validate_prepared_checkpoint(
+            row,
+            trusted_fragments=trusted_fragments,
+        )
         if validated is None:
             continue
         operation_id = validated["operation_id"]
@@ -2323,7 +2346,10 @@ def _load_checkpoint_rows(
             if not isinstance(operation_id, str) or operation_id in seen:
                 continue
             prepared_row = prepared_by_id.get(operation_id)
-            validated = _validate_prepared_checkpoint(prepared_row)
+            validated = _validate_prepared_checkpoint(
+                prepared_row,
+                trusted_fragments=trusted_fragments,
+            )
             if validated is None:
                 continue
             if not _validate_delivery_marker(
@@ -2396,8 +2422,14 @@ def _build_rollup_payload(
     decisions: list[str] = []
     open_questions: list[str] = []
     next_actions: list[str] = []
+    trusted_fragments = _trusted_path_fragments(config)
     for row in records:
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        if _payload_contains_secret(
+            payload,
+            trusted_fragments=trusted_fragments,
+        ):
+            continue
         title = payload.get("title")
         if isinstance(title, str) and title.strip():
             checkpoints.append(title.strip())
@@ -2562,14 +2594,15 @@ def _ingest(
     *,
     operation: str | None = None,
 ) -> object | None:
-    if (
-        _payload_contains_secret(
-            payload,
-            trusted_fragments=(str(config.cwd),),
-        )
-        or not config.api_key
+    if _payload_contains_secret(
+        payload,
+        trusted_fragments=_trusted_path_fragments(config),
     ):
-        if _should_propagate(config) and not config.api_key:
+        if _should_propagate(config):
+            raise EngineeringWriteRejected()
+        return None
+    if not config.api_key:
+        if _should_propagate(config):
             raise RememAPIError(
                 "Remem credential unavailable", kind="credential"
             )
@@ -2674,7 +2707,7 @@ def _persist_checkpoint_direct(
             "payload": payload,
             "response": response,
         },
-        trusted_fragments=(str(config.cwd),),
+        trusted_fragments=_trusted_path_fragments(config),
     )
     return True
 
@@ -2700,6 +2733,8 @@ def _persist_prepared_checkpoint(
         "auto_checkpoint_prepared",
         config.request_identity or "",
     )
+    if _prepared_record_blocked(prepared, config):
+        return _reject_automatic_capture(config)
     if parsed is None:
         if receipt.get("protocol") != _RECEIPT_PROTOCOL:
             _mark_input_unavailable(config, state, "checkpoint_input")
@@ -2716,9 +2751,9 @@ def _persist_prepared_checkpoint(
             )
             if _payload_contains_secret(
                 payload,
-                trusted_fragments=(str(config.cwd),),
+                trusted_fragments=_trusted_path_fragments(config),
             ):
-                return True
+                return _reject_automatic_capture(config)
             if not _live_write_allowed(config):
                 return False
             digest = _stable_digest(payload)
@@ -2749,7 +2784,10 @@ def _persist_prepared_checkpoint(
             prepared = record
             parsed = receipt["checkpoint_input"]
         else:
-            validated = _validate_prepared_checkpoint(prepared)
+            validated = _validate_prepared_checkpoint(
+                prepared,
+                trusted_fragments=_trusted_path_fragments(config),
+            )
             if validated is None:
                 _reject_operation_input(config, state, "checkpoint_input")
             parsed = {
@@ -2761,7 +2799,10 @@ def _persist_prepared_checkpoint(
             _replace_receipt(config, state, receipt)
             _save_state(config.state_path, state)
     else:
-        validated = _validate_prepared_checkpoint(prepared)
+        validated = _validate_prepared_checkpoint(
+            prepared,
+            trusted_fragments=_trusted_path_fragments(config),
+        )
         if validated is None or not _checkpoint_input_matches(parsed, validated):
             _reject_operation_input(config, state, "checkpoint_input")
         payload = validated["payload"]
@@ -2832,6 +2873,7 @@ def _persist_rollup_direct(
         config.log_path,
         project=config.project,
         session_id=config.session_id,
+        trusted_fragments=_trusted_path_fragments(config),
     )
     if not records:
         return True
@@ -2854,7 +2896,7 @@ def _persist_rollup_direct(
             "payload": payload,
             "response": response,
         },
-        trusted_fragments=(str(config.cwd),),
+        trusted_fragments=_trusted_path_fragments(config),
     )
     return True
 
@@ -2873,19 +2915,25 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
         config.log_path,
         project=config.project,
         session_id=config.session_id,
+        trusted_fragments=_trusted_path_fragments(config),
     )
     prepared = _find_prepared_record(
         config.log_path,
         "auto_rollup_prepared",
         config.request_identity or "",
     )
+    if _prepared_record_blocked(prepared, config):
+        return _reject_automatic_capture(config)
     payload: dict[str, Any] | None = None
     if parsed is None:
         if receipt.get("protocol") != _RECEIPT_PROTOCOL:
             _mark_input_unavailable(config, state, "rollup_input")
             raise RememAPIError("Remem request failed", kind="request")
         if prepared is not None:
-            validated = _validate_prepared_rollup(prepared)
+            validated = _validate_prepared_rollup(
+                prepared,
+                trusted_fragments=_trusted_path_fragments(config),
+            )
             if validated is None:
                 _reject_operation_input(config, state, "rollup_input")
             parsed = dict(validated["cursor"])
@@ -2901,12 +2949,9 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
                 )
                 if _payload_contains_secret(
                     payload,
-                    trusted_fragments=(str(config.cwd),),
+                    trusted_fragments=_trusted_path_fragments(config),
                 ):
-                    receipt["rollup_input"] = cursor
-                    _replace_receipt(config, state, receipt)
-                    _save_state(config.state_path, state)
-                    return True
+                    return _reject_automatic_capture(config)
                 if not _live_write_allowed(config):
                     return False
                 payload_digest = _stable_digest(payload)
@@ -2944,7 +2989,10 @@ def _persist_prepared_rollup(config: Config, state: dict[str, Any]) -> bool:
             "auto_rollup_prepared",
             config.request_identity or "",
         )
-    validated = _validate_prepared_rollup(prepared)
+    validated = _validate_prepared_rollup(
+        prepared,
+        trusted_fragments=_trusted_path_fragments(config),
+    )
     if validated is None or not _rollup_input_matches(parsed, validated):
         _reject_operation_input(config, state, "rollup_input")
     payload = validated["payload"]
