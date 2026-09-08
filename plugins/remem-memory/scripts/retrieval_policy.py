@@ -56,6 +56,7 @@ _CANONICAL_UUID = re.compile(
 )
 _RECORD_LOCATOR_ROLES = ("fact_id", "source_document_id")
 _RELATIONSHIP_LOCATOR_ROLES = ("related_fact_id",)
+_SOURCE_LOCATOR_ROLES = ("source_document_id",)
 
 
 class RetrievalEnvelopeError(ValueError):
@@ -83,7 +84,9 @@ def build_retrieval_envelope(
     Path and generated-ID entropy exemptions from automatic capture do not
     apply to retrieved prose. Declared locator slots are exact canonical UUID
     claims bound to a retained record or relationship; they are not a generic
-    ID exemption and confer no permission. Serialized JSON is never sliced.
+    ID exemption and confer no permission. Declared synthesis source_locators
+    are an ordered closed list of source_document_id maps kept whole with that
+    synthesis record. Serialized JSON is never sliced.
     """
 
     if type(origin) is not str or origin not in RETRIEVAL_ORIGINS:
@@ -135,12 +138,20 @@ def _validated_records(value: object) -> list[dict[str, object]]:
                 item["locators"],
                 _RECORD_LOCATOR_ROLES,
             )
+        source_locators = None
+        if "source_locators" in item:
+            source_locators = _validated_source_locators(
+                item["source_locators"],
+                kind,
+            )
         relationships = None
         if "relationships" in item:
             relationships = _validated_relationships(item["relationships"])
         nodes = _scan(item["value"], 1, set(), nodes)
         if locators is not None:
             nodes = _scan(locators, 1, set(), nodes)
+        if source_locators is not None:
+            nodes = _scan(source_locators, 1, set(), nodes)
         if relationships is not None:
             for relationship in relationships:
                 nodes = _scan(relationship["value"], 1, set(), nodes)
@@ -148,7 +159,13 @@ def _validated_records(value: object) -> list[dict[str, object]]:
                 if nested is not None:
                     nodes = _scan(nested, 1, set(), nodes)
         records.append(
-            _record_payload(kind, item["value"], locators, relationships)
+            _record_payload(
+                kind,
+                item["value"],
+                locators,
+                relationships,
+                source_locators,
+            )
         )
     return records
 
@@ -184,6 +201,29 @@ def _validated_locators(
     return out
 
 
+def _validated_source_locators(
+    value: object,
+    kind: str,
+) -> list[dict[str, str]] | None:
+    if value is None:
+        return None
+    if type(value) not in {list, tuple}:
+        raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+    if not value:
+        return None
+    if kind != "synthesis":
+        raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+    locators: list[dict[str, str]] = []
+    for item in value:
+        if item is None or type(item) is not dict:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+        parsed = _validated_locators(item, _SOURCE_LOCATOR_ROLES)
+        if parsed is None:
+            raise RetrievalEnvelopeError(_ERROR_INVALID_LOCATORS)
+        locators.append(parsed)
+    return locators
+
+
 def _validated_relationships(value: object) -> list[dict[str, object]] | None:
     if value is None:
         return None
@@ -210,10 +250,13 @@ def _record_payload(
     value: object,
     locators: dict[str, str] | None,
     relationships: list[dict[str, object]] | None,
+    source_locators: list[dict[str, str]] | None,
 ) -> dict[str, object]:
     record: dict[str, object] = {"kind": kind, "value": value}
     if locators:
         record["locators"] = locators
+    if source_locators:
+        record["source_locators"] = source_locators
     if relationships:
         record["relationships"] = relationships
     return record
@@ -284,7 +327,16 @@ def _redact_records(
         locators = record.get("locators")
         if type(locators) is not dict:
             locators = None
-        if _suppress_denied_locators(locators, extras, counts):
+        source_locators = record.get("source_locators")
+        if type(source_locators) is not list:
+            source_locators = None
+        locator_denied = _suppress_denied_locators(locators, extras, counts)
+        source_denied = _suppress_denied_source_locators(
+            source_locators,
+            extras,
+            counts,
+        )
+        if locator_denied or source_denied:
             continue
         raw_relationships = record.get("relationships")
         relationships = None
@@ -310,6 +362,7 @@ def _redact_records(
                 _redact(record["value"], extras, counts),
                 locators,
                 relationships,
+                source_locators,
             )
         )
     return kept, counts
@@ -320,6 +373,9 @@ def _selected_source(record: Mapping[str, object]) -> dict[str, object]:
     locators = record.get("locators")
     if locators is not None:
         source["locators"] = locators
+    source_locators = record.get("source_locators")
+    if source_locators is not None:
+        source["source_locators"] = source_locators
     relationships = record.get("relationships")
     if relationships is not None:
         source["relationships"] = relationships
@@ -385,6 +441,24 @@ def _suppress_denied_locators(
     for role in locators:
         if _drop_key(role, extras):
             denied += 1
+    if not denied:
+        return False
+    counts.fields += denied
+    return True
+
+
+def _suppress_denied_source_locators(
+    source_locators: list[dict[str, str]] | None,
+    extras: frozenset[str],
+    counts: _Counts,
+) -> bool:
+    if source_locators is None:
+        return False
+    denied = 0
+    for locators in source_locators:
+        for role in locators:
+            if _drop_key(role, extras):
+                denied += 1
     if not denied:
         return False
     counts.fields += denied
@@ -492,6 +566,9 @@ def _fit_record(
     locators = record.get("locators")
     if type(locators) is not dict:
         locators = None
+    source_locators = record.get("source_locators")
+    if type(source_locators) is not list:
+        source_locators = None
     relationships = record.get("relationships")
     if type(relationships) is not list:
         relationships = None
@@ -502,7 +579,7 @@ def _fit_record(
         extra_oc: int,
     ) -> dict[str, object]:
         return make_env(
-            _record_payload(kind, candidate, locators, None),
+            _record_payload(kind, candidate, locators, None, source_locators),
             extra_oi,
             extra_oc,
         )
@@ -529,7 +606,13 @@ def _fit_record(
         ) -> dict[str, object]:
             rels = candidate if candidate else None
             return make_env(
-                _record_payload(kind, current_value, locators, rels),
+                _record_payload(
+                    kind,
+                    current_value,
+                    locators,
+                    rels,
+                    source_locators,
+                ),
                 value_oi + extra_oi,
                 value_oc + extra_oc,
             )
@@ -546,6 +629,7 @@ def _fit_record(
         fitted_value,
         locators,
         fitted_relationships,
+        source_locators,
     )
     if _utf8_size(
         make_env(

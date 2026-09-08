@@ -33,7 +33,7 @@ _SERVER_CODE = (
 )
 _MAX_CREDENTIAL_BYTES = 8192
 _BUNDLE_HASHES = {
-    "PROVENANCE.json": "8509a7263d72eca66fd823a82c111d45dfe17a73070f769ba6e9abb7cab099ae",
+    "PROVENANCE.json": "6f951fcb744f67958d9fea796fe72c1909d6172392afebf40958c5c1c94426ea",
     "pyproject.toml": "35d557173f5c2659517ab902e432f60f2068924751c859cf7e2a2c743b767ae7",
     "remem_mcp/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "remem_mcp/server.py": "903c351d26a1773484e24472035a2ab7509cf17ec802b4b60c92879d7d954417",
@@ -42,7 +42,7 @@ _BUNDLE_HASHES = {
 _IMPORTED_SCRIPT_HASHES = {
     "memory_policy.py": "5d7d251e834e634f0dce052ffe13dad84dbffbf2489a2310f592a65de1aed3ed",
     "retrieval_adapter.py": "929a9fa23f3848d34f27bac6b089acbd2ec5425081484cccc4dffc67df041410",
-    "retrieval_policy.py": "a025ce3e4ede3e76b8b7787a5222c7a31527f6c4f477b5eba9833c60ce1043d3",
+    "retrieval_policy.py": "acf729f19c125a7d30607c8964f4c58ec16b4fb95ee670b13cc6b8869f5a1c8e",
 }
 _CHILD_ENVIRONMENT_KEYS = (
     "PATH",
