@@ -119,16 +119,9 @@ def _query_records(response: object) -> list[dict[str, object]]:
         for item in _collection(data, "results")
     ]
     records.extend(
-        {"kind": "fact", "value": item}
-        for item in _optional_collection(data, "facts")
+        _fact_record(item) for item in _optional_collection(data, "facts")
     )
-    if "synthesis" in data and data["synthesis"] is not None:
-        records.append(
-            {
-                "kind": "synthesis",
-                "value": _synthesis_value(data),
-            }
-        )
+    records.extend(_summarize_records(data))
     return records
 
 
@@ -221,17 +214,6 @@ def _canonical_uuid(value: object) -> str:
     if type(value) is not str or _CANONICAL_UUID.fullmatch(value) is None:
         raise RetrievalAdapterError(_ERROR)
     return value
-
-
-def _synthesis_value(data: dict[str, object]) -> dict[str, object]:
-    text = data["synthesis"]
-    if type(text) is not str:
-        raise RetrievalAdapterError(_ERROR)
-    if "sources" not in data:
-        sources: list[str] = []
-    else:
-        sources = _string_list(data["sources"])
-    return {"text": text, "sources": sources}
 
 
 def _collection(data: dict[str, object], key: str) -> list[dict[str, object]]:
