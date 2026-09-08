@@ -33,11 +33,16 @@ _SERVER_CODE = (
 )
 _MAX_CREDENTIAL_BYTES = 8192
 _BUNDLE_HASHES = {
-    "PROVENANCE.json": "1de3bda3f66bf41046177f1043102f7444f896c44902bda752c626102cb429a0",
+    "PROVENANCE.json": "8e0fbf9fe93b092c1a185e9f4a5c03fc77d6d78af8764c3854f65fdd347a38ca",
     "pyproject.toml": "35d557173f5c2659517ab902e432f60f2068924751c859cf7e2a2c743b767ae7",
     "remem_mcp/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "remem_mcp/server.py": "19645b5b7e1e214476c7e2de5fc902c488fb06b8ba35c98fe2d0f037c5bdc695",
+    "remem_mcp/server.py": "903c351d26a1773484e24472035a2ab7509cf17ec802b4b60c92879d7d954417",
     "uv.lock": "2932996e6841f0430290443549a4073083a202fe676dd5d372074a0178a7ee24",
+}
+_IMPORTED_SCRIPT_HASHES = {
+    "memory_policy.py": "5d7d251e834e634f0dce052ffe13dad84dbffbf2489a2310f592a65de1aed3ed",
+    "retrieval_adapter.py": "929a9fa23f3848d34f27bac6b089acbd2ec5425081484cccc4dffc67df041410",
+    "retrieval_policy.py": "d4019b27a8c6061342b4a00c23ba17fd8ed85f1ef90bf1c2437b38dfa9c3d019",
 }
 _CHILD_ENVIRONMENT_KEYS = (
     "PATH",
@@ -129,6 +134,30 @@ def _validate_bundle(bundle_root: Path) -> tuple[Path, str]:
         for relative, digest in sorted(_BUNDLE_HASHES.items())
     ).encode("ascii")
     return root, hashlib.sha256(manifest).hexdigest()
+
+
+def _validate_imported_scripts(scripts_root: Path, bundle_digest: str) -> str:
+    try:
+        root = scripts_root.resolve(strict=True)
+        entries = []
+        for relative, expected_digest in sorted(_IMPORTED_SCRIPT_HASHES.items()):
+            path = root
+            for component in Path(relative).parts:
+                path = path / component
+                if path.is_symlink():
+                    raise _LauncherError
+            if not path.is_file():
+                raise _LauncherError
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual != expected_digest:
+                raise _LauncherError
+            entries.append(f"{relative}:{actual}")
+    except Exception:
+        raise _LauncherError(
+            "error: bundled Remem MCP failed integrity validation"
+        ) from None
+    manifest = (bundle_digest + "\n" + "\n".join(entries)).encode("ascii")
+    return hashlib.sha256(manifest).hexdigest()
 
 
 def _find_uv(
@@ -389,8 +418,12 @@ def main(
     selected = dict(os.environ if environment is None else environment)
     try:
         client, probe = _parse_arguments(list(argv or ()))
-        bundle, content_digest = _validate_bundle(
+        bundle, bundle_digest = _validate_bundle(
             bundle_root or _default_bundle_root()
+        )
+        content_digest = _validate_imported_scripts(
+            bundle.parent / "scripts",
+            bundle_digest,
         )
         uv = _find_uv(selected, which)
         cache = _cache_environment(selected, content_digest)

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -2565,6 +2566,103 @@ class MCPLauncherTests(unittest.TestCase):
 
         self.assertEqual(validated, bundle.resolve())
         self.assertEqual(len(digest), 64)
+
+    def _copy_imported_scripts(self, directory):
+        dest = Path(directory) / "scripts"
+        dest.mkdir()
+        for name in launcher._IMPORTED_SCRIPT_HASHES:
+            shutil.copy2(_PLUGIN_SCRIPTS / name, dest / name)
+        return dest
+
+    def test_imported_script_hashes_match_plugin_source(self):
+        for name, expected in launcher._IMPORTED_SCRIPT_HASHES.items():
+            actual = hashlib.sha256(
+                (_PLUGIN_SCRIPTS / name).read_bytes()
+            ).hexdigest()
+            self.assertEqual(actual, expected, name)
+
+    def test_imported_scripts_validation_accepts_matching_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = self._copy_imported_scripts(directory)
+            (scripts / "extra_unhashed.py").write_text(
+                "raise RuntimeError('must not load')\n",
+                encoding="utf-8",
+            )
+            digest = launcher._validate_imported_scripts(scripts, "ab" * 32)
+        self.assertEqual(len(digest), 64)
+
+    def test_imported_scripts_validation_rejects_tampered_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = self._copy_imported_scripts(directory)
+            target = scripts / "retrieval_policy.py"
+            target.write_bytes(target.read_bytes() + b"\n")
+            with self.assertRaises(launcher._LauncherError) as ctx:
+                launcher._validate_imported_scripts(scripts, "ab" * 32)
+        self.assertEqual(
+            str(ctx.exception),
+            "error: bundled Remem MCP failed integrity validation",
+        )
+
+    def test_imported_scripts_validation_rejects_missing_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = self._copy_imported_scripts(directory)
+            (scripts / "retrieval_adapter.py").unlink()
+            with self.assertRaises(launcher._LauncherError) as ctx:
+                launcher._validate_imported_scripts(scripts, "ab" * 32)
+        self.assertEqual(
+            str(ctx.exception),
+            "error: bundled Remem MCP failed integrity validation",
+        )
+
+    def test_imported_scripts_validation_rejects_symlink_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = self._copy_imported_scripts(directory)
+            target = scripts / "memory_policy.py"
+            target.unlink()
+            target.symlink_to(_PLUGIN_SCRIPTS / "memory_policy.py")
+            with self.assertRaises(launcher._LauncherError) as ctx:
+                launcher._validate_imported_scripts(scripts, "ab" * 32)
+        self.assertEqual(
+            str(ctx.exception),
+            "error: bundled Remem MCP failed integrity validation",
+        )
+
+    def test_launcher_rejects_tampered_imported_policy_before_resolving_key(self):
+        source_plugin = _ROOT / "plugins" / "remem-memory"
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = Path(directory) / "plugin"
+            shutil.copytree(
+                source_plugin / "mcp",
+                plugin / "mcp",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            scripts = plugin / "scripts"
+            scripts.mkdir()
+            for name in launcher._IMPORTED_SCRIPT_HASHES:
+                shutil.copy2(source_plugin / "scripts" / name, scripts / name)
+            tampered = scripts / "retrieval_policy.py"
+            tampered.write_bytes(tampered.read_bytes() + b"#\n")
+            resolver = mock.Mock(return_value="configured")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = launcher.main(
+                    ["--client", "codex"],
+                    environment={
+                        "PATH": "/test/bin",
+                        "HOME": "/test/home",
+                    },
+                    resolver=resolver,
+                    which=lambda command: "/test/bin/uv",
+                    execvpe=mock.Mock(),
+                    bundle_root=plugin / "mcp",
+                )
+
+        self.assertEqual(result, 2)
+        resolver.assert_not_called()
+        self.assertEqual(
+            stderr.getvalue().strip(),
+            "error: bundled Remem MCP failed integrity validation",
+        )
 
     def test_loopback_origin_never_falls_back_to_keychain_resolver(self):
         resolver = mock.Mock(return_value="vlt_keychain-canary")

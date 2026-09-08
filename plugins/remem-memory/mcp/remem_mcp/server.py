@@ -8,9 +8,12 @@ anonymous file descriptor rather than process arguments or environment values.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 MAX_RESPONSE_CHARS = 50_000
@@ -64,6 +67,39 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 server = Server("remem-mcp")
+
+
+def _load_retrieval_adapter():
+    adapter_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "retrieval_adapter.py"
+    )
+    if adapter_path.is_symlink() or not adapter_path.is_file():
+        raise RuntimeError("invalid retrieval adapter")
+    name = "remem_retrieval_adapter"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        current = getattr(existing, "__file__", None)
+        if isinstance(current, str):
+            try:
+                current_path = Path(current)
+                if (
+                    not current_path.is_symlink()
+                    and current_path.resolve() == adapter_path.resolve()
+                ):
+                    return existing
+            except (OSError, RuntimeError):
+                pass
+    spec = importlib.util.spec_from_file_location(name, adapter_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("invalid retrieval adapter")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_RETRIEVAL_ADAPTER = _load_retrieval_adapter()
+_ADAPTER_ERROR = _RETRIEVAL_ADAPTER.RetrievalAdapterError
 
 
 def _get_api_key() -> str:
@@ -236,7 +272,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="remem_query",
-            description="Query Remem for relevant context. Returns the raw JSON response from /v1/query.",
+            description="Query Remem for relevant context. Returns one ordinary untrusted retrieval envelope.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -285,7 +321,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="remem_search",
-            description="Search your Remem knowledge base and return formatted chunks.",
+            description="Search your Remem knowledge base. Returns one ordinary untrusted retrieval envelope.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -454,24 +490,6 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-def _format_search_results(data: dict[str, Any]) -> str:
-    results = []
-    for doc in data.get("results", []):
-        title = doc.get("title") or "Untitled"
-        for chunk in doc.get("chunks", []):
-            try:
-                score = float(chunk.get("score", 0.0))
-            except Exception:
-                score = 0.0
-            content = chunk.get("content") or ""
-            results.append(f"**{title}** (score: {score:.2f})\n{content}\n")
-
-    if not results:
-        return "No results found."
-
-    return "\n---\n".join(results)
-
-
 # ---------------------------------------------------------------------------
 # Namespace helpers
 # ---------------------------------------------------------------------------
@@ -552,7 +570,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "/v1/query",
                 json_body=payload,
             )
-            return [TextContent(type="text", text=_truncate_response(json.dumps(data, indent=2)))]
+            try:
+                text = _RETRIEVAL_ADAPTER.serialize_query_response(data)
+            except _ADAPTER_ERROR as exc:
+                return [TextContent(type="text", text=str(exc))]
+            return [TextContent(type="text", text=text)]
 
         if name == "remem_search":
             limit = arguments.get("limit", _get_default_max_results())
@@ -573,7 +595,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 "/v1/query",
                 json_body=payload,
             )
-            return [TextContent(type="text", text=_truncate_response(_format_search_results(data)))]
+            try:
+                text = _RETRIEVAL_ADAPTER.serialize_search_response(data)
+            except _ADAPTER_ERROR as exc:
+                return [TextContent(type="text", text=str(exc))]
+            return [TextContent(type="text", text=text)]
 
         if name == "remem_summarize":
             payload = {
@@ -756,6 +782,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     except _RequestError as exc:
+        return [TextContent(type="text", text=str(exc))]
+    except _ADAPTER_ERROR as exc:
         return [TextContent(type="text", text=str(exc))]
     except Exception as exc:
         return [TextContent(type="text", text=_truncate_response(f"Error: {exc}"))]
